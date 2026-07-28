@@ -129,6 +129,64 @@ def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Pat
     assert summary["configured_max_update"] == 2
 
 
+def test_cli_logs_pretraining_variance_diagnostics_only_for_pretraining(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Expose collapse diagnostics in pretraining JSON and omit them in fine-tuning."""
+
+    manifests = _data(tmp_path)
+    pretrain_dir = tmp_path / "variance-pretrain"
+    assert train_main([
+        "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
+        "--override", f"task.data={manifests}",
+        "--override", f"checkpoint.save_dir={pretrain_dir}",
+        "--max-updates", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    pretraining_records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    update_record = next(
+        record
+        for record in pretraining_records
+        if "update" in record and "loss" in record
+    )
+    summary = next(
+        record["training_summary"]
+        for record in pretraining_records
+        if "training_summary" in record
+    )
+    for record in (update_record, summary):
+        assert record["pred_var"] > 0
+        assert record["target_var"] > 0
+        assert np.isfinite(record["pred_var"])
+        assert np.isfinite(record["target_var"])
+
+    finetune_dir = tmp_path / "variance-finetune"
+    assert train_main([
+        "--config", str(ROOT / "configs/cpu_smoke_finetuning.yaml"),
+        "--override", f"task.data={manifests}",
+        "--override", f"checkpoint.save_dir={finetune_dir}",
+        "--pretrained-checkpoint", str(pretrain_dir / "checkpoint_last.pt"),
+        "--max-updates", "1",
+        "--device", "cpu",
+    ]) == 0
+    finetuning_records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    finetuning_update = next(
+        record
+        for record in finetuning_records
+        if "update" in record and "loss" in record
+    )
+    assert "pred_var" not in finetuning_update
+    assert "target_var" not in finetuning_update
+
+
 def test_cli_checkpoint_tracks_consumed_batches_not_worker_prefetch(tmp_path: Path) -> None:
     """Check cli checkpoint tracks consumed batches not worker prefetch."""
     manifests = _data(tmp_path, (64,) * 12)

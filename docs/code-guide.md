@@ -327,15 +327,35 @@ own stream.
 `FrameCounts` stores additive TP, FP, TN, and FN counts. `average_precision`
 groups tied scores before integrating the precision-recall staircase.
 
+`pretraining_variance_diagnostics` reproduces the Animal2Vec 1.0 collapse
+monitor. For masked prediction or teacher matrix \(Z\in\mathbb{R}^{N\times D}\),
+it returns:
+
+```text
+(1 / D) sum_d sqrt(Var_(N-1)(Z[:, d]) + 1e-6).
+```
+
+The historical `pred_var` and `target_var` names refer to this mean
+feature-wise sample standard deviation. The helper packs count, coordinate
+sums, and coordinate squared sums for student and teacher into one tensor. A
+distributed all-reduce combines those moments before the helper calculates the
+standard deviation. This order measures the union of rank-local examples.
+
 `TrainingEngine.step` performs one logical optimizer update:
 
-1. Backpropagate each summed microbatch loss.
-2. Sum loss and sample size across ranks.
-3. Account for DDP's `1/W` gradient average.
-4. Normalize gradients by global frame-token count.
-5. Clip the global gradient norm.
-6. Let GradScaler skip non-finite AMP attempts.
-7. Advance optimizer, update counter, schedule, and EMA after success.
+1. Run each microbatch forward and collect detached pretraining diagnostics.
+2. Backpropagate each summed microbatch loss.
+3. Sum loss and sample size across ranks.
+4. Account for DDP's `1/W` gradient average.
+5. Normalize gradients by global frame-token count.
+6. Clip the global gradient norm.
+7. Let GradScaler skip non-finite AMP attempts.
+8. Advance optimizer, update counter, schedule, and EMA after success.
+
+The engine averages `pred_var` and `target_var` across the microbatches in one
+attempt and returns them in `UpdateResult`. Fine-tuning results leave the
+optional fields empty. `workflows.py` adds numeric keys to pretraining update
+JSON and terminal summaries without storing them in checkpoints.
 
 An AMP-skipped attempt changes only GradScaler state. It does not advance model,
 schedule, teacher, validation, sampler, or checkpoint cadence.

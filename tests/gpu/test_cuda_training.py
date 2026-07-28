@@ -20,6 +20,7 @@ from a2v2.model import Animal2VecPretrainingModel
 from a2v2.training import (
     capture_rng_state,
     load_checkpoint,
+    pretraining_variance_diagnostics,
     restore_rng_state,
     save_checkpoint,
 )
@@ -184,6 +185,16 @@ def test_tiny_pretraining_fp32_cuda_matches_cpu_and_updates_teacher(
     assert torch.allclose(cuda_output.predictions.cpu(), cpu_output.predictions, atol=3e-5, rtol=3e-4)
     assert torch.allclose(cuda_output.targets.cpu(), cpu_output.targets, atol=3e-5, rtol=3e-4)
     assert torch.allclose(cuda_output.loss.cpu(), cpu_output.loss, atol=2e-4, rtol=3e-4)
+    cpu_variances = pretraining_variance_diagnostics(
+        cpu_output.predictions,
+        cpu_output.targets,
+    )
+    cuda_variances = pretraining_variance_diagnostics(
+        cuda_output.predictions,
+        cuda_output.targets,
+    )
+    assert cuda_variances[0] == pytest.approx(cpu_variances[0], rel=5e-4, abs=5e-5)
+    assert cuda_variances[1] == pytest.approx(cpu_variances[1], rel=5e-4, abs=5e-5)
 
     cuda_model.train()
     optimizer = torch.optim.Adam(cuda_model.student.parameters(), lr=1e-3)
@@ -239,6 +250,8 @@ def test_amp_checkpoint_cpu_load_gpu_restore_matches_next_update_exactly(
     assert actual_result.sample_size == expected_result.sample_size
     assert actual_result.gradient_norm == expected_result.gradient_norm
     assert actual_result.learning_rate == expected_result.learning_rate
+    assert actual_result.pred_var == expected_result.pred_var
+    assert actual_result.target_var == expected_result.target_var
     _assert_tree_equal(actual, expected)
 
 

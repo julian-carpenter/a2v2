@@ -230,6 +230,8 @@ def _snapshot(model: Animal2VecPretrainingModel, engine: TrainingEngine, result:
             "gradient_norm": result.gradient_norm,
             "learning_rate": result.learning_rate,
             "update": result.update,
+            "pred_var": result.pred_var,
+            "target_var": result.target_var,
         },
         "model": model.state_dict(),
         "teacher": model.teacher.model.state_dict(),

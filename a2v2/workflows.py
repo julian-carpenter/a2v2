@@ -63,6 +63,7 @@ from .training import (
     CosineUpdateScheduler,
     FrameCounts,
     TrainingEngine,
+    UpdateResult,
     average_precision,
     build_optimizer,
     capture_rng_state,
@@ -1484,6 +1485,7 @@ def run_training(
     output_directory.mkdir(parents=True, exist_ok=True)
     last_path = output_directory / "checkpoint_last.pt"
     last_validation_update = -1
+    last_result: UpdateResult | None = None
 
     def write_checkpoint(path: Path) -> None:
         """Gather rank RNG states and let rank zero write one checkpoint."""
@@ -1554,11 +1556,13 @@ def run_training(
             write_checkpoint(output_directory / "checkpoint_best.pt")
         last_validation_update = engine.update
 
-    def record_update(result: object) -> None:
+    def record_update(result: UpdateResult) -> None:
         """Log one attempt and trigger update-based save and validation work."""
 
+        nonlocal last_result
+        last_result = result
         if rank == 0 and result.update % config.common.log_interval == 0:
-            print(json.dumps({
+            record: dict[str, object] = {
                 "update": result.update,
                 "loss": result.loss,
                 "sample_size": result.sample_size,
@@ -1566,7 +1570,16 @@ def run_training(
                 "learning_rate": result.learning_rate,
                 "skipped": result.skipped,
                 "amp_scale": engine.scaler.get_scale() if engine.scaler is not None else None,
-            }))
+            }
+            # Interpretation: fine-tuning has no masked mean-teacher tensors,
+            # so its JSON schema remains unchanged. Pretraining records retain
+            # the historical keys used by collapse-monitoring dashboards.
+            if result.pred_var is not None and result.target_var is not None:
+                record.update({
+                    "pred_var": result.pred_var,
+                    "target_var": result.target_var,
+                })
+            print(json.dumps(record), flush=True)
         if result.skipped:
             return
         if config.checkpoint.save_interval_updates > 0 and result.update % config.checkpoint.save_interval_updates == 0:
@@ -1671,6 +1684,18 @@ def run_training(
         "elapsed_seconds": time.perf_counter() - started_at,
         "amp_scale": engine.scaler.get_scale() if engine.scaler is not None else None,
     }
+    if (
+        last_result is not None
+        and last_result.pred_var is not None
+        and last_result.target_var is not None
+    ):
+        # Interpretation: short memory and resume burn-ins often stop before
+        # log_interval. The terminal record still exposes their final collapse
+        # diagnostics without adding mutable state to a checkpoint.
+        summary.update({
+            "pred_var": last_result.pred_var,
+            "target_var": last_result.target_var,
+        })
     if device.type == "cuda":
         summary.update({
             "cuda_device": device.index,

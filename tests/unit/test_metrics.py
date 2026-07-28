@@ -4,6 +4,7 @@ expose the treatment of class decisions and tied scores."""
 import torch
 import pytest
 
+import a2v2.training as training
 from a2v2.training import FrameCounts, average_precision
 
 
@@ -40,3 +41,43 @@ def test_average_precision_groups_tied_scores_like_sklearn() -> None:
     targets = torch.tensor([1, 1, 0, 0])
 
     assert average_precision(scores, targets) == pytest.approx(5 / 6)
+
+
+def test_pretraining_variance_diagnostics_match_archived_sample_std() -> None:
+    """Match the historical mean feature-wise sample standard deviation."""
+
+    predictions = torch.tensor([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 8.0],
+    ])
+    targets = torch.tensor([
+        [2.0, 1.0],
+        [4.0, 5.0],
+        [8.0, 7.0],
+    ])
+
+    pred_var, target_var = training.pretraining_variance_diagnostics(
+        predictions,
+        targets,
+    )
+
+    # These literals come from the archived equation:
+    # mean_d sqrt(sample_variance(z[:, d]) + 1e-6).
+    assert pred_var == pytest.approx(2.5275254249572754)
+    assert target_var == pytest.approx(3.0550506114959717)
+
+
+def test_pretraining_variance_diagnostics_reject_bad_shape_or_count() -> None:
+    """Reject tensors that cannot define paired feature-wise sample variance."""
+
+    with pytest.raises(ValueError, match="same shape"):
+        training.pretraining_variance_diagnostics(
+            torch.zeros(3, 2),
+            torch.zeros(3, 3),
+        )
+    with pytest.raises(ValueError, match="at least two"):
+        training.pretraining_variance_diagnostics(
+            torch.zeros(1, 2),
+            torch.zeros(1, 2),
+        )

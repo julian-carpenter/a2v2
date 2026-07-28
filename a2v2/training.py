@@ -409,8 +409,81 @@ class CosineUpdateScheduler:
 
 
 # =============================================================================
-# FRAME-LEVEL METRICS
+# PRETRAINING COLLAPSE DIAGNOSTICS AND FRAME-LEVEL METRICS
 # =============================================================================
+
+@torch.no_grad()
+def pretraining_variance_diagnostics(
+    predictions: Tensor,
+    targets: Tensor,
+) -> tuple[float, float]:
+    """Return the archived ``pred_var`` and ``target_var`` diagnostics.
+
+    The historical names say variance, while the returned values are the mean
+    feature-wise sample standard deviation after adding the archived ``1e-6``
+    stabilizer. Inputs may have any leading dimensions; their final dimension
+    is the learned feature coordinate.
+    """
+
+    if predictions.shape != targets.shape:
+        raise ValueError("predictions and targets must have the same shape")
+    if predictions.ndim < 2 or predictions.shape[-1] == 0:
+        raise ValueError("diagnostic tensors need a nonempty feature dimension")
+
+    # Mathematics: flatten z from [...,D] to [N,D], then retain the three
+    # sufficient statistics N, Σ_i z_i, and Σ_i z_i² for each coordinate.
+    # Interpretation: diagnostic work detaches from autograd and uses FP32,
+    # matching the archived code without retaining full activation histories.
+    predictions = predictions.detach().reshape(-1, predictions.shape[-1]).float()
+    targets = targets.detach().reshape(-1, targets.shape[-1]).float()
+    count = predictions.new_tensor(float(predictions.shape[0]))
+    statistics = torch.cat((
+        count.view(1),
+        predictions.sum(dim=0),
+        predictions.square().sum(dim=0),
+        targets.sum(dim=0),
+        targets.square().sum(dim=0),
+    ))
+
+    # Mathematics: sums are linear, so all-reducing sufficient statistics
+    # before evaluating variance gives the sample variance of the union of all
+    # rank-local masked vectors. Averaging local variances would be incorrect.
+    # Interpretation: every worker reports one diagnostic for the same global
+    # microbatch even though each GPU observed a different audio shard.
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(statistics)
+
+    feature_dim = predictions.shape[-1]
+    count = statistics[0]
+    if float(count) < 2:
+        raise ValueError("variance diagnostics require at least two vectors")
+    offset = 1
+    pred_sum = statistics[offset: offset + feature_dim]
+    offset += feature_dim
+    pred_square_sum = statistics[offset: offset + feature_dim]
+    offset += feature_dim
+    target_sum = statistics[offset: offset + feature_dim]
+    offset += feature_dim
+    target_square_sum = statistics[offset: offset + feature_dim]
+
+    def archived_value(total: Tensor, square_total: Tensor) -> float:
+        """Evaluate the archived unbiased variance identity and square root."""
+
+        # Mathematics: s² = Σz²/(N-1) - (Σz)²/[N(N-1)], followed by
+        # D^{-1}Σ_d sqrt(s_d²+10^{-6}).
+        # Interpretation: a value approaching zero warns that feature
+        # coordinates are becoming constant across masked training examples.
+        variance = (
+            square_total / (count - 1)
+            - total.square() / (count * (count - 1))
+        )
+        return float(torch.sqrt(variance + 1e-6).mean())
+
+    return (
+        archived_value(pred_sum, pred_square_sum),
+        archived_value(target_sum, target_square_sum),
+    )
+
 
 @dataclass(frozen=True)
 class FrameCounts:
@@ -532,6 +605,8 @@ class UpdateResult:
     learning_rate: float
     update: int
     skipped: bool
+    pred_var: float | None = None
+    target_var: float | None = None
 
 
 class TrainingEngine:
@@ -588,6 +663,9 @@ class TrainingEngine:
         self.optimizer.zero_grad(set_to_none=True)
         total_sample_size = 0
         total_loss = 0.0
+        pred_var_sum = 0.0
+        target_var_sum = 0.0
+        variance_microbatches = 0
         # Mathematics: if an update contains K microbatches, backpropagate each
         # summed loss before a single normalization and optimizer step.
         # Interpretation: gradient accumulation emulates a larger batch without
@@ -599,6 +677,26 @@ class TrainingEngine:
                 output = forward(microbatch)
             if not torch.isfinite(output.loss):
                 raise FloatingPointError(f"non-finite loss at update {self.update}")
+            predictions = getattr(output, "predictions", None)
+            diagnostic_targets = getattr(output, "targets", None)
+            if predictions is not None:
+                if diagnostic_targets is None:
+                    raise ValueError(
+                        "a pretraining output with predictions must also provide targets"
+                    )
+                # Mathematics: the archived logger evaluates one global
+                # standard-deviation scalar per microbatch, then its metrics
+                # meter takes their arithmetic mean over an accumulated update.
+                # Interpretation: diagnostics retain the original scale even
+                # when update_freq groups several forwards into one optimizer
+                # step, and their detached collective cannot alter gradients.
+                pred_var, target_var = pretraining_variance_diagnostics(
+                    predictions,
+                    diagnostic_targets,
+                )
+                pred_var_sum += pred_var
+                target_var_sum += target_var
+                variance_microbatches += 1
             if self.scaler is None:
                 output.loss.backward()
             else:
@@ -623,6 +721,16 @@ class TrainingEngine:
             world_size = dist.get_world_size()
             dist.all_reduce(totals)
         global_sample_size = max(float(totals[0].item()), 1.0)
+        pred_var = (
+            pred_var_sum / variance_microbatches
+            if variance_microbatches
+            else None
+        )
+        target_var = (
+            target_var_sum / variance_microbatches
+            if variance_microbatches
+            else None
+        )
         if self.scaler is not None:
             self.scaler.unscale_(self.optimizer)
         # Mathematics: DDP has already averaged gradients by 1/W, so multiplying
@@ -659,6 +767,8 @@ class TrainingEngine:
                 learning_rate=float(self.optimizer.param_groups[0]["lr"]),
                 update=self.update,
                 skipped=True,
+                pred_var=pred_var,
+                target_var=target_var,
             )
         if self.scaler is None:
             self.optimizer.step()
@@ -685,6 +795,8 @@ class TrainingEngine:
             learning_rate=learning_rate,
             update=self.update,
             skipped=False,
+            pred_var=pred_var,
+            target_var=target_var,
         )
 
     def checkpoint_payload(

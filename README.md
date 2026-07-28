@@ -833,6 +833,42 @@ or worker count. The worst observed allocator reservation left 2.40 GiB
 against PyTorch-visible capacity. This was a two-update fit/resume burn-in, not
 a completed 384,230-update run.
 
+### Monitor representation variance
+
+Pretraining update records include `pred_var` for masked student-decoder
+outputs and `target_var` for the matched normalized EMA-teacher targets. The
+names match Animal2Vec 1.0 logs. Each scalar contains the mean feature-wise
+sample standard deviation:
+
+```text
+mean_d sqrt(sample_variance(z[:, d]) + 1e-6)
+```
+
+For distributed training, the engine reduces vector count, sum, and squared
+sum across ranks before it evaluates the formula. It computes one value per
+microbatch and averages the values across the microbatches accumulated into an
+optimizer attempt. FP16 activations use FP32 diagnostic arithmetic.
+
+A pretraining update JSON record therefore contains fields such as:
+
+```json
+{
+  "update": 384,
+  "loss": 0.417,
+  "pred_var": 0.238,
+  "target_var": 0.512,
+  "gradient_norm": 1.73,
+  "amp_scale": 0.03125
+}
+```
+
+Plot both series throughout pretraining. A sustained move toward zero warns
+that the student predictions or teacher representation are collapsing toward
+constant feature vectors. Interpret the trajectory with normalized loss,
+gradient norm, EMA decay, learning rate, and AMP scale. The terminal
+`training_summary` repeats the most recent pair, so a short burn-in exposes the
+diagnostic before it reaches `common.log_interval`.
+
 ### Single-GPU diagnostic pretraining
 
 For a functional diagnostic on one GPU, explicitly override the recipe's world
