@@ -1,0 +1,69 @@
+# Minimal pretraining architecture used by fast equation and state tests.
+# Values are intentionally small enough for CPU forward/backward passes while
+# retaining a Sinc frontend, prenet, Transformer, clones, masks, and decoder.
+
+# Deterministic CPU execution.
+common:
+  fp16: false
+  seed: 7
+# Test checkpoints stay under a disposable fixture path.
+checkpoint:
+  save_dir: checkpoints/tiny
+# Synthetic 8 kHz unlabeled waveforms and toy convolution geometry.
+task:
+  _name: audio_ccas
+  data: tests/fixtures/manifests
+  sample_rate: 8000
+  normalize: true
+  with_labels: false
+  unique_labels: "[]"
+  conv_feature_layers: "[(8, 7, 1)] + [(16, 4, 2)] * 2"
+# Single-process batches for unit and integration tests.
+dataset:
+  max_tokens: 16000
+  num_workers: 0
+  train_subset: pretrain
+  valid_subset: valid
+# Tests construct one process unless a DDP probe overrides this field.
+distributed_training:
+  distributed_world_size: 1
+# The criterion name identifies pretraining stage.
+criterion:
+  _name: expanded_model
+# Short update horizon with clipping.
+optimization:
+  update_freq: [1]
+  max_update: 2
+  clip_norm: 1.0
+# Adam values used in optimizer parity and resume tests.
+optimizer:
+  _name: adam
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1.0e-6
+  weight_decay: 0.01
+# One warmup update makes schedule indexing visible.
+lr_scheduler:
+  _name: cosine
+  warmup_updates: 1
+# Tiny two-layer mean-teacher model and compact decoder.
+model:
+  _name: data2vec_multi
+  depth: 2
+  embed_dim: 16
+  num_heads: 4
+  clone_batch: 2
+  average_top_k_layers: 2
+  modalities:
+    audio:
+      sinc_input: true
+      conv_pos_depth: 1
+      conv_pos_width: 5
+      conv_pos_groups: 4
+      prenet_depth: 1
+      mask_prob: 0.5
+      mask_length: 2
+      decoder:
+        decoder_dim: 12
+        decoder_groups: 4
+        decoder_kernel: 3
+        decoder_layers: 2

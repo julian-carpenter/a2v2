@@ -1,0 +1,51 @@
+# Setuptools builds a standard wheel from the compact, flat A2V2 package.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Installable package metadata and the complete native runtime dependency set.
+[project]
+name = "a2v2"
+version = "0.1.0"
+description = "Extensible bioacoustic research code with an Animal2Vec 1.0 baseline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  # Tensor math, neural-network layers, AMP, distributed execution, and checkpoints.
+  "torch>=2.3",
+  # Deterministic masking and dataset-audit array operations.
+  "numpy>=1.24",
+  # WAV/FLAC decoding through libsndfile, without torchaudio.
+  "soundfile>=0.12",
+  # Published sparse event annotations use HDF5 containers.
+  "h5py>=3.8",
+  # Published recipes and command-line overrides begin as YAML.
+  "PyYAML>=6.0",
+]
+
+# Pytest is needed only by developers and verification agents.
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+# Each command enters the orchestration file through a distinct function.
+[project.scripts]
+a2v2-train = "a2v2.workflows:train_main"
+a2v2-infer = "a2v2.workflows:infer_main"
+a2v2-convert-checkpoint = "a2v2.workflows:convert_checkpoint_main"
+
+# The repository-root package is intentional; no hidden src/ layer is used.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["a2v2"]
+
+# Importlib mode catches accidental reliance on test-directory import side effects.
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+  # Collected on CPU hosts but skipped by the shared CUDA fixture.
+  "gpu: requires a real CUDA GPU and is skipped on CPU-only hosts",
+  # Standalone torchrun programs exercise this marker's multi-process behavior.
+  "nccl: requires a multi-process NCCL launch",
+]

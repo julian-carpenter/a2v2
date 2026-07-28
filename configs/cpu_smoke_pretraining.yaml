@@ -1,0 +1,81 @@
+# Reduced A2V2 workflow check for the Animal2Vec 1.0 pretraining baseline.
+# This small profile tests implementation flow; it does not reproduce paper results.
+# It keeps the student, EMA teacher, span masking, and decoder flow while using
+# a 16-dimensional, two-layer encoder and two optimizer updates.
+# Replace task.data or override it with a directory containing TSV manifests.
+
+# CPU precision, deterministic seed, and per-update logging.
+common:
+  fp16: false
+  seed: 7
+  log_format: json
+  log_interval: 1
+# Write each update so resume behavior can be tested with a short run.
+checkpoint:
+  save_dir: checkpoints/cpu_smoke_pretrain
+  save_interval_updates: 1
+# Unlabeled 8 kHz audio and a three-block toy frontend.
+task:
+  _name: audio_ccas
+  data: smoke_data/manifests
+  sample_rate: 8000
+  normalize: true
+  with_labels: false
+  unique_labels: "[]"
+  conv_feature_layers: "[(8, 7, 1)] + [(16, 4, 2)] * 2"
+  min_sample_size: 1
+# A small sample budget keeps test batches cheap and single-process.
+dataset:
+  max_tokens: 512
+  num_workers: 0
+  required_batch_size_multiple: 1
+  train_subset: pretrain
+  valid_subset: valid
+  disable_validation: true
+# CPU smoke runs use one process; distributed behavior has separate probes.
+distributed_training:
+  distributed_world_size: 1
+# The expanded-model criterion selects pretraining stage translation.
+criterion:
+  _name: expanded_model
+# Two updates with no accumulation exercise scheduler and checkpoint state.
+optimization:
+  update_freq: [1]
+  max_update: 2
+  clip_norm: 1.0
+# Fairseq-compatible Adam with decoupled weight decay.
+optimizer:
+  _name: adam
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1.0e-6
+  weight_decay: 0.01
+# Zero warmup starts the cosine schedule at the configured learning rate.
+lr_scheduler:
+  _name: cosine
+  warmup_updates: 0
+# Tiny mean-teacher encoder, two masked clones, and a compact decoder.
+model:
+  _name: data2vec_multi
+  depth: 2
+  embed_dim: 16
+  num_heads: 4
+  clone_batch: 2
+  average_top_k_layers: 2
+  source_mixup: -1.0
+  mixup_prob: 0.0
+  modalities:
+    audio:
+      sinc_input: true
+      use_pswish: true
+      conv_pos_depth: 1
+      conv_pos_width: 5
+      conv_pos_groups: 4
+      prenet_depth: 1
+      mask_prob: 0.5
+      mask_length: 2
+      decoder:
+        input_dropout: 0.0
+        decoder_dim: 12
+        decoder_groups: 4
+        decoder_kernel: 3
+        decoder_layers: 2

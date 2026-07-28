@@ -1,0 +1,32 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local interpreter selection
+.venv/
+venv/
+env/
+.python-version
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+
+# Training, evaluation, and downloaded artifacts
+checkpoints/
+results/
+logs/
+data/
+wandb/
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store

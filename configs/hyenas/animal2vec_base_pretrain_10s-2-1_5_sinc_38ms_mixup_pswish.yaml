@@ -1,0 +1,157 @@
+# Animal2Vec 1.0 reproduction baseline: official Hyena base pretraining.
+# Audio is 24 kHz; the stride pattern still produces about 200 frames per second.
+# Replace task.data with manifests for the intended ten-second Hyena corpus.
+# @package _group_
+
+# Numeric precision and progress reporting.
+common:
+  fp16: true
+  log_format: json
+  log_interval: 1418  # log every tenth of an epoch
+  tensorboard_logdir: tb
+  min_loss_scale: 1e-6
+  fp16_no_flatten_grads: true
+  fp16_init_scale: 1
+
+# Epoch checkpoint cadence for the long pretraining run.
+checkpoint:
+  save_interval: 10  # that is every 141750 updates
+  keep_last_epochs: 5  # keep half of all, as we train for 100 epochs
+
+# Input corpus and 24 kHz convolution frontend.
+task:
+  _name: audio_ccas
+  data: /local/datasets/Hyena_10s_energy_event_detected_pretrain_only_2024-09-03/manifests
+  unique_labels: "[]"
+  # Change feature extractor to account for reduced sample rate in meerkat data
+  # 24000Hz / 5 / 2 / 2 / 2 / 1 / 1 / 1 -> Effective encoder output frequency of 200Hz.
+  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 4)] + [(512, 3, 3)] + [(512, 3, 2)] + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1
+  sample_rate: 24000
+  normalize: true
+  with_labels: false
+  min_label_size: 1  # Empty label files have Bytesize 1780, so to exclude them set this to 1780
+  verbose_tensorboard_logging: false
+  enable_padding: false
+
+# Token-budget loading and disabled validation.
+dataset:
+  num_workers: 32
+  # max_tokens / sample_rate * distributed_world_size * update_freq is the batch size in seconds
+  # For training on asmodeus, we use ~1000s for training, as in the paper
+  max_tokens: 3000000  #  a token is a single audio frame, one epoch has 14175 steps (3927.5 hours)
+  skip_invalid_size_inputs_valid_test: true
+  validate_interval: 25
+  validate_interval_updates: 10000  # validate every m updates
+  required_batch_size_multiple: 1
+  disable_validation: true
+  train_subset: pretrain
+  valid_subset: valid_0
+
+# The published topology uses four GPU processes.
+distributed_training:
+  distributed_world_size: 4
+  ddp_backend: legacy_ddp
+
+# Pretraining exposes regression and EMA diagnostics through legacy log keys.
+criterion:
+  _name: expanded_model
+  segmentation_metrics: true
+  use_focal_loss: true  # this overrides label smoothing and uses the focal loss instead
+  log_keys:
+    - ema_decay
+    - target_var
+    - pred_var
+    - model_norm
+    - ema_norm
+    - masked_pct
+
+# Two microbatches per rank contribute to one optimizer update.
+optimization:
+  update_freq: [ 2 ]
+  max_update: 1417431  # ~ 100 epochs
+  clip_norm: 1
+
+# Fairseq's composite group contains both Adam and cosine schedule settings.
+optimizer:
+  _name: composite
+  dynamic_groups: true
+  groups:
+    default:
+      lr_float: 0.00025
+      optimizer:
+        _name: adam
+        adam_betas: [ 0.9,0.98 ]
+        adam_eps: 1e-06
+        weight_decay: 0.01
+      lr_scheduler:
+        _name: cosine
+        warmup_updates: 10000
+
+# Native translation uses the nested schedule and treats this as a passthrough marker.
+lr_scheduler: pass_through
+
+# Base mean-teacher encoder, source mixup, masks, ALiBi, and decoder.
+model:
+  _name: data2vec_multi
+  loss_beta: 0
+  loss_scale: null
+
+  depth: 12
+  embed_dim: 768
+  clone_batch: 8
+
+  ema_decay: 0.9997
+  ema_end_decay: 1
+  ema_anneal_end_step: 300000
+  ema_encoder_only: false
+
+  average_top_k_layers: 12
+  instance_norm_target_layer: true
+  layer_norm_target_layer: false
+  layer_norm_targets: false
+
+  layerdrop: 0
+  norm_eps: 1e-5
+
+  supported_modality: AUDIO
+  target_mixup: false
+  source_mixup: 0.5  # The strength of the mixing (Uniformly sampled between this and 1.)
+  mixup_prob: 1.0  # How much of the source and targets should be mixed up (1.0 == 100%)
+  same_mixup: true  # Should we use the same strength for the full batch or use a random strength for every sample
+  mixing_window_length: 0.05  # The window length for the to-be-mixed windows in BC learning
+  gain_mode: "A_weighting"  # The mode with which the mixing gain is calculated, see BC learning paper
+
+  modalities:
+    audio:
+      sinc_input: true
+      apply_window_to_root: false
+      use_pswish: true
+      sinc_norm: "layer_norm"
+      conv_pos_depth: 5
+      conv_pos_width: 95
+      conv_pos_groups: 16
+      prenet_depth: 0  # The depth of the transformer based context_encoder
+      # mask_prob: 0.5
+      # mask_length: 5
+      mask_prob: 1.5  # Probability for a token being masked (Default is 0.65)
+      # The masking length if a token was chosen.
+      # This mask_prob and mask_length will mask ~93% of the input with a median masking length of 70 ms
+      mask_length: 2
+      mask_prob_adjust: 0.05
+      inverse_mask: false
+      mask_noise_std: 0.01
+      mask_dropout: 0
+      add_masks: false
+      ema_local_encoder: false
+      use_alibi_encoder: true
+      prenet_layerdrop: 0.05
+      prenet_dropout: 0.1
+      learned_alibi_scale: true
+      learned_alibi_scale_per_head: true
+      decoder:
+        input_dropout: 0.1
+        decoder_dim: 384
+        decoder_groups: 16
+        decoder_kernel: 7
+        decoder_layers: 4

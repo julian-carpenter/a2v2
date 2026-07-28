@@ -1,0 +1,498 @@
+# A2V2 code guide
+
+The current A2V2 runtime contains the complete Animal2Vec 1.0 reproduction
+baseline in five implementation files under `a2v2/`, plus one public API file.
+These six files form the stable control implementation against which future
+A2V2 methods can be compared. Each implementation file uses large section
+banners to preserve the navigation benefits of smaller modules. Search for a
+banner title or use an editor's symbol outline to move within a file.
+
+The package forms this one-way dependency chain:
+
+```text
+a2v2.config
+      ↓
+ a2v2.data
+      ↓
+ a2v2.model
+      ↓
+a2v2.training
+      ↓
+a2v2.workflows
+```
+
+`a2v2.__init__` re-exports the common configuration, model, and inference
+types. It does not own research logic.
+
+## Comment and notation conventions
+
+Result-sensitive blocks use paired comments:
+
+```python
+# Mathematics: equation, shape transformation, probability law, or state rule.
+# Interpretation: purpose in the Animal2Vec reproduction.
+```
+
+The order lets a reader verify the operation before reading its motivation.
+Comments name axes and units wherever a mismatch could change a result.
+
+The source uses these symbols:
+
+| Symbol | Meaning |
+| --- | --- |
+| `B` | batch size |
+| `S` | waveform samples per item |
+| `T` | convolution or transformer frames |
+| `C` | target classes, or convolution channels when stated |
+| `D` | transformer embedding dimension |
+| `H` | attention heads |
+| `d_h` | per-head dimension, `D/H` |
+| `M` | masked frame count |
+| `W` | distributed world size |
+| `K` | layer count, clone count, or accumulation count in local context |
+
+Waveform time uses samples until a function divides by sample rate. Event
+intervals use seconds. Padding masks use `True` for positions that contain no
+real input. Time masks use `True` for real frames hidden from the student.
+
+## Suggested reading path
+
+Researchers who want the shortest complete path should read:
+
+1. The module introduction and dataclasses in `config.py`.
+2. `conv_output_length`, `rasterize_labels`, `collate_audio`, and both samplers
+   in `data.py`.
+3. The section banners in `model.py`, starting at the Sinc filterbank and
+   continuing through attention, masking, `AudioEncoder`, and the two task
+   models.
+4. `FairseqCompatibleAdam`, `CosineUpdateScheduler`, and
+   `TrainingEngine.step` in `training.py`.
+5. `run_training`, `InferenceRunner`, and `convert_checkpoint` in
+   `workflows.py`.
+
+This order follows runtime data flow. A reader interested only in architecture
+can spend most of their time in `model.py`. A reader auditing resume behavior
+should start with `training.py` and then inspect the training section in
+`workflows.py`.
+
+## `a2v2/config.py`
+
+This file turns published Fairseq-style YAML into immutable Python dataclasses.
+It rejects unknown fields so a setting cannot disappear during framework
+removal.
+
+### Schema sections
+
+The dataclasses mirror top-level recipe groups:
+
+| Dataclass | Recipe responsibility |
+| --- | --- |
+| `CommonConfig` | seed, AMP, logging |
+| `CheckpointConfig` | save cadence and best metric |
+| `TaskConfig` | sample rate, labels, convolution geometry, data path |
+| `DatasetConfig` | workers, token budget, subsets, validation cadence |
+| `DistributedConfig` | requested and launched world size |
+| `CriterionConfig` | focal loss and event scoring |
+| `OptimizationConfig` | update accumulation, clipping, learning rate |
+| `OptimizerConfig` | Adam coefficients and weight decay |
+| `SchedulerConfig` | warmup and cosine floor |
+| `DecoderConfig` | reconstruction decoder |
+| `AudioModelConfig` | local frontend, masking, ALiBi, decoder |
+| `ModelConfig` | transformer, EMA, loss, mixup, fine-tuning |
+| `Animal2VecConfig` | complete validated runtime configuration |
+
+`parse_conv_feature_layers` accepts literal lists and the restricted list
+addition or repetition syntax used by official recipes. It never evaluates
+arbitrary Python.
+
+`config_from_dict` contains the full legacy-to-native translation. Read it when
+adding a recipe field. The function checks supported keys, resolves old
+composite optimizer wrappers, recovers model defaults that Hydra once supplied,
+and infers pretraining versus fine-tuning.
+
+`config_to_dict` converts paths and tuples into portable containers for
+checkpoints. `config_from_serialized_dict` performs the inverse operation.
+
+## `a2v2/data.py`
+
+This file covers the path from an audio filename to a device-ready batch.
+
+### Audio geometry and I/O
+
+`conv_output_length` applies the convolution recurrence
+
+```text
+L_next = floor((L + total_padding - kernel) / stride) + 1
+```
+
+one layer at a time. Model features, padding masks, labels, and test fixtures
+all call this function.
+
+`feature_timestamps` propagates receptive-field center and sample jump through
+the convolution stack. It returns center times in seconds.
+
+`load_audio` uses SoundFile and returns `[channels, samples]` float32 data.
+`normalize_waveform` reproduces Fairseq's affine-free layer normalization over
+the sample axis.
+
+`resample_waveform` implements windowed-sinc resampling in PyTorch. It maps each
+output index to a continuous input coordinate, builds a low-pass sinc kernel
+under a raised-cosine window, renormalizes boundary taps, and processes output
+positions in chunks.
+
+### Labels, manifests, and collation
+
+`load_label_events` reads sparse HDF5 intervals. `rasterize_labels` maps them to
+the zero-origin frame grid used by the published dataset code. That grid differs
+from receptive-field center timestamps; the source explains and preserves the
+difference.
+
+`AudioDataset` reads the root-plus-rows TSV format, resolves label paths, checks
+sample rate, averages channels, normalizes waveforms, and creates targets on
+demand.
+
+`collate_audio` chooses one batch sample length, applies deterministic random
+crops, creates padding masks, and maps each sample crop offset to its target
+frame offset.
+
+### Token batch samplers
+
+`TokenBatchSampler` sorts recordings by length and enforces
+
+```text
+batch_size × maximum_recording_length ≤ max_tokens
+```
+
+It stores the epoch and first undelivered batch index. `DistributedBatchSampler`
+assigns one complete token batch to each rank per synchronized round. Both
+classes keep their checkpoint state independent of DataLoader prefetch.
+
+## `a2v2/model.py`
+
+This file contains the complete differentiable a2v2. Its section order
+matches a bottom-up architecture reading.
+
+### Differentiable primitives
+
+`GradMultiply` leaves forward values unchanged and multiplies only the backward
+gradient. `SamePad` trims the extra frame created by symmetric padding with an
+even kernel. `PSwish` applies
+
+```text
+y[c] = alpha[c] x[c] sigmoid(beta[c] x[c]).
+```
+
+`DropPath` draws one Bernoulli variable per sample and residual path.
+
+The FP32 normalization classes perform reduction arithmetic in float32 under
+AMP and return the result in the input dtype.
+
+### Sinc filterbank
+
+`SincConv1d` parameterizes each first-layer filter through lower and upper
+cutoff frequencies. It constructs a symmetric band-pass response as the
+difference between two low-pass sinc functions, applies a Hamming window, and
+normalizes by bandwidth.
+
+The explicit reflection-padding branch uses slices and flips. CUDA's generic
+reflection-padding backward kernel uses nondeterministic atomics on the
+verified environment, so this implementation preserves the equivalent
+deterministic operation.
+
+### Attention and ALiBi
+
+`alibi_slopes` creates the geometric head slopes from the ALiBi paper.
+`alibi_bias` builds
+
+```text
+B[h,i,j] = -slope[h] |i-j|.
+```
+
+`MultiheadAttention` packs Q, K, and V in one projection to retain checkpoint
+layout. It adds ALiBi before masking, assigns negative infinity to padded keys,
+normalizes attention weights in float32, and returns to the surrounding dtype.
+
+### Masking and decoder
+
+`compute_mask_indices` reproduces the Fairseq Data2Vec span sampler, including
+stochastic span-count rounding, overlap modes, padding-aware lengths,
+equalization across a batch, and mask dropout. It uses NumPy randomness because
+the archived algorithm did.
+
+`make_mask_info` sorts unmasked positions before masked positions and records
+the inverse permutation. The student processes the shorter unmasked sequence.
+`restore_masked_features` appends mask vectors and gathers through the inverse
+permutation before decoding.
+
+`ConvDecoder` applies grouped temporal convolutions and predicts teacher
+features at every restored position. The pretraining objective selects only
+masked positions.
+
+### Objectives, mixup, and EMA teacher
+
+`RegressionLoss` implements summed MSE or smooth L1, scaled by `1/sqrt(D)` when
+the recipe does not provide a scale. It reports frame-token count as
+`sample_size`.
+
+`SigmoidFocalLoss` implements independent multilabel focal loss:
+
+```text
+p_t = y sigmoid(z) + (1-y)(1-sigmoid(z))
+FL = alpha_t BCE(z,y) (1-p_t)^gamma.
+```
+
+`make_teacher_targets` normalizes the selected EMA layer outputs and averages
+them. `a_weighted_level` and `mix_waveforms` implement perceptual gain-corrected
+between-class mixing.
+
+`EMATeacher` holds a float32, evaluation-mode copy of the student:
+
+```text
+teacher = decay × teacher + (1-decay) × student.
+```
+
+It copies buffers and never enables dropout.
+
+### Shared encoder
+
+`ConvFeatureEncoder` turns `[B,S]` waveforms into `[B,C,T]` local features.
+`AudioEncoder.project_waveform` normalizes and projects them to `[B,T,D]`.
+
+`PositionalConvEncoder` adds local relative-position information.
+`TransformerStack` runs the optional prenet and main blocks while retaining
+intermediate target tensors.
+
+`AudioEncoder.encode_projected` has two paths:
+
+- The teacher and fine-tuning path keeps all projected frames.
+- The masked student path zeros hidden positions before positional convolution,
+  gathers unmasked projected and positional vectors, and gathers matching ALiBi
+  rows and columns before attention.
+
+The gather-before-scale ALiBi order prevents a clone-expanded full bias tensor
+that exceeded A100 memory during verification.
+
+### Task models
+
+`Animal2VecPretrainingModel` performs this flow:
+
+```text
+waveform
+  → optional gain-corrected mixup
+  → one local projection
+  ├─→ full EMA teacher → normalized top-layer targets
+  └─→ cloned masks → shortened student → restored decoder predictions
+  → regression at masked positions
+```
+
+`Animal2VecFineTuningModel` constructs its encoder architecture from the
+pretraining configuration. It applies fine-tuning dropout, masks, mixup, and
+freeze schedules, averages final transformer layers, and produces framewise
+multilabel logits.
+
+## `a2v2/training.py`
+
+This file owns state transitions around the models.
+
+### Optimizer and schedule
+
+`FairseqCompatibleAdam` uses the archived epsilon placement:
+
+```text
+m_t = beta1 m_(t-1) + (1-beta1) g_t
+v_t = beta2 v_(t-1) + (1-beta2) g_t^2
+step_t = lr sqrt(1-beta2^t) / (1-beta1^t)
+theta_t = theta_(t-1) - step_t m_t / (sqrt(v_t) + epsilon).
+```
+
+`build_optimizer` excludes biases, one-dimensional normalization parameters,
+ALiBi scales, and P-Swish parameters from weight decay.
+
+`CosineUpdateScheduler` indexes learning rates by successful optimizer update.
+It supports linear warmup and cosine cycles. Diagnostic early stops do not
+change its full configured horizon.
+
+### Checkpoints and random state
+
+`capture_rng_state` records Python, NumPy, CPU PyTorch, and every CUDA generator.
+Distributed training gathers one state per rank into the rank-zero checkpoint.
+`restore_rng_state` requires the same world size and returns each rank to its
+own stream.
+
+`save_checkpoint` writes a temporary file and performs an atomic replacement.
+`validate_checkpoint` enforces the versioned plain-container schema.
+
+### Metrics and training engine
+
+`FrameCounts` stores additive TP, FP, TN, and FN counts. `average_precision`
+groups tied scores before integrating the precision-recall staircase.
+
+`TrainingEngine.step` performs one logical optimizer update:
+
+1. Backpropagate each summed microbatch loss.
+2. Sum loss and sample size across ranks.
+3. Account for DDP's `1/W` gradient average.
+4. Normalize gradients by global frame-token count.
+5. Clip the global gradient norm.
+6. Let GradScaler skip non-finite AMP attempts.
+7. Advance optimizer, update counter, schedule, and EMA after success.
+
+An AMP-skipped attempt changes only GradScaler state. It does not advance model,
+schedule, teacher, validation, sampler, or checkpoint cadence.
+
+## `a2v2/workflows.py`
+
+This file composes all lower-level pieces and owns external side effects.
+
+### Events and evaluation
+
+`pool_probabilities` applies centered average or maximum smoothing.
+`fuse_probabilities` thresholds pooled frames and converts maximal active runs
+to half-open intervals in seconds.
+
+The segmented evaluation section reproduces the archived matcher, including its
+inclusive interval arithmetic, strict IoU comparison, split and merger counts,
+classwise AP, macro and micro AP, and focal threshold search. Preserve its
+historical endpoint rules when comparing paper results.
+
+### Inference
+
+`InferenceRunner` loads a native fine-tuning checkpoint, reconstructs both
+active and pretrained configurations, and loads state strictly.
+
+`run_tensor` selects or averages channels, resamples to the model rate, divides
+long audio into bounded segments, computes probabilities and averaged
+embeddings, assigns absolute timestamps, removes frames beyond the true final
+duration, and fuses events.
+
+`write_events` owns the two external event-table representations. Its default
+native TSV stores label, onset seconds, offset seconds, and the full score.
+Passing `audition=True` writes the Animal2Vec 1.0 Adobe marker schema:
+`Name`, `Start`, `Duration`, `Time Format`, `Type`, and `Description`.
+The Audition branch converts
+\(\left(t_{\mathrm{start}},t_{\mathrm{end}}\right)\) into
+\(\left(t_{\mathrm{start}},t_{\mathrm{end}}-t_{\mathrm{start}}\right)\),
+formats both coordinates as `datetime.timedelta` values, and rounds the score
+to three decimal places. It sorts markers by numeric onset before writing the
+tab-delimited `.csv`.
+
+The serializer receives the existing event tuple. It does not suppress
+overlapping labels or reinterpret the `focal` channel. Researchers who need a
+different event-selection policy can operate on `InferenceResult.events`
+before calling `write_events`.
+
+### Checkpoint conversion
+
+The conversion section maps official Fairseq state keys to current model
+attributes. It validates destination shapes and complete target-key coverage.
+It never reshapes a plausible tensor to force a match.
+
+Converted checkpoints contain inference state and configuration but no portable
+Fairseq optimizer state. Use them for inference or initialization, not exact
+continuation of the archived training run.
+
+### Training orchestration
+
+`run_training` resolves rank-local devices, seeds each rank, constructs model
+and optimizer state, wraps DDP, restores checkpoints, creates token samplers and
+DataLoaders, and owns validation and save cadence.
+
+The workflow records batches delivered to training instead of the sampler
+cursor advanced by DataLoader prefetch. It also supplies a private DataLoader
+generator so worker setup does not consume the model RNG stream.
+
+The installed commands call these functions:
+
+| Command | Function |
+| --- | --- |
+| `a2v2-train` | `train_main` |
+| `a2v2-infer` | `infer_main` |
+| `a2v2-convert-checkpoint` | `convert_checkpoint_main` |
+
+For DDP, pass the installed training script to `torchrun`:
+
+```bash
+torchrun --standalone --nproc-per-node=4 \
+  "$(command -v a2v2-train)" \
+  --config configs/MeerKAT/a2v_large_pretrain_best.yaml \
+  --device cuda
+```
+
+## Import migration
+
+New code should import by responsibility:
+
+```python
+from a2v2.config import load_config
+from a2v2.data import AudioDataset, load_audio
+from a2v2.model import (
+    Animal2VecFineTuningModel,
+    Animal2VecPretrainingModel,
+    AudioEncoder,
+)
+from a2v2.training import TrainingEngine, load_checkpoint
+from a2v2.workflows import InferenceRunner, convert_checkpoint
+```
+
+The package root supports the common path:
+
+```python
+from a2v2 import (
+    Animal2VecFineTuningModel,
+    Animal2VecPretrainingModel,
+    InferenceRunner,
+    load_config,
+)
+```
+
+The intermediate `baseline` namespace and the old `animal2vec` package no
+longer exist. The source distribution contains no compatibility shims. A
+single `a2v2` namespace gives the Animal2Vec 1.0 control and future research
+code one readable home.
+
+## Compatibility contracts
+
+Native checkpoints store dictionaries and tensors rather than pickled model
+instances. Source module paths do not enter state keys. Model attribute names
+and construction order do.
+
+Tests protect these ordered state signatures:
+
+| Model | Entries | SHA-256 signature |
+| --- | ---: | --- |
+| Pretraining | 120 | `5efbec43fd1c1c392b8b4278cee6a21513f68f3095353bb22524d2ada2ecf6ad` |
+| Fine-tuning | 59 | `b7b2ea2ad9017ec94d56516fbda49a932866b472a48633804619b7232f3d05bb` |
+
+Configuration tests protect semantic YAML hashes. Documentation tests require a
+module docstring and docstrings on every named definition. Repository layout
+tests require exactly six Python files in `a2v2/`.
+
+## Verification commands
+
+Run the CPU suite:
+
+```bash
+python -m pytest -q
+```
+
+Run one-GPU tests:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q -m gpu
+```
+
+Run a four-rank exact-resume probe:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc-per-node=4 \
+  tests/gpu/nccl_resume.py \
+  --output-dir results/gpu_reverification/resume-4
+```
+
+The report in `gpu-verification-20260723.md` records the official checkpoint,
+FP32, FP16, gradient, optimizer-update, NCCL, memory, and exact-resume evidence
+for the implementation before file consolidation. The consolidation preserved
+function bodies and state signatures. A GPU agent should rerun the durable
+suite after any future change to equations, randomness, model attributes,
+checkpoint fields, batching, AMP, or DDP.

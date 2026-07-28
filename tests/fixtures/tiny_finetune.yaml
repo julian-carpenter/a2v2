@@ -1,0 +1,63 @@
+# Minimal fine-tuning architecture paired with tiny_pretrain.yaml.
+# It predicts one call class and a focal indicator, crosses an encoder freeze
+# boundary, and enables feature masking without source mixup.
+
+# Deterministic CPU execution.
+common:
+  fp16: false
+  seed: 7
+# Labeled synthetic waveforms must use the tiny pretraining frontend geometry.
+task:
+  _name: audio_ccas
+  data: tests/fixtures/manifests
+  sample_rate: 8000
+  normalize: true
+  with_labels: true
+  unique_labels: "['call', 'focal']"
+  conv_feature_layers: "[(8, 7, 1)] + [(16, 4, 2)] * 2"
+# Single-process batches for unit and integration tests.
+dataset:
+  max_tokens: 16000
+  num_workers: 0
+  train_subset: train
+  valid_subset: valid
+# Tests construct one process.
+distributed_training:
+  distributed_world_size: 1
+# Framewise focal loss with a visible diagnostic threshold.
+criterion:
+  _name: finetunecriterion
+  use_focal_loss: true
+  metric_threshold: 0.4
+# Three updates cover frozen and trainable encoder phases.
+optimization:
+  update_freq: [1]
+  max_update: 3
+  lr: [0.001]
+# Adam settings for supervised step tests.
+optimizer:
+  _name: adam
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1.0e-8
+# One warmup update makes schedule state observable.
+lr_scheduler:
+  _name: cosine
+  warmup_updates: 1
+# Native tiny pretraining checkpoint, freeze policy, masks, and regularization.
+model:
+  _name: wav2vec_ccas_finetune
+  w2v_path: checkpoints/tiny_pretrain.pt
+  freeze_finetune_updates: 1
+  feature_grad_mult: 0.0
+  apply_mask: true
+  average_top_k_layers: 2
+  mask_prob: 0.5
+  mask_length: 2
+  mask_channel_prob: 0.25
+  mask_channel_length: 2
+  dropout: 0.0
+  final_dropout: 0.0
+  layerdrop: 0.0
+  target_mixup: false
+  source_mixup: -1.0
+  mixup_prob: 0.0

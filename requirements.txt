@@ -1,0 +1,14 @@
+# PyTorch supplies tensors, neural networks, AMP, DDP, and checkpoint storage.
+torch>=2.3
+
+# NumPy supplies deterministic mask sampling and audit-array operations.
+numpy>=1.24
+
+# SoundFile reads waveform files through libsndfile without torchaudio.
+soundfile>=0.12
+
+# h5py reads the published sparse event annotation files.
+h5py>=3.8
+
+# PyYAML loads the published and smoke-test experiment recipes.
+PyYAML>=6.0
