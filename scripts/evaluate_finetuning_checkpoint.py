@@ -34,7 +34,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from a2v2.training import CheckpointError  # noqa: E402
-from a2v2.workflows import InferenceRunner, _validate  # noqa: E402
+from a2v2.workflows import InferenceRunner, TensorBoardLogger, _validate  # noqa: E402
 
 
 SCOPE_STATEMENT = (
@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-dir", required=True, type=Path)
     parser.add_argument("--subset", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=Path,
+        help="event directory; defaults to a tensorboard directory beside --output",
+    )
     parser.add_argument("--fold", required=True, type=_non_negative_integer)
     parser.add_argument("--fraction", required=True, choices=("100", "025", "001"))
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
@@ -176,12 +181,28 @@ def evaluate(arguments: argparse.Namespace) -> dict[str, Any]:
             num_workers=arguments.num_workers,
         ),
     )
-    metrics = _validate(
-        runner.model,
-        validation_config,
-        device=device,
-        update=runner.update,
+    output_path = arguments.output.resolve()
+    tensorboard_directory = (
+        arguments.tensorboard_dir.resolve()
+        if arguments.tensorboard_dir is not None
+        else output_path.parent / "tensorboard"
     )
+    with TensorBoardLogger(
+        tensorboard_directory,
+        purge_step=None,
+    ) as tensorboard_logger:
+        tensorboard_logger.log_run(
+            validation_config,
+            runner.model,
+            update=runner.update,
+        )
+        metrics = _validate(
+            runner.model,
+            validation_config,
+            device=device,
+            update=runner.update,
+            tensorboard_logger=tensorboard_logger,
+        )
 
     # Effective token batch is the product of per-rank padded-sample budget,
     # rank count, and gradient-accumulation steps. It is a capacity/throughput
@@ -239,6 +260,10 @@ def evaluate(arguments: argparse.Namespace) -> dict[str, Any]:
             "num_workers": arguments.num_workers,
         },
         "metrics": {name: float(value) for name, value in metrics.items()},
+        "tensorboard": {
+            "log_dir": str(tensorboard_directory),
+            "global_step": runner.update,
+        },
         "runtime": _runtime_metadata(device),
     }
 

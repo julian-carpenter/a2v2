@@ -16,6 +16,7 @@ import h5py
 import numpy as np
 import soundfile as sf
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from a2v2.config import config_to_dict, load_config
 from a2v2.model import Animal2VecFineTuningModel
@@ -88,6 +89,7 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert "dataset.train_subset=train_0" in semantic_stdout
     assert "dataset.valid_subset=valid_0" in semantic_stdout
     assert str(output / "final-evaluation/final-evaluation-report.json") in semantic_stdout
+    assert str(output / "final-evaluation/tensorboard") in semantic_stdout
 
 
 def test_dry_run_rejects_a_missing_selected_manifest(tmp_path: Path) -> None:
@@ -164,7 +166,7 @@ def _tiny_validation_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return manifests, checkpoint
 
 
-def test_evaluator_loads_a_native_checkpoint_and_writes_frame_metrics(
+def test_evaluator_loads_a_native_checkpoint_and_writes_validation_metrics(
     tmp_path: Path,
 ) -> None:
     """Run real CPU validation and retain enough provenance to audit the result."""
@@ -216,5 +218,26 @@ def test_evaluator_loads_a_native_checkpoint_and_writes_frame_metrics(
         "f1",
         "accuracy",
         "average_precision",
+        "segmented_precision",
+        "segmented_recall",
+        "segmented_f1",
+        "segmented_accuracy",
+        "segmented_average_precision",
+        "segmented_micro_average_precision",
+        "segmented_focal_threshold",
+        "segmented_focal_f1",
+        "segmented_focal_precision",
+        "segmented_focal_recall",
     }
     assert all(np.isfinite(value) for value in report["metrics"].values())
+    tensorboard_directory = output.parent / "tensorboard"
+    assert report["tensorboard"]["log_dir"] == str(tensorboard_directory.resolve())
+    events = EventAccumulator(str(tensorboard_directory))
+    events.Reload()
+    assert {
+        "validation/valid_0/loss",
+        "validation/valid_0/frame/f1",
+        "validation/valid_0/segmented/f1",
+        "validation/valid_0/segmented/average_precision/call",
+    } <= set(events.Tags()["scalars"])
+    assert "validation/valid_0/segmented/pr_micro" in events.Tags()["tensors"]

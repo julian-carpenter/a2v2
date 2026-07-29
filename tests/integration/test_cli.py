@@ -10,12 +10,21 @@ import h5py
 import numpy as np
 import soundfile as sf
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from a2v2.workflows import train_main
 from a2v2.training import load_checkpoint
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def _tensorboard_tags(directory: Path) -> dict[str, object]:
+    """Load tags after the training workflow has closed its event writer."""
+
+    events = EventAccumulator(str(directory))
+    events.Reload()
+    return events.Tags()
 
 
 def _assert_tree_equal(actual: Any, expected: Any, path: str = "root") -> None:
@@ -62,7 +71,7 @@ def _data(tmp_path: Path, lengths: tuple[int, ...] = (64, 72, 80)) -> Path:
     return manifests
 
 
-def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path) -> None:
+def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path, capsys) -> None:
     """Check cli pretrain resume and finetune flow."""
     manifests = _data(tmp_path)
     pretrain_dir = tmp_path / "pretrain"
@@ -101,6 +110,32 @@ def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path) -> None:
     assert "pretrained" in checkpoint["config"]
     assert checkpoint["best_metric"] is not None
     assert (finetune_dir / "checkpoint_best.pt").is_file()
+    records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+    ]
+    validation = next(record for record in records if "validation" in record)
+    for name in (
+        "segmented_precision",
+        "segmented_recall",
+        "segmented_f1",
+        "segmented_accuracy",
+        "segmented_average_precision",
+        "segmented_micro_average_precision",
+    ):
+        assert name in validation
+        assert np.isfinite(validation[name])
+    finetuning_tags = _tensorboard_tags(finetune_dir / "tensorboard")
+    assert {
+        "train/loss",
+        "train/gradient_norm",
+        "train/learning_rate",
+        "validation/valid/loss",
+        "validation/valid/frame/f1",
+        "validation/valid/segmented/f1",
+        "validation/valid/segmented/average_precision/call",
+    } <= set(finetuning_tags["scalars"])
+    assert "validation/valid/segmented/pr_micro" in finetuning_tags["tensors"]
 
 
 def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Path, capsys) -> None:
@@ -164,6 +199,17 @@ def test_cli_logs_pretraining_variance_diagnostics_only_for_pretraining(
         assert record["target_var"] > 0
         assert np.isfinite(record["pred_var"])
         assert np.isfinite(record["target_var"])
+    pretraining_tags = _tensorboard_tags(pretrain_dir / "tensorboard")
+    assert {
+        "train/loss",
+        "train/sample_size",
+        "train/gradient_norm",
+        "train/learning_rate",
+        "pretrain/pred_var",
+        "pretrain/target_var",
+        "run/parameters",
+        "run/trainable_parameters",
+    } <= set(pretraining_tags["scalars"])
 
     finetune_dir = tmp_path / "variance-finetune"
     assert train_main([
@@ -185,6 +231,9 @@ def test_cli_logs_pretraining_variance_diagnostics_only_for_pretraining(
     )
     assert "pred_var" not in finetuning_update
     assert "target_var" not in finetuning_update
+    finetuning_tags = _tensorboard_tags(finetune_dir / "tensorboard")
+    assert "train/loss" in finetuning_tags["scalars"]
+    assert "pretrain/pred_var" not in finetuning_tags["scalars"]
 
 
 def test_cli_checkpoint_tracks_consumed_batches_not_worker_prefetch(tmp_path: Path) -> None:

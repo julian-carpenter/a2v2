@@ -869,6 +869,45 @@ gradient norm, EMA decay, learning rate, and AMP scale. The terminal
 `training_summary` repeats the most recent pair, so a short burn-in exposes the
 diagnostic before it reaches `common.log_interval`.
 
+### TensorBoard monitoring
+
+The trainer writes TensorBoard events on rank zero for pretraining and
+fine-tuning. A relative `common.tensorboard_logdir` sits below
+`checkpoint.save_dir`. The published recipes use `tb`, so the MeerKAT command
+above writes:
+
+```text
+/checkpoints/meerkat-pretrain/tb
+```
+
+Recipes without `tensorboard_logdir` use
+`<checkpoint.save_dir>/tensorboard`. Open the dashboard with:
+
+```bash
+tensorboard --logdir /checkpoints/meerkat-pretrain/tb
+```
+
+The main training tags are:
+
+| Tag | Meaning |
+| --- | --- |
+| `train/loss` | Globally normalized update loss |
+| `train/sample_size` | Global frame-token count for the update |
+| `train/gradient_norm` | Gradient norm before clipping |
+| `train/learning_rate` | Post-update scheduler value |
+| `train/skipped` | One when AMP rejected an optimizer attempt |
+| `train/amp_scale` | Current GradScaler scale when FP16 is active |
+| `pretrain/pred_var` | Masked student-output dispersion |
+| `pretrain/target_var` | Matched EMA-target dispersion |
+
+`run/config` stores the resolved native recipe. `run/parameters` and
+`run/trainable_parameters` record model size. A resumed run purges stale events
+after the checkpoint step before it appends new measurements.
+
+Fine-tuning validation adds the `validation/<subset>/frame/` and
+`validation/<subset>/segmented/` groups. Those groups contain aggregate and
+classwise scalars, precision-recall curves, and event-diagnostic histograms.
+
 ### Single-GPU diagnostic pretraining
 
 For a functional diagnostic on one GPU, explicitly override the recipe's world
@@ -1270,7 +1309,8 @@ Fine-tuning validation computes normalized loss and framewise:
 - accuracy; and
 - micro average precision.
 
-The validation cadence and best-checkpoint metric come from the recipe.
+The validation cadence and best-checkpoint metric come from the recipe. The
+stdout JSON and TensorBoard event file receive the same aggregate values.
 
 ### Event metrics
 
@@ -1284,13 +1324,36 @@ without importing the analysis stack into the native runtime. It includes:
 - split and merger markers;
 - interval mean scores;
 - per-class AP;
-- macro and micro AP excluding the focal channel; and
+- macro AP over every legacy label column, including `focal`;
+- micro AP over every segment-class decision;
+- fixed-threshold segmented precision, recall, F1, and accuracy; and
 - best-unique-threshold focal precision, recall, and F1.
 
-The native implementation was compared against the actual archived evaluator on
-nontrivial fixtures using average windows 1 and 3 and maximum window 3. Scores,
-targets, IoUs, split/merger state, AP, macro/micro aggregation, focal threshold,
-precision, recall, and F1 were exact.
+Every fine-tuning validation invokes this matcher, including scheduled training
+validation and `scripts/evaluate_finetuning_checkpoint.py`. The standalone
+script writes the aggregate values to its JSON report and puts TensorBoard
+events in a `tensorboard` directory beside that report unless
+`--tensorboard-dir` selects another location.
+
+The matcher preserves two unusual archived conventions required for result
+comparison. Multi-frame intervals use an inclusive endpoint when constructed
+but enter half-open overlap arithmetic, and a pair counts only when
+`IoU > iou_threshold`. A previous native aggregator discarded all rows with no
+positive target. That rule also discarded genuine false-positive segments.
+The corrected aggregator retains the complete fixed-size arrays passed to the
+legacy classification and AP routines, including their zero padding.
+
+TensorBoard records:
+
+- framewise and segmented micro/classwise precision-recall curves;
+- classwise frame and segmented AP;
+- segmented IoU histograms per label; and
+- split and merger-count histograms per label.
+
+Tests cover perfect matches, misses, false positives, strict boundaries,
+splits, mergers, overlapping classes, pooling shifts, and all-negative clips.
+The pure-PyTorch average-precision implementation also matches scikit-learn's
+archived calculation to floating-point precision on tied-score fixtures.
 
 ### Paper-level evaluation caution
 

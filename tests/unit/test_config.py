@@ -49,6 +49,7 @@ def test_loads_meerkat_pretraining_recipe() -> None:
     assert cfg.common.fp16 is torch.cuda.is_available()
     assert cfg.common.fp16_init_scale == 1.0
     assert cfg.common.min_loss_scale == 1e-6
+    assert cfg.common.tensorboard_logdir == Path("tb")
     assert cfg.distributed.world_size == 1
     assert cfg.distributed.requested_world_size == 4
 
@@ -95,6 +96,7 @@ def test_loads_tiny_native_recipe() -> None:
     cfg = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
 
     assert cfg.common.seed == 7
+    assert cfg.common.tensorboard_logdir == Path("tensorboard")
     assert cfg.task.conv_feature_layers == ((8, 7, 1), (16, 4, 2), (16, 4, 2))
     assert cfg.model.audio.decoder.decoder_layers == 2
 

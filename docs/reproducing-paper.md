@@ -213,8 +213,23 @@ torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
 
 Validation follows `validate_after_updates` and `validate_interval_updates`.
 Each pass logs normalized loss, micro precision, recall, F1, accuracy, and micro
-average precision. `checkpoint_best.pt` tracks the recipe's
-`checkpoint.best_checkpoint_metric`; the MeerKAT recipe selects framewise F1.
+average precision. It also runs the archived-compatible event matcher and logs
+segmented precision, recall, F1, accuracy, macro AP, micro AP, classwise PR
+curves, IoU distributions, splits, and mergers. `checkpoint_best.pt` tracks the
+recipe's `checkpoint.best_checkpoint_metric`; the published MeerKAT recipe
+selects framewise F1. Set the metric suffix to `segmented_f1` when an experiment
+should select checkpoints by temporal event overlap.
+
+The published recipes write TensorBoard events below each training directory
+at `tb/`. For example:
+
+```bash
+tensorboard --logdir /checkpoints/meerkat-finetune/tb
+```
+
+The one-fold reproduction driver also writes standalone evaluation events to
+`final-evaluation/tensorboard/`. The adjacent JSON report records that absolute
+path and contains the same aggregate segmented metrics.
 
 For the labeled-data ablations, point each recipe at a manifest directory whose
 `train_0.tsv` contains the corresponding published 25% or 1% training split.

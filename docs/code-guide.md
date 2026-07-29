@@ -372,8 +372,17 @@ to half-open intervals in seconds.
 
 The segmented evaluation section reproduces the archived matcher, including its
 inclusive interval arithmetic, strict IoU comparison, split and merger counts,
-classwise AP, macro and micro AP, and focal threshold search. Preserve its
-historical endpoint rules when comparing paper results.
+classwise AP, macro and micro AP, fixed-threshold confusion metrics, and focal
+threshold search. It retains all fixed-size output rows because an all-zero
+target row can contain a false-positive segment score. Removing target-free
+rows inflates AP.
+
+`TensorBoardLogger` owns experiment event files. Rank zero records globally
+reduced training scalars at `common.log_interval`. `_validate` supplies
+recording-preserving frame tensors and segmented artifacts for scalar metrics,
+PR curves, and IoU/split/merger histograms. The standalone checkpoint evaluator
+uses the same class and `_validate` call, so it cannot drift to a second metric
+implementation.
 
 ### Inference
 
@@ -420,6 +429,11 @@ DataLoaders, and owns validation and save cadence.
 The workflow records batches delivered to training instead of the sampler
 cursor advanced by DataLoader prefetch. It also supplies a private DataLoader
 generator so worker setup does not consume the model RNG stream.
+
+Only rank zero creates `TensorBoardLogger`. Relative event paths resolve below
+`checkpoint.save_dir`; published `tensorboard_logdir: tb` values therefore
+remain recognizable within a self-contained experiment directory. Resume uses
+the next optimizer update as TensorBoard's purge boundary.
 
 The installed commands call these functions:
 

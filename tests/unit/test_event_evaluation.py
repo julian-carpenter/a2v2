@@ -32,9 +32,8 @@ def test_perfect_event_matches_archived_segment_score_and_iou() -> None:
     assert torch.count_nonzero(result.segmented_targets) == 1
 
 
-def test_aggregation_excludes_focal_from_call_averages_and_selects_focal_threshold() -> None:
-    """Check aggregation excludes focal from call averages and selects focal
-    threshold."""
+def test_aggregation_matches_legacy_macro_ap_and_selects_focal_threshold() -> None:
+    """Include every legacy label column in macro AP and score focal events."""
     result = SegmentedEvaluation(
         segmented_scores=torch.tensor([[[0.9, 0.9], [0.8, 0.7], [0.1, 0.6], [0.0, 0.0]]]),
         segmented_targets=torch.tensor([[[1, 1], [1, 0], [0, 1], [0, 0]]]),
@@ -49,10 +48,40 @@ def test_aggregation_excludes_focal_from_call_averages_and_selects_focal_thresho
         "call": 1.0,
         "focal": (1.0 + 2 / 3) / 2,
     })
-    assert metrics.macro_average_precision == 1.0
-    assert metrics.micro_average_precision == 1.0
+    assert metrics.macro_average_precision == pytest.approx(11 / 12)
+    assert metrics.micro_average_precision == pytest.approx(0.95)
     assert metrics.focal_threshold == pytest.approx(0.6)
     assert metrics.focal_f1 == pytest.approx(0.8)
+
+
+def test_segmented_aggregation_keeps_false_positive_samples() -> None:
+    """Count false-positive segments instead of mistaking them for padding.
+
+    This catches the previous ``targets.sum(...) != 0`` filter. A target-free
+    row can hold a real predicted event, so dropping it removes the strongest
+    false positive in this fixture and changes AP from 0.5 to 1.0.
+    """
+
+    result = SegmentedEvaluation(
+        segmented_scores=torch.tensor([[[0.6], [0.9], [0.0], [0.0]]]),
+        segmented_targets=torch.tensor([[[1], [0], [0], [0]]]),
+        ious=torch.tensor([[[0.75], [0.0]]]),
+        splits=torch.zeros(1, 2, 1, dtype=torch.long),
+        mergers=torch.zeros(1, 2, 1, dtype=torch.long),
+    )
+
+    metrics = aggregate_segmented_metrics(
+        [result],
+        ["call"],
+        metric_threshold=0.5,
+    )
+
+    assert metrics.precision == pytest.approx(0.5)
+    assert metrics.recall == pytest.approx(1.0)
+    assert metrics.f1 == pytest.approx(2 / 3)
+    assert metrics.classwise_average_precision == pytest.approx({"call": 0.5})
+    assert metrics.macro_average_precision == pytest.approx(0.5)
+    assert metrics.micro_average_precision == pytest.approx(0.5)
 
 
 def _evaluate(probabilities: list[float], targets: list[int], *, iou_threshold: float = 0.5):

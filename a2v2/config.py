@@ -48,6 +48,7 @@ class CommonConfig:
     seed: int = 1
     log_format: str = "json"
     log_interval: int = 100
+    tensorboard_logdir: Path = Path("tensorboard")
 
 
 @dataclass(frozen=True)
@@ -415,6 +416,9 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     # Mathematics: fp16_effective = fp16_requested ∧ CUDA_available.
     # Interpretation: CPU verification follows the same recipe without asking
     # PyTorch to execute unsupported half-precision training kernels.
+    tensorboard_logdir = Path(common_raw.get("tensorboard_logdir", "tensorboard"))
+    if not str(tensorboard_logdir):
+        raise ConfigError("common.tensorboard_logdir must not be empty")
     common = CommonConfig(
         fp16=bool(common_raw.get("fp16", False) and torch.cuda.is_available()),
         fp16_init_scale=float(common_raw.get("fp16_init_scale", 128.0)),
@@ -422,6 +426,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         seed=int(common_raw.get("seed", 1)),
         log_format=str(common_raw.get("log_format", "json")),
         log_interval=int(common_raw.get("log_interval", 100)),
+        tensorboard_logdir=tensorboard_logdir,
     )
 
     checkpoint_raw = _mapping(raw, "checkpoint")
@@ -712,7 +717,10 @@ def config_from_serialized_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     """Restore the native dataclass representation stored in checkpoints."""
 
     try:
-        common = CommonConfig(**dict(raw["common"]))  # type: ignore[arg-type]
+        common_values = dict(raw["common"])  # type: ignore[arg-type]
+        if "tensorboard_logdir" in common_values:
+            common_values["tensorboard_logdir"] = Path(common_values["tensorboard_logdir"])
+        common = CommonConfig(**common_values)
         checkpoint_values = dict(raw["checkpoint"])  # type: ignore[arg-type]
         checkpoint_values["save_dir"] = Path(checkpoint_values["save_dir"])
         checkpoint = CheckpointConfig(**checkpoint_values)

@@ -21,6 +21,8 @@ dependencies = [
   "h5py>=3.8",
   # Published recipes and command-line overrides begin as YAML.
   "PyYAML>=6.0",
+  # PyTorch's SummaryWriter uses TensorBoard's event protocol and dashboard.
+  "tensorboard>=2.14",
 ]
 
 # Pytest is needed only by developers and verification agents.

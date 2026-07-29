@@ -35,6 +35,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from .config import (
     Animal2VecConfig,
@@ -72,6 +73,262 @@ from .training import (
     save_checkpoint,
     serialize_rng_state,
 )
+
+
+# =============================================================================
+# TENSORBOARD EXPERIMENT LOGGING
+# =============================================================================
+
+def resolve_tensorboard_directory(config: Animal2VecConfig) -> Path:
+    """Resolve a recipe's event directory inside its checkpoint directory."""
+
+    configured = config.common.tensorboard_logdir
+    return configured if configured.is_absolute() else config.checkpoint.save_dir / configured
+
+
+def _tensorboard_label(label: str) -> str:
+    """Return a stable tag component for one researcher-defined class name."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", label.strip())
+    return cleaned or "unnamed"
+
+
+class TensorBoardLogger:
+    """Write compact experiment records through PyTorch's TensorBoard API.
+
+    The training workflow creates this object on rank zero only. Methods accept
+    detached CPU tensors at validation boundaries, which keeps event writing
+    outside model autograd and avoids retaining accelerator allocations.
+    """
+
+    def __init__(self, directory: str | Path, *, purge_step: int | None) -> None:
+        self.directory = Path(directory)
+        try:
+            self.writer = SummaryWriter(
+                log_dir=str(self.directory),
+                purge_step=purge_step,
+            )
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(
+                f"could not initialize TensorBoard logging in {self.directory}: {error}"
+            ) from error
+        self._closed = False
+
+    def log_run(self, config: Animal2VecConfig, model: nn.Module, *, update: int) -> None:
+        """Record the resolved recipe and model size at the run boundary."""
+
+        serialized = json.dumps(config_to_dict(config), indent=2, sort_keys=True)
+        self.writer.add_text("run/config", f"```json\n{serialized}\n```", update)
+        parameter_count = sum(parameter.numel() for parameter in model.parameters())
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+        self.writer.add_scalar("run/parameters", parameter_count, update)
+        self.writer.add_scalar("run/trainable_parameters", trainable_count, update)
+        self.writer.add_text("run/stage", config.stage, update)
+        self.writer.flush()
+
+    def log_update(
+        self,
+        result: UpdateResult,
+        *,
+        stage: str,
+        amp_scale: float | None,
+    ) -> None:
+        """Record one globally reduced logical optimizer-update result."""
+
+        step = result.update
+        scalars = {
+            "train/loss": result.loss,
+            "train/sample_size": result.sample_size,
+            "train/gradient_norm": result.gradient_norm,
+            "train/learning_rate": result.learning_rate,
+            "train/skipped": float(result.skipped),
+        }
+        if amp_scale is not None:
+            scalars["train/amp_scale"] = amp_scale
+        if stage == "pretrain":
+            if result.pred_var is not None:
+                scalars["pretrain/pred_var"] = result.pred_var
+            if result.target_var is not None:
+                scalars["pretrain/target_var"] = result.target_var
+        for tag, value in scalars.items():
+            self.writer.add_scalar(tag, value, step)
+        self.writer.flush()
+
+    def log_validation(
+        self,
+        metrics: Mapping[str, float],
+        *,
+        update: int,
+        subset: str,
+        labels: Sequence[str] = (),
+        frame_scores: Tensor | None = None,
+        frame_targets: Tensor | None = None,
+        segmented_evaluations: Sequence[SegmentedEvaluation] = (),
+        metric_threshold: float = 0.5,
+    ) -> None:
+        """Record validation scalars, PR curves, and event diagnostics."""
+
+        base = f"validation/{_tensorboard_label(subset)}"
+        for name, value in metrics.items():
+            if name == "loss":
+                tag = f"{base}/loss"
+            elif name.startswith("segmented_"):
+                tag = f"{base}/segmented/{name.removeprefix('segmented_')}"
+            else:
+                tag = f"{base}/frame/{name}"
+            self.writer.add_scalar(tag, value, update)
+
+        if frame_scores is not None and frame_targets is not None:
+            scores = frame_scores.detach().float().cpu()
+            targets = frame_targets.detach().long().cpu()
+            if scores.shape != targets.shape or scores.ndim != 2:
+                raise ValueError(
+                    "TensorBoard frame scores and targets must share [frames, labels] shape"
+                )
+            if scores.shape[1] != len(labels):
+                raise ValueError("TensorBoard labels must match frame score columns")
+            self.writer.add_pr_curve(
+                f"{base}/frame/pr_micro",
+                targets.reshape(-1),
+                scores.reshape(-1),
+                global_step=update,
+            )
+            frame_predictions = scores >= metric_threshold
+            for index, label in enumerate(labels):
+                safe_label = _tensorboard_label(label)
+                self.writer.add_pr_curve(
+                    f"{base}/frame/pr/{safe_label}",
+                    targets[:, index],
+                    scores[:, index],
+                    global_step=update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/frame/average_precision/{safe_label}",
+                    average_precision(scores[:, index], targets[:, index]),
+                    update,
+                )
+                counts = FrameCounts.from_predictions(
+                    frame_predictions[:, index],
+                    targets[:, index].bool(),
+                )
+                self.writer.add_scalar(
+                    f"{base}/frame/precision/{safe_label}",
+                    counts.precision,
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/frame/recall/{safe_label}",
+                    counts.recall,
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/frame/f1/{safe_label}",
+                    counts.f1,
+                    update,
+                )
+
+        if segmented_evaluations:
+            segmented = aggregate_segmented_metrics(
+                segmented_evaluations,
+                labels,
+                metric_threshold=metric_threshold,
+            )
+            segment_scores = torch.cat([
+                evaluation.segmented_scores.reshape(
+                    -1, evaluation.segmented_scores.shape[-1]
+                )
+                for evaluation in segmented_evaluations
+            ]).float().cpu()
+            segment_targets = torch.cat([
+                evaluation.segmented_targets.reshape(
+                    -1, evaluation.segmented_targets.shape[-1]
+                )
+                for evaluation in segmented_evaluations
+            ]).long().cpu()
+            self.writer.add_pr_curve(
+                f"{base}/segmented/pr_micro",
+                segment_targets.reshape(-1),
+                segment_scores.reshape(-1),
+                global_step=update,
+            )
+            for index, label in enumerate(labels):
+                safe_label = _tensorboard_label(label)
+                self.writer.add_pr_curve(
+                    f"{base}/segmented/pr/{safe_label}",
+                    segment_targets[:, index],
+                    segment_scores[:, index],
+                    global_step=update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/segmented/average_precision/{safe_label}",
+                    segmented.classwise_average_precision[label],
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/segmented/precision/{safe_label}",
+                    segmented.classwise_precision[label],
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/segmented/recall/{safe_label}",
+                    segmented.classwise_recall[label],
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/segmented/f1/{safe_label}",
+                    segmented.classwise_f1[label],
+                    update,
+                )
+                distributions = {
+                    "iou": torch.cat([
+                        evaluation.ious[..., index].reshape(-1)
+                        for evaluation in segmented_evaluations
+                    ]),
+                    "splits": torch.cat([
+                        evaluation.splits[..., index].reshape(-1)
+                        for evaluation in segmented_evaluations
+                    ]),
+                    "mergers": torch.cat([
+                        evaluation.mergers[..., index].reshape(-1)
+                        for evaluation in segmented_evaluations
+                    ]),
+                }
+                for name, values in distributions.items():
+                    nonzero = values[values != 0].detach().float().cpu()
+                    if nonzero.numel():
+                        self.writer.add_histogram(
+                            f"{base}/segmented/{name}/{safe_label}",
+                            nonzero,
+                            global_step=update,
+                        )
+        self.writer.flush()
+
+    def close(self) -> None:
+        """Flush and close the event writer once."""
+
+        if self._closed:
+            return
+        self.writer.flush()
+        self.writer.close()
+        self._closed = True
+
+    def __enter__(self) -> "TensorBoardLogger":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # SummaryWriter owns a background event thread. This fallback releases
+        # it if an exception leaves the training loop before its normal close.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -212,11 +469,18 @@ class SegmentedEvaluation:
 
 @dataclass(frozen=True)
 class SegmentedMetrics:
-    """Dataset-level AP and optional focal-label threshold measurements."""
+    """Dataset-level event metrics after archived segment matching."""
 
     classwise_average_precision: dict[str, float]
+    classwise_precision: dict[str, float]
+    classwise_recall: dict[str, float]
+    classwise_f1: dict[str, float]
     macro_average_precision: float
     micro_average_precision: float
+    precision: float
+    recall: float
+    f1: float
+    accuracy: float
     focal_threshold: float | None
     focal_f1: float | None
     focal_precision: float | None
@@ -427,9 +691,16 @@ def aggregate_segmented_metrics(
     evaluations: Sequence[SegmentedEvaluation],
     labels: Sequence[str],
     *,
+    metric_threshold: float = 0.5,
     focal_label: str = "focal",
 ) -> SegmentedMetrics:
-    """Aggregate segmented evaluations into paper-compatible AP metrics."""
+    """Aggregate the complete archived segment-sample tensors.
+
+    Rows with no positive target remain in the calculation because they can
+    represent false-positive predicted segments. The archived logger also
+    retained the unused zero padding in each fixed-size tensor, so this
+    function keeps it for numerical compatibility.
+    """
 
     if not evaluations:
         raise ValueError("at least one segmented evaluation is required")
@@ -443,29 +714,36 @@ def aggregate_segmented_metrics(
     ])
     if scores.shape != targets.shape or scores.shape[1] != len(labels):
         raise ValueError("labels must match the segmented score and target class dimension")
-    # Mathematics: retain segmented rows with Σ_c y_c != 0 before AP.
-    # Interpretation: fixed-size zero padding from the legacy matcher does not
-    # become a large set of synthetic negative examples.
-    populated = targets.sum(dim=1) != 0
-    scores = scores[populated]
-    targets = targets[populated]
     classwise = {
         label: average_precision(scores[:, index], targets[:, index])
         for index, label in enumerate(labels)
     }
-    call_indices = [index for index, label in enumerate(labels) if label != focal_label]
-    # Mathematics: macro AP averages per-call-class AP, while micro AP flattens
-    # every call class and frame into one binary ranking problem.
-    # Interpretation: macro weights species/categories equally; micro weights
-    # each labeled decision equally. The special focal channel is excluded.
-    macro = (
-        sum(classwise[labels[index]] for index in call_indices) / len(call_indices)
-        if call_indices else 0.0
-    )
-    micro = (
-        average_precision(scores[:, call_indices].reshape(-1), targets[:, call_indices].reshape(-1))
-        if call_indices else 0.0
-    )
+    # Mathematics: the archived ``average_precision_score(ta, pr)`` uses a
+    # macro average over all C columns, while flattening gives micro AP.
+    # Interpretation: the first value weights labels equally, including the
+    # focal channel; the second weights every segment-class decision equally.
+    macro = sum(classwise.values()) / len(classwise) if classwise else 0.0
+    micro = average_precision(scores.reshape(-1), targets.reshape(-1))
+
+    predicted = scores >= metric_threshold
+    positive = targets.bool()
+    total_counts = FrameCounts.from_predictions(predicted, positive)
+    class_counts = [
+        FrameCounts.from_predictions(predicted[:, index], positive[:, index])
+        for index in range(scores.shape[1])
+    ]
+    classwise_precision = {
+        label: class_counts[index].precision
+        for index, label in enumerate(labels)
+    }
+    classwise_recall = {
+        label: class_counts[index].recall
+        for index, label in enumerate(labels)
+    }
+    classwise_f1 = {
+        label: class_counts[index].f1
+        for index, label in enumerate(labels)
+    }
     if focal_label in labels:
         focal_index = labels.index(focal_label)
         threshold, f1, precision, recall = _best_f1(
@@ -475,8 +753,15 @@ def aggregate_segmented_metrics(
         threshold = f1 = precision = recall = None
     return SegmentedMetrics(
         classwise_average_precision=classwise,
+        classwise_precision=classwise_precision,
+        classwise_recall=classwise_recall,
+        classwise_f1=classwise_f1,
         macro_average_precision=macro,
         micro_average_precision=micro,
+        precision=total_counts.precision,
+        recall=total_counts.recall,
+        f1=total_counts.f1,
+        accuracy=total_counts.accuracy,
         focal_threshold=threshold,
         focal_f1=f1,
         focal_precision=precision,
@@ -1231,8 +1516,9 @@ def _validate(
     *,
     device: torch.device,
     update: int,
+    tensorboard_logger: TensorBoardLogger | None = None,
 ) -> dict[str, float]:
-    """Evaluate one subset and return loss plus frame metrics when labeled."""
+    """Evaluate one subset with framewise and segmented event measurements."""
 
     dataset = _make_dataset(config, config.dataset.valid_subset)
     if len(dataset) == 0:
@@ -1263,6 +1549,7 @@ def _validate(
     counts = FrameCounts()
     score_parts: list[Tensor] = []
     target_parts: list[Tensor] = []
+    segmented_evaluations: list[SegmentedEvaluation] = []
     try:
         for cpu_batch in loader:
             batch = _move_batch(cpu_batch, device)
@@ -1295,34 +1582,122 @@ def _validate(
                 targets = output.targets
                 if targets is None:
                     raise ValueError("fine-tuning validation did not return targets")
-                if output.padding_mask is not None:
-                    valid = ~output.padding_mask
-                    scores = scores[valid]
-                    targets = targets[valid]
-                score_parts.append(scores.detach().cpu().reshape(-1))
-                target_parts.append(targets.detach().cpu().reshape(-1))
-                # Mathematics: threshold p>=τ and target y>=0.5 before adding
-                # binary confusion counts over all valid frame-class pairs.
-                # Interpretation: padding does not appear as true negatives,
-                # and soft mixup-style targets use a stable binary boundary.
-                counts += FrameCounts.from_predictions(
-                    scores >= config.criterion.metric_threshold,
-                    targets >= 0.5,
-                )
+                for sample_index in range(scores.shape[0]):
+                    if output.padding_mask is None:
+                        valid_frames = torch.ones(
+                            scores.shape[1],
+                            dtype=torch.bool,
+                            device=scores.device,
+                        )
+                    else:
+                        valid_frames = ~output.padding_mask[sample_index]
+                    sample_scores = scores[sample_index, valid_frames]
+                    sample_targets = targets[sample_index, valid_frames]
+                    if sample_scores.numel() == 0:
+                        continue
+                    cpu_scores = sample_scores.detach().float().cpu()
+                    cpu_targets = sample_targets.detach().float().cpu()
+                    score_parts.append(cpu_scores)
+                    target_parts.append(cpu_targets)
+                    # Mathematics: threshold p>=τ and target y>=0.5 before
+                    # adding binary confusion counts over every valid
+                    # frame-class pair.
+                    # Interpretation: padded audio cannot appear as a true
+                    # negative, while soft labels retain a stable boundary.
+                    counts += FrameCounts.from_predictions(
+                        cpu_scores >= config.criterion.metric_threshold,
+                        cpu_targets >= 0.5,
+                    )
+
+                    source_padding = batch.get("padding_mask")
+                    if isinstance(source_padding, Tensor):
+                        source_samples = int(
+                            (~source_padding[sample_index]).sum().item()
+                        )
+                    else:
+                        source_samples = int(batch["source"].shape[-1])
+                    # Mathematics: archived feature rate is
+                    # f_e=(T/S)f_s, hence pooling width
+                    # w=round(f_e sigma_s). The scorer applies max(w,1)
+                    # because PyTorch pooling requires a positive kernel.
+                    # Interpretation: sigma_s retains its meaning in seconds
+                    # for every frontend geometry and cropped recording.
+                    feature_rate = (
+                        cpu_scores.shape[0]
+                        / max(source_samples, 1)
+                        * config.task.sample_rate
+                    )
+                    window_frames = max(
+                        1,
+                        round(feature_rate * config.criterion.sigma_s),
+                    )
+                    segmented_evaluations.append(
+                        legacy_segmented_evaluation(
+                            cpu_scores.unsqueeze(0),
+                            (cpu_targets >= 0.5).long().unsqueeze(0),
+                            method=config.criterion.event_method,  # type: ignore[arg-type]
+                            window_frames=window_frames,
+                            metric_threshold=config.criterion.metric_threshold,
+                            iou_threshold=config.criterion.iou_threshold,
+                        )
+                    )
     finally:
         model.train(was_training)
 
     metrics = {"loss": total_loss / max(total_sample_size, 1)}
     if config.stage == "finetune":
+        frame_scores = torch.cat(score_parts) if score_parts else torch.empty(
+            0, len(config.task.unique_labels)
+        )
+        frame_targets = torch.cat(target_parts) if target_parts else torch.empty_like(
+            frame_scores
+        )
         metrics.update({
             "precision": counts.precision,
             "recall": counts.recall,
             "f1": counts.f1,
             "accuracy": counts.accuracy,
             "average_precision": average_precision(
-                torch.cat(score_parts), torch.cat(target_parts)
+                frame_scores.reshape(-1), frame_targets.reshape(-1)
             ) if score_parts else 0.0,
         })
+        segmented = aggregate_segmented_metrics(
+            segmented_evaluations,
+            config.task.unique_labels,
+            metric_threshold=config.criterion.metric_threshold,
+        )
+        metrics.update({
+            "segmented_precision": segmented.precision,
+            "segmented_recall": segmented.recall,
+            "segmented_f1": segmented.f1,
+            "segmented_accuracy": segmented.accuracy,
+            "segmented_average_precision": segmented.macro_average_precision,
+            "segmented_micro_average_precision": segmented.micro_average_precision,
+        })
+        if segmented.focal_threshold is not None:
+            metrics.update({
+                "segmented_focal_threshold": segmented.focal_threshold,
+                "segmented_focal_f1": segmented.focal_f1 or 0.0,
+                "segmented_focal_precision": segmented.focal_precision or 0.0,
+                "segmented_focal_recall": segmented.focal_recall or 0.0,
+            })
+        if tensorboard_logger is not None:
+            tensorboard_logger.log_validation(
+                metrics,
+                update=update,
+                subset=config.dataset.valid_subset,
+                labels=config.task.unique_labels,
+                frame_scores=frame_scores,
+                frame_targets=frame_targets,
+                segmented_evaluations=segmented_evaluations,
+                metric_threshold=config.criterion.metric_threshold,
+            )
+    elif tensorboard_logger is not None:
+        tensorboard_logger.log_validation(
+            metrics,
+            update=update,
+            subset=config.dataset.valid_subset,
+        )
     return metrics
 
 
@@ -1486,6 +1861,20 @@ def run_training(
     last_path = output_directory / "checkpoint_last.pt"
     last_validation_update = -1
     last_result: UpdateResult | None = None
+    tensorboard_logger = (
+        TensorBoardLogger(
+            resolve_tensorboard_directory(config),
+            purge_step=engine.update + 1 if engine.update > 0 else None,
+        )
+        if rank == 0
+        else None
+    )
+    if tensorboard_logger is not None:
+        tensorboard_logger.log_run(
+            config,
+            engine.unwrapped_model,
+            update=engine.update,
+        )
 
     def write_checkpoint(path: Path) -> None:
         """Gather rank RNG states and let rank zero write one checkpoint."""
@@ -1528,12 +1917,13 @@ def run_training(
                 config,
                 device=device,
                 update=engine.update,
+                tensorboard_logger=tensorboard_logger,
             )
             print(json.dumps({
                 "validation": config.dataset.valid_subset,
                 "update": engine.update,
                 **metrics,
-            }))
+            }), flush=True)
             _, current, maximize = _tracked_metric(config, metrics)
             # Mathematics: loss improves under <, whereas AP/F1/accuracy-style
             # metrics improve under >.
@@ -1580,6 +1970,16 @@ def run_training(
                     "target_var": result.target_var,
                 })
             print(json.dumps(record), flush=True)
+            if tensorboard_logger is not None:
+                tensorboard_logger.log_update(
+                    result,
+                    stage=config.stage,
+                    amp_scale=(
+                        engine.scaler.get_scale()
+                        if engine.scaler is not None
+                        else None
+                    ),
+                )
         if result.skipped:
             return
         if config.checkpoint.save_interval_updates > 0 and result.update % config.checkpoint.save_interval_updates == 0:
@@ -1704,6 +2104,9 @@ def run_training(
             "cuda_peak_memory_allocated": torch.cuda.max_memory_allocated(device),
             "cuda_peak_memory_reserved": torch.cuda.max_memory_reserved(device),
         })
+    if tensorboard_logger is not None:
+        tensorboard_logger.close()
+        summary["tensorboard_logdir"] = str(tensorboard_logger.directory)
     print(json.dumps({"training_summary": summary}), flush=True)
     if initialized_here:
         dist.destroy_process_group()
