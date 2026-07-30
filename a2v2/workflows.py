@@ -68,10 +68,9 @@ from .training import (
     average_precision,
     build_optimizer,
     capture_rng_state,
-    deserialize_rng_state,
+    gather_rank_rng_states,
     load_checkpoint,
     save_checkpoint,
-    serialize_rng_state,
 )
 
 
@@ -1399,6 +1398,17 @@ def _distributed_device(requested: str) -> tuple[torch.device, int, int, bool]:
     return device, rank, world_size, initialized_here
 
 
+def _checkpoint_process_group(
+    device: torch.device,
+    world_size: int,
+) -> dist.ProcessGroup | None:
+    """Create a CPU control plane for object checkpoint collectives when needed."""
+
+    if world_size > 1 and device.type == "cuda":
+        return dist.new_group(backend="gloo")
+    return None
+
+
 def _ddp_find_unused_parameters(config: Animal2VecConfig) -> bool:
     """Return the fixed traversal setting used by exact-resume verification."""
 
@@ -1736,7 +1746,7 @@ def _restore_and_release_checkpoint(
 
 # Training orchestration
 
-def run_training(
+def _run_training(
     config: Animal2VecConfig,
     *,
     device_name: str,
@@ -1756,6 +1766,7 @@ def run_training(
             f"{config.distributed.requested_world_size} but the launch created {world_size} process(es); "
             "use torchrun with the configured worker count or override the field"
         )
+    checkpoint_group = _checkpoint_process_group(device, world_size)
     # Mathematics: rank r starts each global RNG at seed+r; its exact evolved
     # states later enter distributed checkpoints.
     # Interpretation: workers draw distinct augmentations during a run but
@@ -1885,19 +1896,19 @@ def run_training(
         # stochastic stream after a multi-GPU restart.
         payload = engine.checkpoint_payload(stage=config.stage, config=serialized)
         if world_size > 1:
-            gathered: list[object] | None = [None] * world_size if rank == 0 else None
-            encoded = serialize_rng_state(payload["rng_state"])
-            dist.gather_object(encoded, gathered, dst=0)
+            local_rng_state = payload["rng_state"]
+            if not isinstance(local_rng_state, Mapping):
+                raise CheckpointError("local RNG checkpoint state is not a mapping")
+            gathered = gather_rank_rng_states(
+                local_rng_state,
+                world_size=world_size,
+                rank=rank,
+                group=checkpoint_group,
+            )
             if rank == 0:
-                assert gathered is not None
-                payload["rng_state"] = {
-                    "world_size": world_size,
-                    "by_rank": [
-                        deserialize_rng_state(item)
-                        for item in gathered
-                        if isinstance(item, bytes)
-                    ],
-                }
+                if gathered is None:
+                    raise CheckpointError("rank zero received no distributed RNG state")
+                payload["rng_state"] = gathered
         if rank == 0:
             save_checkpoint(path, payload)
 
@@ -2108,9 +2119,31 @@ def run_training(
         tensorboard_logger.close()
         summary["tensorboard_logdir"] = str(tensorboard_logger.directory)
     print(json.dumps({"training_summary": summary}), flush=True)
-    if initialized_here:
-        dist.destroy_process_group()
     return last_path
+
+
+def run_training(
+    config: Animal2VecConfig,
+    *,
+    device_name: str,
+    resume_path: Path | None,
+    pretrained_checkpoint: Path | None,
+    stop_at_update: int | None = None,
+) -> Path:
+    """Run training and release only a process group initialized by this call."""
+
+    caller_owned_group = dist.is_initialized()
+    try:
+        return _run_training(
+            config,
+            device_name=device_name,
+            resume_path=resume_path,
+            pretrained_checkpoint=pretrained_checkpoint,
+            stop_at_update=stop_at_update,
+        )
+    finally:
+        if not caller_owned_group and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def train_main(argv: Sequence[str] | None = None) -> int:

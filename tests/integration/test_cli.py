@@ -8,15 +8,114 @@ from typing import Any
 
 import h5py
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+import a2v2.workflows as workflows
 from a2v2.workflows import train_main
 from a2v2.training import load_checkpoint
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_checkpoint_process_group_uses_gloo_for_distributed_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check CUDA training separates checkpoint objects from NCCL collectives."""
+    selected_group = object()
+
+    def fake_new_group(*, backend: str) -> object:
+        assert backend == "gloo"
+        return selected_group
+
+    monkeypatch.setattr(workflows.dist, "new_group", fake_new_group)
+
+    assert workflows._checkpoint_process_group(torch.device("cuda", 0), 8) is selected_group
+
+
+@pytest.mark.parametrize(
+    ("device", "world_size"),
+    [(torch.device("cpu"), 8), (torch.device("cuda", 0), 1)],
+)
+def test_checkpoint_process_group_skips_cpu_or_single_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    device: torch.device,
+    world_size: int,
+) -> None:
+    """Check launches that do not need a second backend create no group."""
+
+    def unexpected_new_group(*, backend: str) -> object:
+        raise AssertionError(f"unexpected {backend} process group")
+
+    monkeypatch.setattr(workflows.dist, "new_group", unexpected_new_group)
+
+    assert workflows._checkpoint_process_group(device, world_size) is None
+
+
+def test_run_training_destroys_process_group_created_during_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check exceptions cannot leak a process group initialized by training."""
+    distributed = {"initialized": False}
+    destroyed: list[bool] = []
+
+    monkeypatch.setattr(
+        workflows.dist,
+        "is_initialized",
+        lambda: distributed["initialized"],
+    )
+
+    def fake_run_training(*args: object, **kwargs: object) -> Path:
+        distributed["initialized"] = True
+        raise RuntimeError("forced training failure")
+
+    def fake_destroy_process_group() -> None:
+        destroyed.append(True)
+        distributed["initialized"] = False
+
+    monkeypatch.setattr(workflows, "_run_training", fake_run_training)
+    monkeypatch.setattr(workflows.dist, "destroy_process_group", fake_destroy_process_group)
+
+    with pytest.raises(RuntimeError, match="forced training failure"):
+        workflows.run_training(
+            object(),  # type: ignore[arg-type]
+            device_name="cuda",
+            resume_path=None,
+            pretrained_checkpoint=None,
+        )
+
+    assert destroyed == [True]
+
+
+def test_run_training_preserves_caller_owned_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check training does not destroy a process group initialized by its caller."""
+    monkeypatch.setattr(workflows.dist, "is_initialized", lambda: True)
+
+    def fake_run_training(*args: object, **kwargs: object) -> Path:
+        raise RuntimeError("forced training failure")
+
+    def unexpected_destroy_process_group() -> None:
+        raise AssertionError("caller-owned process group was destroyed")
+
+    monkeypatch.setattr(workflows, "_run_training", fake_run_training)
+    monkeypatch.setattr(
+        workflows.dist,
+        "destroy_process_group",
+        unexpected_destroy_process_group,
+    )
+
+    with pytest.raises(RuntimeError, match="forced training failure"):
+        workflows.run_training(
+            object(),  # type: ignore[arg-type]
+            device_name="cuda",
+            resume_path=None,
+            pretrained_checkpoint=None,
+        )
 
 
 def _tensorboard_tags(directory: Path) -> dict[str, object]:
