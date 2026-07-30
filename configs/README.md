@@ -22,6 +22,36 @@ These files define the frozen Animal2Vec 1.0 control baseline. New A2V2
 experiments should not overwrite them or reuse their filenames for changed
 methods.
 
+## What belongs in a native recipe
+
+Each checked-in YAML contains settings that affect data selection, tensor
+geometry, model computation, optimization, validation, or saved output. The
+comments next to a value explain its mathematical role and experimental
+consequence. Recipes use no YAML inheritance, so you can understand and
+archive one file without resolving another.
+
+`a2v2.config` accepts a small set of old Fairseq and Hydra fields when it
+recovers configurations embedded in archived checkpoints. Native recipes omit
+fields that the new runtime does not consume:
+
+- Hydra output directories and the task, criterion, model, and scheduler
+  `_name` selectors (`optimizer._name` remains because it chooses the actual
+  optimization algorithm);
+- Fairseq logging, all-gather, gradient-flattening, and DDP-backend controls;
+- criterion log-key, report, and segmentation switches;
+- Canny-only event parameters, because the native baseline supports the
+  paper's average and maximum pooling methods;
+- inactive model flags that never reach the rewritten forward pass; and
+- `keep_last_epochs`, because the native trainer never performs destructive
+  checkpoint retention.
+
+The pretraining recipes also express Adam and cosine scheduling directly.
+Their former `optimizer: composite` wrapper represented one Fairseq parameter
+group and did not add a mathematical operation.
+
+TensorBoard stores the typed configuration, including defaults and command-line
+overrides, under `run/config`. Archive that event directory with checkpoints.
+
 ## Workflow checks
 
 `cpu_smoke_pretraining.yaml` and `cpu_smoke_finetuning.yaml` reduce model width,

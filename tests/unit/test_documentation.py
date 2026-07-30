@@ -20,25 +20,57 @@ ROOT = Path(__file__).parents[2]
 PYTHON_ROOTS = (ROOT / "a2v2", ROOT / "scripts", ROOT / "tests")
 YAML_HASHES = {
     "configs/MeerKAT/a2v_large_pretrain_best.yaml":
-        "c4eaf146a1f9e3319d4e7cbf4f122ff11b26d53ef82d66a75132a05d13b7dcf0",
+        "2582620361833034d075adc81254a05e4d1a608fe00de1e129a3f15564ee68d1",
     "configs/MeerKAT/finetune_mixup_001.yaml":
-        "aade7ffe69cea7bee03ed722f14c30fe08a691fbd8f2a2792eae5664f790c199",
+        "f79fb460836e83b641dcf5defeb8ffaec0e71fe724788980ebe05c0afed4e7ad",
     "configs/MeerKAT/finetune_mixup_025.yaml":
-        "f8f336a82172ca46441a2ceda494a5cc05c4b562fcf4bdd37f584d49cb6f44e1",
+        "9d9e796db0d320f3512adb34ed3cf0c5ffed827eecc61c878ea14d2adf406549",
     "configs/MeerKAT/finetune_mixup_100.yaml":
-        "8bdf2b3803e15302d76e04a088e2bb09764aca57f5f1a626125afa0cdf10496b",
+        "9630fda2d3d9377643acfee4407182ff667c8e5182ffd1dfa02c8c95f4e82052",
     "configs/cpu_smoke_finetuning.yaml":
-        "fa50853e6f1b14883bb982eae736622f0bd1afb966a4912fbbf443bc4cb3c372",
+        "fe6a83820aea9b9c9b0f47e3375ce682cc281d5bcd8e9f29522056cb49adf3d7",
     "configs/cpu_smoke_pretraining.yaml":
-        "77529552a7f50ed170e4de94099befcfab79d6c66b55d2b476afa6118e3bdc08",
+        "9f25841c8e6ee848f043a2fcf87d5f2ab0f6bcae3b51895f74e1d5827e4292f9",
     "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml":
-        "d0c70d6fd03d065efacf9ac4f947ef0d362000747dae69554bf55a8a8f6be2be",
+        "5398ae35c32452694f624bbd7df90eadfee74e118de51dcb1d7c74d172f0f59f",
     "configs/hyenas/finetune_mixup_100.yaml":
-        "d0e556bf3a307b5cba8e4e7ed6dd30d8d7c6cbb1c32c35c6b0e73d361119822b",
+        "7b657777801b20fdef164a714def35677be579b7cbbd8bca3cbbd16cf96a9681",
     "tests/fixtures/tiny_finetune.yaml":
-        "fdea332527289ea5a503ca58ef7fca4602ace01d5dbd92a52016c4529fc3f220",
+        "166ebbbc14417430a664b02fdaf2f7c327d9923217cff5f00a6b8487aedff0cc",
     "tests/fixtures/tiny_pretrain.yaml":
-        "d41fbd7716fc8915a178a3d6406d68aa82f6810447acd3de4587c0a9f998bc54",
+        "61e5eb25022f73b63951e5e69b733be57eaed9d2daac4784ab30cc657464c513",
+}
+
+IGNORED_RECIPE_PATHS = {
+    "hydra",
+    "common.log_format",
+    "common.fp16_no_flatten_grads",
+    "common.all_gather_list_size",
+    "checkpoint.keep_last_epochs",
+    "task._name",
+    "task.verbose_tensorboard_logging",
+    "dataset.skip_invalid_size_inputs_valid_test",
+    "distributed_training.ddp_backend",
+    "criterion._name",
+    "criterion.use_focal_loss",
+    "criterion.label_smoothing",
+    "criterion.maxfilt_s",
+    "criterion.max_duration_s",
+    "criterion.lowP",
+    "criterion.segmentation_metrics",
+    "criterion.report_accuracy",
+    "criterion.log_keys",
+    "optimizer.dynamic_groups",
+    "optimizer.groups",
+    "lr_scheduler._name",
+    "model._name",
+    "model.supported_modality",
+    "model.ema_encoder_only",
+    "model.load_pretrain_weights",
+    "model.modalities.audio.mask_prob_adjust",
+    "model.modalities.audio.inverse_mask",
+    "model.modalities.audio.add_masks",
+    "model.modalities.audio.ema_local_encoder",
 }
 
 
@@ -105,3 +137,27 @@ def test_yaml_files_open_with_context_and_preserve_values() -> None:
             default=str,
         ).encode()
         assert hashlib.sha256(canonical).hexdigest() == expected_hash
+
+
+def test_checked_in_recipes_exclude_ignored_legacy_options() -> None:
+    """Keep native recipes free of fields consumed only by Fairseq or Hydra."""
+
+    violations: list[str] = []
+    for relative in YAML_HASHES:
+        values = yaml.safe_load((ROOT / relative).read_text(encoding="utf-8"))
+        pending: list[tuple[tuple[str, ...], object]] = [((), values)]
+        while pending:
+            prefix, value = pending.pop()
+            if not isinstance(value, dict):
+                continue
+            for key, child in value.items():
+                path = prefix + (str(key),)
+                dotted = ".".join(path)
+                if dotted in IGNORED_RECIPE_PATHS:
+                    violations.append(f"{relative}:{dotted}")
+                pending.append((path, child))
+
+    assert violations == [], (
+        "Checked-in recipes contain ignored legacy options:\n"
+        + "\n".join(sorted(violations))
+    )

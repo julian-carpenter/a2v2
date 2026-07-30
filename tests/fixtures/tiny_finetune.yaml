@@ -8,7 +8,6 @@ common:
   seed: 7
 # Labeled synthetic waveforms must use the tiny pretraining frontend geometry.
 task:
-  _name: audio_ccas
   data: tests/fixtures/manifests
   sample_rate: 8000
   normalize: true
@@ -26,8 +25,6 @@ distributed_training:
   distributed_world_size: 1
 # Framewise focal loss with a visible diagnostic threshold.
 criterion:
-  _name: finetunecriterion
-  use_focal_loss: true
   metric_threshold: 0.4
 # Three updates cover frozen and trainable encoder phases.
 optimization:
@@ -41,11 +38,9 @@ optimizer:
   adam_eps: 1.0e-8
 # One warmup update makes schedule state observable.
 lr_scheduler:
-  _name: cosine
   warmup_updates: 1
 # Native tiny pretraining checkpoint, freeze policy, masks, and regularization.
 model:
-  _name: wav2vec_ccas_finetune
   w2v_path: checkpoints/tiny_pretrain.pt
   freeze_finetune_updates: 1
   feature_grad_mult: 0.0

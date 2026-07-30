@@ -11,7 +11,6 @@ checkpoint:
   save_dir: checkpoints/tiny
 # Synthetic 8 kHz unlabeled waveforms and toy convolution geometry.
 task:
-  _name: audio_ccas
   data: tests/fixtures/manifests
   sample_rate: 8000
   normalize: true
@@ -27,9 +26,6 @@ dataset:
 # Tests construct one process unless a DDP probe overrides this field.
 distributed_training:
   distributed_world_size: 1
-# The criterion name identifies pretraining stage.
-criterion:
-  _name: expanded_model
 # Short update horizon with clipping.
 optimization:
   update_freq: [1]
@@ -43,11 +39,9 @@ optimizer:
   weight_decay: 0.01
 # One warmup update makes schedule indexing visible.
 lr_scheduler:
-  _name: cosine
   warmup_updates: 1
 # Tiny two-layer mean-teacher model and compact decoder.
 model:
-  _name: data2vec_multi
   depth: 2
   embed_dim: 16
   num_heads: 4

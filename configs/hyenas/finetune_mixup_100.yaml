@@ -1,123 +1,100 @@
-# Animal2Vec 1.0 reproduction baseline: Hyena full-data fine-tuning, fold 0.
-# It adapts the 24 kHz base encoder to nine call classes plus a focal label.
+# Animal2Vec 1.0 reproduction baseline: spotted-hyena full-data fine-tuning.
+# It predicts nine call classes plus a focal indicator from the base encoder.
 # Replace task.data and model.w2v_path before launching the experiment.
-# @package _group_
-# Hydra output naming is historical metadata; the native CLI uses checkpoint.save_dir.
-hydra:
-  run:
-    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}_hyena_ft_full-0_825-4
 
-# Mixed precision and log cadence.
+# AMP reduces accelerator memory; metrics are emitted every 361 updates.
 common:
   fp16: true
-  log_format: json
-  log_interval: 361  # this is in steps, not epochs ... log every epoch
+  log_interval: 361
   tensorboard_logdir: tb
-  all_gather_list_size: 6500000
 
-# Epoch checkpoints plus metric-selected checkpoint_best.pt.
+# Save every ten epochs. checkpoint_best.pt tracks validation frame F1 unless
+# best_checkpoint_metric is changed to segmented_f1.
 checkpoint:
-  save_interval: 10  # that is every 3612 updates
-  keep_last_epochs: 10  # keep roughly all seven finetuning and the last three freeze update checkpoints
+  save_interval: 10
   best_checkpoint_metric: metrics/finetune/f1
 
-# Labeled 24 kHz recordings and the exact pretrained frontend geometry.
+# The class order defines output columns. Combined convolution stride 120 maps
+# 24 kHz audio to about 200 encoder frames/s and must match pretraining.
 task:
-  _name: audio_ccas
   data: /home/jupyter-jzimmermann/ml/datasets/Hyena_10s_2025-10-28/manifests
-  max_sample_size: 320000
-  min_sample_size: 1000
-  min_label_size: 2936  # Empty label files have Bytesize 2936, so to exclude them set this to 2936
-  normalize: true
-  unique_labels: "['groan', 'oth', 'whoop', 'alarm_rumble', 'squitter', 'squeal', 'feeding', 'giggle', 'growl', 'focal']"
-  with_labels: true
-  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 4)] + [(512, 3, 3)] + [(512, 3, 2)] + [(512, 3, 1)] + [(512, 2, 1)] * 2'
   sample_rate: 24000
-  verbose_tensorboard_logging: true
+  normalize: true
+  with_labels: true
+  unique_labels: "['groan', 'oth', 'whoop', 'alarm_rumble', 'squitter', 'squeal', 'feeding', 'giggle', 'growl', 'focal']"
+  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 4)] + [(512, 3, 3)] + [(512, 3, 2)] + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1000
+  max_sample_size: 320000
+  min_label_size: 2936  # Keep label files strictly larger than this byte count.
 
-# Token-budget loading and update-based validation.
+# Effective samples/update = 285,000 × 4 ranks × 11 microbatches.
 dataset:
   num_workers: 20
-  # original value: max_tokens: ~1300 seconds
-  # max_tokens / sample_rate * distributed_world_size * update_freq is the batch size in seconds
   max_tokens: 285_000
-  skip_invalid_size_inputs_valid_test: true
-  validate_interval: 5000  # validate every N epochs, setting to 1000 or above effectively deactivates that
-  validate_interval_updates: 5000  # validate every m updates after validate_after_updates,
-  # so setting this to 2000 validates every 2000 updates after  validate_after_updates.
-  validate_after_updates: 10000  # dont validate until reaching this many updates, but then do a
-  # validate regardless of validate_interval_updates
-  train_subset: train_0  # we have 577840s in train_0 and a batch size of 1600s
+  train_subset: train_0
   valid_subset: valid_0
+  validate_after_updates: 10000
+  validate_interval_updates: 5000
+  validate_interval: 5000  # Suppress ordinary epoch-triggered validation.
 
-# One process runs on each of four GPUs.
+# Original paper topology; deployment scripts may override this launch guard.
 distributed_training:
-  distributed_world_size: 4  # num of gpus -> we have 4
-  ddp_backend: legacy_ddp
+  distributed_world_size: 4
 
-# Focal loss and frame-to-event evaluation settings.
+# Independent sigmoid focal losses train every label. Segments are produced by
+# 100 ms average pooling and require strict IoU > 0 for an overlap match.
 criterion:
-  _name: finetunecriterion
-  label_smoothing: 0.09  # 1 / num_classes as a rule of thumb
-  report_accuracy: true
-  segmentation_metrics: true
-  use_focal_loss: true  # this overrides label smoothing and uses the focal loss instead
-  metric_threshold: .175  # The minimum likelihood which is deemed a prediction
-  method: "avg"  # Parameters for the segmentation detection
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  metric_threshold: 0.175
+  method: avg
   sigma_s: 0.1
-  maxfilt_s: 0.1
-  max_duration_s: 0.5
-  lowP: 0.125
+  iou_threshold: 0.0
 
-# Eleven microbatches per rank contribute to each of 30,000 updates.
+# Eleven microbatches form an update. The first 10,000 updates train only the
+# classifier; the remaining 20,000 also adapt Transformer blocks.
 optimization:
-  update_freq: [ 11 ]
-  max_update: 30000  # after the 10000 freeze updates we do 20000 normal finetuning steps -> 69.2 epochs
-  lr: [ 0.0001 ]
+  update_freq: [11]
+  max_update: 30000
+  lr: [0.0001]
 
-# Adam settings for supervised adaptation.
+# Adam uses Fairseq-compatible epsilon placement.
 optimizer:
   _name: adam
-  adam_betas: (0.9,0.98)
+  adam_betas: [0.9, 0.98]
   adam_eps: 1e-08
 
-# Update-based cosine decay with a 2,000-update warmup.
+# Warm up linearly from 1e-10, then decay by cosine to 5e-6.
 lr_scheduler:
-  _name: cosine  # replaced the tri stage scheduler with a cosine one
   warmup_updates: 2000
   warmup_init_lr: 1e-10
   min_lr: 5e-06
 
-# Pretrained encoder loading, freezing, regularization, and target-aware mixup.
+# Keep the local Sinc/convolution frontend frozen and unfreeze the Transformer
+# after the classifier-only phase.
 model:
-  _name: wav2vec_ccas_finetune
   w2v_path: ???
-  # For the first 10k updates only the output classifier is trained,
-  # after which the Transformer is also updated.
-  # The feature encoder is not trained during fine-tuning.
   freeze_finetune_updates: 10000
   feature_grad_mult: 0.0
+
+  # Average all 12 pretrained Transformer block outputs.
+  average_top_k_layers: 12
+
+  # Use four-frame time spans. Channel masking is omitted because the archived
+  # Hyena recipe sets its probability to zero.
   apply_mask: true
-  average_top_k_layers: 12 # Layers in the middle perform best, see arXiv:2105.11084 [cs.CL]
-  # Regularization terms
-  mask_prob: 0.825  # Probability - the R term in the paper - for a token being masked (Default is 0.65)
-  # The masking length if a token was chosen.
+  mask_prob: 0.825
   mask_length: 4
-  # to get the prob from the paper you have to:
-  # mask_channel_prob * num_channels (1024) / mask_channel_length / batch_size
-  mask_channel_prob: 0
-  mask_channel_length: 64
   dropout: 0.1
-  dropout_input: 0.0
   activation_dropout: 0.1
   attention_dropout: 0.2
-  final_dropout: 0.0
   layerdrop: 0.1
-  drop_path: 0.0
-  target_mixup: true  # Should we mixup the targets as well
-  source_mixup: 0.5  # The strength of the mixing (Uniformly sampled between this and 1.)
-  mixup_prob: 1.0  # How much of the source and targets should be mixed up (1.0 == 100%)
-  same_mixup: true  # Should we use the same strength for the full batch or use a random strength for every sample
-  mixing_window_length: 0.05  # The window length for the to-be-mixed windows in BC learning
-  gain_mode: "A_weighting"  # The mode with which the mixing gain is calculated, see BC learning paper
-  load_pretrain_weights: false  # should we attempt to load the linear eval projection layer weights from pretrain
+
+  # Mix every waveform and its targets with one batch-shared ratio from
+  # [0.5, 1.0], using 50 ms A-weighted gain estimates.
+  target_mixup: true
+  source_mixup: 0.5
+  mixup_prob: 1.0
+  same_mixup: true
+  mixing_window_length: 0.05
+  gain_mode: A_weighting

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from a2v2.data import conv_output_length
+from a2v2.data import AudioDataset, conv_output_length
 from a2v2.config import load_config
 
 
@@ -38,3 +38,34 @@ def test_cpu_smoke_profiles_load_with_tiny_architecture() -> None:
     assert finetune.stage == "finetune"
     assert finetune.model.average_top_k_layers == 2
 
+
+def test_hyena_pretraining_recipe_retains_unlabeled_manifest_rows(
+    tmp_path: Path,
+) -> None:
+    """Do not apply the supervised label-file-size filter to pretraining."""
+
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    (audio_root / "recording.wav").touch()
+    manifest = tmp_path / "pretrain.tsv"
+    manifest.write_text(
+        f"{audio_root}\nrecording.wav\t24000\n",
+        encoding="utf-8",
+    )
+    config = load_config(
+        ROOT
+        / "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml"
+    )
+
+    dataset = AudioDataset(
+        manifest,
+        sample_rate=config.task.sample_rate,
+        conv_layers=config.task.conv_feature_layers,
+        normalize=config.task.normalize,
+        labels=None,
+        min_sample_size=config.task.min_sample_size,
+        max_sample_size=config.task.max_sample_size,
+        min_label_size=config.task.min_label_size,
+    )
+
+    assert len(dataset) == 1

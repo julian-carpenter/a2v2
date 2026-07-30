@@ -109,6 +109,17 @@ The 25% and 1% MeerKAT labeled-data recipes are
 `configs/MeerKAT/finetune_mixup_025.yaml` and
 `configs/MeerKAT/finetune_mixup_001.yaml`.
 
+The checked-in files omit Hydra and Fairseq compatibility metadata. For a
+future A2V2 experiment:
+
+1. copy the nearest Animal2Vec 1.0 control rather than editing the control;
+2. retain every value whose change affects data, tensor geometry, forward
+   computation, optimization, validation, or saved output;
+3. do not restore compatibility-only component names, log switches, composite
+   optimizer wrappers, or unsupported Canny parameters; and
+4. archive TensorBoard's `run/config` entry with the checkpoint, because it
+   contains the recipe after command-line overrides and native defaults.
+
 ## 2. Prepare manifests and labels
 
 Create one TSV for each split named by `dataset.train_subset` and
@@ -136,9 +147,13 @@ ten-second, 80,000-sample recordings. The frontend's total stride is 40 samples,
 which gives an asymptotic frame rate of 200 Hz. The hyena recipes use 24 kHz
 audio and a total stride of 120 samples, also 200 Hz.
 
-The data loader applies a positive `task.min_label_size` while indexing labeled
-and unlabeled training splits. The Hyena pretraining recipe selects recordings
-with nonempty event files, even though the model does not receive their labels.
+`task.min_label_size` is a supervised-data filter: a labeled record is retained
+only when its HDF5 file is larger than the configured byte count. Pretraining
+recipes must leave this value at zero because their datasets deliberately have
+no label paths. The cleaned Hyena pretraining recipe therefore retains every
+otherwise valid row in `pretrain.tsv`; its earlier copied
+`min_label_size: 1` value would have removed the entire unlabeled dataset in
+the native loader.
 
 Before a long run, use the CPU recipes with a few representative files to catch
 manifest, sample-rate, and HDF5 errors.

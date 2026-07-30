@@ -38,7 +38,6 @@ def test_loads_meerkat_pretraining_recipe() -> None:
 
     assert cfg.stage == "pretrain"
     assert cfg.task.sample_rate == 8000
-    assert cfg.task.unique_labels[-1] == "focal"
     assert cfg.model.depth == 16
     assert cfg.model.embed_dim == 1024
     assert cfg.model.audio.prenet_depth == 8

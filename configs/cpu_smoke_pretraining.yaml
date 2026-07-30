@@ -8,7 +8,6 @@
 common:
   fp16: false
   seed: 7
-  log_format: json
   log_interval: 1
 # Write each update so resume behavior can be tested with a short run.
 checkpoint:
@@ -16,7 +15,6 @@ checkpoint:
   save_interval_updates: 1
 # Unlabeled 8 kHz audio and a three-block toy frontend.
 task:
-  _name: audio_ccas
   data: smoke_data/manifests
   sample_rate: 8000
   normalize: true
@@ -35,9 +33,6 @@ dataset:
 # CPU smoke runs use one process; distributed behavior has separate probes.
 distributed_training:
   distributed_world_size: 1
-# The expanded-model criterion selects pretraining stage translation.
-criterion:
-  _name: expanded_model
 # Two updates with no accumulation exercise scheduler and checkpoint state.
 optimization:
   update_freq: [1]
@@ -51,11 +46,9 @@ optimizer:
   weight_decay: 0.01
 # Zero warmup starts the cosine schedule at the configured learning rate.
 lr_scheduler:
-  _name: cosine
   warmup_updates: 0
 # Tiny mean-teacher encoder, two masked clones, and a compact decoder.
 model:
-  _name: data2vec_multi
   depth: 2
   embed_dim: 16
   num_heads: 4

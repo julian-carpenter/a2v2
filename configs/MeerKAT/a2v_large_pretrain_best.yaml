@@ -1,157 +1,135 @@
 # Animal2Vec 1.0 reproduction baseline: official MeerKAT large pretraining.
-# Audio is 8 kHz and the frontend emits about 200 feature frames per second.
-# Replace task.data with a directory containing pretrain.tsv and valid_0.tsv.
-# @package _group_
+# This is a native PyTorch recipe, not a Hydra/Fairseq component. Replace
+# task.data with a directory containing pretrain.tsv.
 
-# Numeric precision, random seed defaults, and progress reporting.
+# AMP performs matrix operations in reduced precision. The initial scale of
+# one and 1e-6 lower bound reproduce the archived run's conservative scaling.
 common:
   fp16: true
-  log_format: json
-  log_interval: 384  # log every tenth of an epoch
-  tensorboard_logdir: tb
-  min_loss_scale: 1e-6
-  fp16_no_flatten_grads: true
+  log_interval: 384  # Emit stdout and TensorBoard scalars every 384 updates.
+  tensorboard_logdir: tb  # Relative paths live below checkpoint.save_dir.
   fp16_init_scale: 1
+  min_loss_scale: 1e-6
 
-# Epoch/update checkpoint cadence. The native trainer also writes checkpoint_last.pt.
+# Save a numbered checkpoint every ten epochs and replace checkpoint_last.pt
+# after each save. The native trainer does not delete epoch checkpoints, so
+# the old keep_last_epochs option had no effect.
 checkpoint:
-  save_interval: 10  # that is every 40840 updates
-  keep_last_epochs: 10  # keep all of them, as we train for 100 epochs
+  save_interval: 10
 
-# Dataset meaning and raw-waveform frontend geometry.
+# A convolution triple is (output channels, kernel samples, stride). The total
+# stride is 40, so 8,000 samples/s become about 200 feature frames/s. Label
+# metadata is omitted because the self-supervised objective never reads it.
 task:
-  _name: audio_ccas
   data: /path/to/manifest_files
-  unique_labels: "['beep', 'synch', 'sn', 'cc', 'ld', 'oth', 'mo', 'al', 'soc', 'agg', 'eating', 'focal']"
-  # Change feature extractor for MeerKAT
-  # 8000Hz / 5 / 2 / 2 / 2 / 1 / 1 / 1 -> Effective encoder output frequency of 200Hz.
-  # number of Sinc filters and kernel length is is n_sinc = k = sqrt( sr / 2 )
-  # 63 filters times 127 Hz resolution each is 8000Hz
-  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
-  min_sample_size: 1
   sample_rate: 8000
-  normalize: true
-  with_labels: false
-  verbose_tensorboard_logging: false
-  enable_padding: false
+  normalize: true  # Standardize each waveform before feature extraction.
+  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1  # Accept every nonempty manifest recording.
+  enable_padding: false  # Crop batches to a common length instead of padding.
 
-# Length-aware loading and validation cadence.
+# One rank receives at most 408,000 waveform samples per DataLoader batch.
+# Effective samples/update = max_tokens × world_size × update_freq.
 dataset:
   num_workers: 32
-  # max_tokens / sample_rate * distributed_world_size * update_freq is the batch size in seconds
-  # For training on asmodeus, we use 960s for training, as in the paper
-  max_tokens: 408_000  #  a token is a single audio frame
-  skip_invalid_size_inputs_valid_test: true
-  validate_interval: 25
-  validate_interval_updates: 10000  # validate every m updates
+  max_tokens: 408_000
   required_batch_size_multiple: 1
-  disable_validation: true
   train_subset: pretrain
-  valid_subset: valid_0
+  disable_validation: true  # Self-supervised training has no labeled metric.
 
-# The published run used one process on each of four GPUs.
+# The paper recipe used four ranks. The eight-A100 reproduction script
+# overrides this guard to eight.
 distributed_training:
-  distributed_world_size: 4  # Number of GPUs
-  ddp_backend: legacy_ddp
+  distributed_world_size: 4
 
-# Pretraining regression logs retain their legacy Fairseq names.
-criterion:
-  _name: expanded_model
-  segmentation_metrics: true
-  use_focal_loss: true  # this overrides label smoothing and uses the focal loss instead
-  log_keys:
-    - ema_decay
-    - target_var
-    - pred_var
-    - model_norm
-    - ema_norm
-    - masked_pct
-
-# One optimizer update accumulates five DataLoader batches on every rank.
+# Five microbatches per rank form one optimizer update. The paper's
+# 384,230-update schedule covers about 100 epochs.
 optimization:
-  update_freq: [ 5 ]  # Gradient accumulation steps
-  max_update: 384230  # 3842.3 updates are one epoch, so we train for 100 epochs
+  update_freq: [5]
+  max_update: 384230
   clip_norm: 1
+  lr: [0.0001]
 
-# The composite wrapper stores optimizer and scheduler values in one legacy group.
+# Adam uses Fairseq-compatible epsilon placement and decoupled weight decay.
 optimizer:
-  _name: composite
-  dynamic_groups: true
-  groups:
-    default:
-      lr_float: 0.0001
-      optimizer:
-        _name: adam
-        adam_betas: [ 0.9,0.98 ]
-        adam_eps: 1e-06
-        weight_decay: 0.01
-      lr_scheduler:
-        _name: cosine
-        warmup_updates: 10000
+  _name: adam
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1e-6
+  weight_decay: 0.01
 
-# Native config translation reads the scheduler nested above for this recipe.
-lr_scheduler: pass_through
+# Learning rate rises linearly for 10,000 updates, then follows cosine decay
+# over the remaining configured horizon.
+lr_scheduler:
+  warmup_updates: 10000
 
-# Large mean-teacher architecture, mixing, masking, ALiBi, and decoder settings.
+# The student and EMA teacher are 16-layer, 1,024-dimensional encoders.
 model:
-  _name: data2vec_multi
-  loss_beta: 0
-  loss_scale: null
-
   depth: 16
   embed_dim: 1024
   num_heads: 16
+  clone_batch: 12  # Twelve independently masked views share each frontend pass.
 
-  clone_batch: 12
-
+  # At update u, the teacher parameters follow
+  # theta_teacher <- d(u) theta_teacher + (1-d(u)) theta_student.
   ema_decay: 0.9997
   ema_end_decay: 1
   ema_anneal_end_step: 300000
-  ema_encoder_only: false
 
+  # Targets average the final 16 teacher block outputs. Instance normalization
+  # is applied to each block before averaging; no layer normalization follows.
   average_top_k_layers: 16
   instance_norm_target_layer: true
   layer_norm_target_layer: false
   layer_norm_targets: false
 
-  layerdrop: 0
+  layerdrop: 0  # Execute every Transformer block during pretraining.
   norm_eps: 1e-5
 
-  supported_modality: AUDIO
-  target_mixup: false
-  source_mixup: 0.5  # The strength of the mixing (Uniformly sampled between this and 1.)
-  mixup_prob: 1.0  # How much of the source and targets should be mixed up (1.0 == 100%)
-  same_mixup: true  # Should we use the same strength for the full batch or use a random strength for every sample
-  mixing_window_length: 0.05  # The window length for the to-be-mixed windows in BC learning
-  gain_mode: "A_weighting"  # The mode with which the mixing gain is calculated, see BC learning paper
+  # Every source is mixed with another recording. A single ratio drawn between
+  # 0.5 and 1.0 is shared by the batch; gain uses 50 ms A-weighted windows.
+  source_mixup: 0.5
+  mixup_prob: 1.0
+  same_mixup: true
+  mixing_window_length: 0.05
+  gain_mode: A_weighting
+
+  # beta=0 selects squared regression error on masked frames. A null scale lets
+  # the loss use its native sample-size normalization.
+  loss_beta: 0
+  loss_scale: null
 
   modalities:
     audio:
+      # The first convolution is parameterized as Sinc filters, followed by
+      # pSwish activations and layer-normalized local features.
       sinc_input: true
       apply_window_to_root: false
       use_pswish: true
-      sinc_norm: "layer_norm"
+      sinc_norm: layer_norm
+
+      # Five grouped convolutions encode relative position. Eight prenet
+      # Transformer blocks run before the shared 16-layer encoder.
       conv_pos_depth: 5
       conv_pos_width: 95
       conv_pos_groups: 16
-      prenet_depth: 8  # The depth of the transformer based context_encoder
-      # mask_prob: 0.5
-      # mask_length: 5
-      mask_prob: 1.5  # Probability for a token being masked (Default is 0.65)
-      # The masking length if a token was chosen.
-      # This mask_prob and mask_length will mask ~93% of the input with a median masking length of 70 ms
+      prenet_depth: 8
+
+      # The mask sampler draws approximately mask_prob*T/mask_length span
+      # starts. Overlap permits mask_prob > 1; 1.5 with length two reproduces
+      # the paper's dense masking rather than a 150% Bernoulli probability.
+      mask_prob: 1.5
       mask_length: 2
-      mask_prob_adjust: 0.05
-      inverse_mask: false
       mask_noise_std: 0.01
       mask_dropout: 0
-      add_masks: false
-      ema_local_encoder: false
+
+      # ALiBi supplies distance bias; each head learns its own scale.
       use_alibi_encoder: true
-      prenet_layerdrop: 0
       prenet_dropout: 0.1
       learned_alibi_scale: true
       learned_alibi_scale_per_head: true
+
+      # The decoder reconstructs the full time axis from unmasked student
+      # context before regression is evaluated only at masked positions.
       decoder:
         input_dropout: 0.1
         decoder_dim: 768
