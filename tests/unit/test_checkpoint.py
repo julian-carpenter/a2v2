@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+import a2v2.training as training
 from a2v2.training import (
     CheckpointError,
     capture_rng_state,
@@ -61,6 +62,83 @@ def test_rng_state_has_an_opaque_distributed_transport() -> None:
 
     assert isinstance(encoded, bytes)
     assert torch.equal(decoded["torch"], state["torch"])
+
+
+def test_rank_rng_gather_uses_selected_group_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check rank RNG gathering uses its control-plane group in rank order."""
+    torch.manual_seed(7)
+    rank_zero = capture_rng_state()
+    torch.manual_seed(8)
+    rank_one = capture_rng_state()
+    encoded_by_rank = [serialize_rng_state(rank_zero), serialize_rng_state(rank_one)]
+    selected_group = object()
+
+    def fake_gather_object(
+        encoded: bytes,
+        gathered: list[bytes | None] | None,
+        *,
+        dst: int,
+        group: object,
+    ) -> None:
+        assert encoded == encoded_by_rank[0]
+        assert dst == 0
+        assert group is selected_group
+        assert gathered is not None
+        gathered[:] = encoded_by_rank
+
+    monkeypatch.setattr(training.dist, "gather_object", fake_gather_object)
+
+    gathered = training.gather_rank_rng_states(
+        rank_zero,
+        world_size=2,
+        rank=0,
+        group=selected_group,
+    )
+
+    assert gathered is not None
+    assert gathered["world_size"] == 2
+    assert torch.equal(gathered["by_rank"][0]["torch"], rank_zero["torch"])
+    assert torch.equal(gathered["by_rank"][1]["torch"], rank_one["torch"])
+
+
+@pytest.mark.parametrize(
+    "received",
+    [
+        [serialize_rng_state(capture_rng_state())],
+        [serialize_rng_state(capture_rng_state()), None],
+    ],
+)
+def test_rank_rng_gather_rejects_incomplete_or_non_byte_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    received: list[bytes | None],
+) -> None:
+    """Check rank RNG gathering rejects a partial distributed checkpoint."""
+
+    def fake_gather_object(
+        encoded: bytes,
+        gathered: list[bytes | None] | None,
+        *,
+        dst: int,
+        group: object,
+    ) -> None:
+        assert isinstance(encoded, bytes)
+        assert dst == 0
+        assert group is selected_group
+        assert gathered is not None
+        gathered[:] = received
+
+    selected_group = object()
+    monkeypatch.setattr(training.dist, "gather_object", fake_gather_object)
+
+    with pytest.raises(CheckpointError, match="one byte payload per rank"):
+        training.gather_rank_rng_states(
+            capture_rng_state(),
+            world_size=2,
+            rank=0,
+            group=selected_group,
+        )
 
 
 def test_native_checkpoint_round_trip(tmp_path: Path) -> None:

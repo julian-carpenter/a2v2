@@ -85,6 +85,34 @@ def deserialize_rng_state(encoded: bytes) -> dict[str, object]:
     return state
 
 
+def gather_rank_rng_states(
+    state: Mapping[str, object],
+    *,
+    world_size: int,
+    rank: int,
+    group: dist.ProcessGroup | None,
+) -> dict[str, object] | None:
+    """Gather serialized per-rank RNG states through a selected process group."""
+
+    encoded = serialize_rng_state(state)
+    gathered: list[object] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(encoded, gathered, dst=0, group=group)
+    if rank != 0:
+        return None
+    if (
+        gathered is None
+        or len(gathered) != world_size
+        or any(not isinstance(item, bytes) for item in gathered)
+    ):
+        raise CheckpointError(
+            "distributed RNG gather did not return one byte payload per rank"
+        )
+    return {
+        "world_size": world_size,
+        "by_rank": [deserialize_rng_state(item) for item in gathered],
+    }
+
+
 def restore_rng_state(state: Mapping[str, object]) -> None:
     """Restore local or rank-specific random generators exactly."""
 
