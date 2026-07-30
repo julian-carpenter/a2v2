@@ -28,10 +28,9 @@ from a2v2.config import config_to_dict, load_config
 from a2v2.model import Animal2VecPretrainingModel
 from a2v2.training import (
     capture_rng_state,
-    deserialize_rng_state,
+    gather_rank_rng_states,
     load_checkpoint,
     save_checkpoint,
-    serialize_rng_state,
 )
 from a2v2.training import TrainingEngine
 from a2v2.training import CosineUpdateScheduler, build_optimizer
@@ -255,12 +254,13 @@ def main() -> int:
     arguments = parser.parse_args()
 
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    checkpoint_group = dist.new_group(backend="gloo")
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
@@ -292,20 +292,17 @@ def main() -> int:
         stage="pretrain",
         config={"active": config_to_dict(config)},
     )
-    encoded_rng = serialize_rng_state(payload["rng_state"])
-    gathered_rng: list[object] | None = [None] * world_size if rank == 0 else None
-    dist.gather_object(encoded_rng, gathered_rng, dst=0)
+    ranked_rng = gather_rank_rng_states(
+        payload["rng_state"],
+        world_size=world_size,
+        rank=rank,
+        group=checkpoint_group,
+    )
     checkpoint_path = arguments.output_dir / "resume-point.pt"
     if rank == 0:
-        assert gathered_rng is not None
-        ranked_rng = [
-            deserialize_rng_state(item)
-            for item in gathered_rng
-            if isinstance(item, bytes)
-        ]
-        if len(ranked_rng) != world_size:
-            raise RuntimeError("did not gather one RNG payload per rank")
-        payload["rng_state"] = {"world_size": world_size, "by_rank": ranked_rng}
+        if ranked_rng is None:
+            raise RuntimeError("rank zero received no distributed RNG state")
+        payload["rng_state"] = ranked_rng
         save_checkpoint(checkpoint_path, payload)
     dist.barrier()
 
@@ -333,6 +330,7 @@ def main() -> int:
         "rank": rank,
         "local_rank": local_rank,
         "world_size": world_size,
+        "rng_gather_backend": str(dist.get_backend(checkpoint_group)),
         "device": str(device),
         "first_update": first_result.update,
         "compared_update": actual_result.update,

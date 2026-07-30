@@ -1401,6 +1401,12 @@ Depending on recipe intervals, the trainer writes:
 - `checkpoint_epoch_<epoch>.pt`.
 
 Rank 0 writes the shared file after collecting each rank's RNG state.
+Distributed CUDA training keeps tensor collectives on NCCL but sends the
+serialized CPU RNG payloads through a separate Gloo process group. Rank 0
+requires exactly one byte payload from every rank before it writes; a partial
+gather is an error, not a shortened `by_rank` list. The public training
+boundary destroys process groups that it initialized even when training raises
+an exception, while preserving a process group supplied by a caller.
 
 ### Overflow attempts are not updates
 
@@ -1533,8 +1539,9 @@ torchrun --standalone --nproc-per-node=4 \
   --output-dir /tmp/a2v2-nccl-4
 ```
 
-The probes require correct all-reduce, broadcast, all-gather, barriers, and
-rank-local RNG restoration.
+The probes require correct NCCL all-reduce, broadcast, all-gather, and barriers,
+plus Gloo-backed rank RNG collection and exact rank-local RNG restoration. Each
+rank report records `rng_gather_backend: "gloo"`.
 
 ### Durable distributed resume
 
@@ -1722,6 +1729,16 @@ bash scripts/reproduce_meerkat_paper.sh \
   /datasets/MeerKAT/manifests \
   /experiments/a2v2-meerkat-fold0
 ```
+
+Before a long launch, the driver checks the selected Python runtime, exactly
+eight visible A100s, at least 39 GiB total and 38 GiB currently free on every
+GPU, and at least 64 GiB free on the output filesystem. It then runs an
+eight-rank NCCL/Gloo checkpoint probe. A fresh pretraining directory runs one
+real production update, validates the resulting resumable eight-rank
+checkpoint, and starts the full job with `--resume`. Existing checkpoints are
+validated before resume. Phase headers and command output append to the stage
+logs, so rerunning the driver does not erase the evidence from an earlier
+failure.
 
 This is explicitly an approximate, same-order reproduction. It is not the
 published four-rank topology and does not include all five folds or the

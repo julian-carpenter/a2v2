@@ -319,6 +319,12 @@ Distributed training gathers one state per rank into the rank-zero checkpoint.
 `restore_rng_state` requires the same world size and returns each rank to its
 own stream.
 
+`gather_rank_rng_states` serializes each tensor-bearing state to bytes and
+requires exactly one payload in rank order. CUDA training passes a dedicated
+Gloo process group to this helper: NCCL remains the high-throughput tensor data
+plane, while serialized CPU checkpoint metadata stays off the CUDA allocator.
+CPU distributed training already uses Gloo as its default group.
+
 `save_checkpoint` writes a temporary file and performs an atomic replacement.
 `validate_checkpoint` enforces the versioned plain-container schema.
 
@@ -426,6 +432,12 @@ continuation of the archived training run.
 and optimizer state, wraps DDP, restores checkpoints, creates token samplers and
 DataLoaders, and owns validation and save cadence.
 
+The public `run_training` function is a lifecycle boundary around the private
+implementation. It destroys the default process group—and therefore the
+auxiliary checkpoint group—when this call initialized distributed training,
+including exception paths. It does not destroy a default group initialized by
+an embedding caller.
+
 The workflow records batches delivered to training instead of the sampler
 cursor advanced by DataLoader prefetch. It also supplies a private DataLoader
 generator so worker setup does not consume the model RNG stream.
@@ -530,3 +542,6 @@ for the implementation before file consolidation. The consolidation preserved
 function bodies and state signatures. A GPU agent should rerun the durable
 suite after any future change to equations, randomness, model attributes,
 checkpoint fields, batching, AMP, or DDP.
+
+Both standalone distributed programs bind `LOCAL_RANK` before initializing
+NCCL and record `rng_gather_backend: "gloo"` in their per-rank JSON evidence.

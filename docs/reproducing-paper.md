@@ -26,9 +26,12 @@ bash scripts/reproduce_meerkat_paper.sh \
   /experiments/a2v2-meerkat-fold0
 ```
 
-The default performs one complete pretraining run, one 100%-label fine-tuning
-run for fold 0 initialized from that pretraining checkpoint, and one final
-validation. Both training stages use all devices in
+The default first verifies the selected Python environment, output filesystem,
+and all eight GPUs. It then runs an eight-rank collective/checkpoint probe. A
+fresh pretraining directory performs one production update, validates the
+resulting native checkpoint, resumes the complete pretraining run, performs
+one 100%-label fine-tuning run for fold 0, and runs one final validation. Both
+training stages use all devices in
 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` with eight `torchrun` ranks. The
 validation step uses one GPU because it does not perform distributed gradient
 updates. Its report is written to:
@@ -81,18 +84,35 @@ The complete batch controls are:
 | `A2V2_EVAL_MAX_TOKENS` | 320000 |
 | `A2V2_EVAL_WORKERS` | 20 |
 
+The deployment controls are:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `A2V2_GPUS` | `0,1,2,3,4,5,6,7` | Eight physical GPU IDs exposed to each launch |
+| `A2V2_PYTHON` | `python` | Interpreter used for preflight, `torch.distributed.run`, and evaluation |
+| `A2V2_TORCHRUN` | unset | Optional single launcher executable replacing `python -m torch.distributed.run` |
+| `A2V2_TRAIN_ENTRY` | `a2v2-train` | Training script passed to the distributed launcher |
+
 Use `--fold N` for another single fold and `--fraction 025` or
 `--fraction 001` for one reduced-label recipe. Use `--dry-run` to check
-manifest resolution and print the full pretrain → fine-tune → validation
-command graph without requiring CUDA.
+manifest resolution and print the full preflight → probe → burn-in → pretrain
+resume → fine-tune → validation command graph without requiring CUDA.
 
-The script automatically resumes each training stage when its own
-`checkpoint_last.pt` exists. Do not change world size or batch variables
-between an interrupted run and its resume: sampler and optimizer state belong
-to the stored topology. Validation prefers `checkpoint_best.pt`, falls back to
-`checkpoint_last.pt` with a warning, and records the selected checkpoint hash.
-The output directory also retains package, GPU, manifest, recipe, and batch
-profile provenance.
+Preflight requires exactly eight visible A100 devices, at least 39 GiB total
+and 38 GiB currently free on every device, and at least 64 GiB free on the
+output filesystem. The distributed probe exercises NCCL tensor collectives and
+Gloo transport for the serialized per-rank RNG checkpoint state. A fresh run's
+one-update burn-in uses the full paper model, data, token budget, accumulation,
+AMP, and eight-rank topology; `--stop-at-update 1` changes only the stopping
+point, not the configured scheduler horizon.
+
+The script validates and resumes a stage when its own `checkpoint_last.pt`
+exists. Do not change world size or batch variables between an interrupted run
+and its resume: sampler and optimizer state belong to the stored topology.
+Validation prefers `checkpoint_best.pt`, falls back to `checkpoint_last.pt`
+with a warning, and records the selected checkpoint hash. Logs contain UTC
+phase headers and append across invocations. The output directory also retains
+package, GPU, manifest, recipe, and batch profile provenance.
 
 ## 1. Select the published recipe
 

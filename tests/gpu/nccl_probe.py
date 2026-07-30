@@ -20,11 +20,10 @@ import torch.distributed as dist
 
 from a2v2.training import (
     capture_rng_state,
-    deserialize_rng_state,
+    gather_rank_rng_states,
     load_checkpoint,
     restore_rng_state,
     save_checkpoint,
-    serialize_rng_state,
 )
 
 
@@ -48,12 +47,13 @@ def main() -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("NCCL probe requires CUDA")
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    checkpoint_group = dist.new_group(backend="gloo")
 
     if rank == 0:
         arguments.output_dir.mkdir(parents=True, exist_ok=True)
@@ -77,20 +77,17 @@ def main() -> int:
 
     captured = capture_rng_state()
     expected_random = _draw_random(device)
-    encoded = serialize_rng_state(captured)
-    gathered_rng: list[object] | None = [None] * world_size if rank == 0 else None
-    dist.gather_object(encoded, gathered_rng, dst=0)
+    ranked_rng = gather_rank_rng_states(
+        captured,
+        world_size=world_size,
+        rank=rank,
+        group=checkpoint_group,
+    )
 
     checkpoint_path = arguments.output_dir / "nccl-rng-checkpoint.pt"
     if rank == 0:
-        assert gathered_rng is not None
-        ranked_rng = [
-            deserialize_rng_state(item)
-            for item in gathered_rng
-            if isinstance(item, bytes)
-        ]
-        if len(ranked_rng) != world_size:
-            raise RuntimeError("did not gather one RNG payload per rank")
+        if ranked_rng is None:
+            raise RuntimeError("rank zero received no distributed RNG state")
         save_checkpoint(checkpoint_path, {
             "format_version": 1,
             "stage": "pretrain",
@@ -103,7 +100,7 @@ def main() -> int:
             "update": 0,
             "epoch": 1,
             "batch_in_epoch": 0,
-            "rng_state": {"world_size": world_size, "by_rank": ranked_rng},
+            "rng_state": ranked_rng,
             "sampler_state": None,
             "best_metric": None,
         })
@@ -129,6 +126,7 @@ def main() -> int:
         "local_rank": local_rank,
         "world_size": world_size,
         "backend": str(dist.get_backend()),
+        "rng_gather_backend": str(dist.get_backend(checkpoint_group)),
         "device": str(device),
         "device_name": properties.name,
         "device_uuid": str(getattr(properties, "uuid", "unavailable")),
