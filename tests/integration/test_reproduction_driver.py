@@ -8,12 +8,15 @@ the report helper against a genuinely loadable tiny native checkpoint.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import h5py
 import numpy as np
+import pytest
 import soundfile as sf
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -26,6 +29,131 @@ from a2v2.training import capture_rng_state, save_checkpoint
 ROOT = Path(__file__).parents[2]
 DRIVER = ROOT / "scripts/reproduce_meerkat_paper.sh"
 EVALUATOR = ROOT / "scripts/evaluate_finetuning_checkpoint.py"
+PREFLIGHT = ROOT / "scripts/check_reproduction_environment.py"
+
+
+def _load_preflight() -> ModuleType:
+    """Load the deployable preflight script as a testable Python module."""
+
+    spec = importlib.util.spec_from_file_location("a2v2_reproduction_preflight", PREFLIGHT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {PREFLIGHT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _fake_cuda(*, low_free_index: int | None = None) -> object:
+    """Return an eight-A100 CUDA facade with controllable free-memory reports."""
+
+    gib = 1024**3
+    total = 40 * gib
+    free_by_device = [39 * gib] * 8
+    if low_free_index is not None:
+        free_by_device[low_free_index] = 37 * gib
+
+    class FakeCuda:
+        @staticmethod
+        def device_count() -> int:
+            return 8
+
+        @staticmethod
+        def get_device_properties(index: int) -> object:
+            return SimpleNamespace(name="NVIDIA A100-SXM4-40GB", total_memory=total)
+
+        @staticmethod
+        def mem_get_info(index: int) -> tuple[int, int]:
+            return free_by_device[index], total
+
+    return FakeCuda()
+
+
+def test_environment_preflight_reports_all_eight_a100_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check CUDA preflight returns auditable per-device capacity metadata."""
+    preflight = _load_preflight()
+    monkeypatch.setattr(preflight.torch, "cuda", _fake_cuda())
+    gib = 1024**3
+
+    devices = preflight.check_cuda_devices(
+        expected_count=8,
+        min_total_bytes=39 * gib,
+        min_free_bytes=38 * gib,
+    )
+
+    assert [device["index"] for device in devices] == list(range(8))
+    assert all(device["name"] == "NVIDIA A100-SXM4-40GB" for device in devices)
+    assert all(device["total_bytes"] == 40 * gib for device in devices)
+    assert all(device["free_bytes"] == 39 * gib for device in devices)
+
+
+def test_environment_preflight_names_a_low_memory_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check one occupied GPU stops the launch and identifies its index."""
+    preflight = _load_preflight()
+    monkeypatch.setattr(preflight.torch, "cuda", _fake_cuda(low_free_index=3))
+    gib = 1024**3
+
+    with pytest.raises(RuntimeError, match=r"CUDA device 3.*free memory"):
+        preflight.check_cuda_devices(
+            expected_count=8,
+            min_total_bytes=39 * gib,
+            min_free_bytes=38 * gib,
+        )
+
+
+def test_environment_preflight_rejects_low_output_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check atomic checkpoint headroom is enforced before training."""
+    preflight = _load_preflight()
+    gib = 1024**3
+    monkeypatch.setattr(
+        preflight.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(total=100 * gib, used=40 * gib, free=60 * gib),
+    )
+
+    with pytest.raises(RuntimeError, match="output filesystem.*free"):
+        preflight.check_output_space(tmp_path, min_free_bytes=64 * gib)
+
+
+def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) -> None:
+    """Check a burn-in artifact is a complete eight-rank training checkpoint."""
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "checkpoint_last.pt"
+    rank_state = capture_rng_state()
+    payload = {
+        "format_version": 1,
+        "stage": "pretrain",
+        "config": {"active": {"name": "preflight-test"}},
+        "model": {},
+        "teacher": {},
+        "optimizer": {"state": {}, "param_groups": []},
+        "scheduler": {"last_update": 1},
+        "scaler": None,
+        "update": 1,
+        "epoch": 1,
+        "batch_in_epoch": 0,
+        "rng_state": {"world_size": 8, "by_rank": [rank_state] * 8},
+        "sampler_state": {"epoch": 1, "next_batch": 0},
+        "best_metric": None,
+    }
+    save_checkpoint(checkpoint, payload)
+
+    report = preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    assert report["path"] == str(checkpoint.resolve())
+    assert report["update"] == 1
+    assert report["rng_world_size"] == 8
+
+    payload["optimizer"] = None
+    save_checkpoint(checkpoint, payload)
+    with pytest.raises(RuntimeError, match="optimizer.*resume"):
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
 
 
 def _placeholder_manifests(directory: Path, *, fold: int = 0, fraction: str = "100") -> None:
