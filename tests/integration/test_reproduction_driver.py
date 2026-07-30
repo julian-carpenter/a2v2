@@ -163,6 +163,36 @@ def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) 
         preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
 
 
+def test_environment_preflight_cli_normalizes_unexpected_check_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Check malformed checkpoint errors still produce one failed JSON report."""
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "malformed.pt"
+    checkpoint.touch()
+    monkeypatch.setattr(preflight, "_runtime_report", lambda: {})
+    monkeypatch.setattr(preflight, "check_cuda_devices", lambda *args: [])
+    monkeypatch.setattr(preflight, "check_output_space", lambda *args: {})
+    monkeypatch.setattr(
+        preflight,
+        "check_training_checkpoint",
+        lambda *args: (_ for _ in ()).throw(TypeError("malformed checkpoint")),
+    )
+
+    exit_code = preflight.main([
+        "--output-dir", str(tmp_path),
+        "--checkpoint", str(checkpoint),
+    ])
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "pass": False,
+        "error": "malformed checkpoint",
+    }
+
+
 def _placeholder_manifests(directory: Path, *, fold: int = 0, fraction: str = "100") -> None:
     """Create the manifest names that shell preflight must resolve.
 

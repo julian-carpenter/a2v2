@@ -10,14 +10,18 @@ import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-import h5py
-import numpy as np
-import soundfile
-import tensorboard
-import torch
-import yaml
+_RUNTIME_IMPORT_ERROR: Exception | None = None
+try:
+    import h5py
+    import numpy as np
+    import soundfile
+    import tensorboard
+    import torch
+    import yaml
 
-from a2v2.training import load_checkpoint
+    from a2v2.training import load_checkpoint
+except Exception as error:  # pragma: no cover - exercised by a broken deployment
+    _RUNTIME_IMPORT_ERROR = error
 
 
 GIB = 1024**3
@@ -121,6 +125,10 @@ def check_training_checkpoint(
 def _runtime_report() -> dict[str, object]:
     """Return versions for every native runtime dependency imported above."""
 
+    if _RUNTIME_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            f"could not import reproduction runtime dependencies: {_RUNTIME_IMPORT_ERROR}"
+        ) from _RUNTIME_IMPORT_ERROR
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,
@@ -169,7 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.checkpoint,
                 arguments.expected_gpus,
             )
-    except (OSError, RuntimeError, ValueError) as error:
+    except Exception as error:
         print(json.dumps({"pass": False, "error": str(error)}, sort_keys=True))
         return 1
     print(json.dumps(report, sort_keys=True))

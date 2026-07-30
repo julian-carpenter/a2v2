@@ -106,9 +106,11 @@ one-update burn-in uses the full paper model, data, token budget, accumulation,
 AMP, and eight-rank topology; `--stop-at-update 1` changes only the stopping
 point, not the configured scheduler horizon.
 
-The script validates and resumes a stage when its own `checkpoint_last.pt`
-exists. Do not change world size or batch variables between an interrupted run
-and its resume: sampler and optimizer state belong to the stored topology.
+The script explicitly validates and resumes pretraining when its
+`checkpoint_last.pt` exists; fine-tuning resumes through the trainer's native
+checkpoint validation. Do not change world size or batch variables between an
+interrupted run and its resume: sampler and optimizer state belong to the
+stored topology.
 Validation prefers `checkpoint_best.pt`, falls back to `checkpoint_last.pt`
 with a warning, and records the selected checkpoint hash. Logs contain UTC
 phase headers and append across invocations. The output directory also retains

@@ -436,7 +436,8 @@ The public `run_training` function is a lifecycle boundary around the private
 implementation. It destroys the default process group—and therefore the
 auxiliary checkpoint group—when this call initialized distributed training,
 including exception paths. It does not destroy a default group initialized by
-an embedding caller.
+an embedding caller; in that case it destroys only the auxiliary checkpoint
+group created by the training call.
 
 The workflow records batches delivered to training instead of the sampler
 cursor advanced by DataLoader prefetch. It also supplies a private DataLoader

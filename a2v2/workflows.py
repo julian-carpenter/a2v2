@@ -1753,6 +1753,7 @@ def _run_training(
     resume_path: Path | None,
     pretrained_checkpoint: Path | None,
     stop_at_update: int | None = None,
+    created_checkpoint_groups: list[dist.ProcessGroup] | None = None,
 ) -> Path:
     """Run native pretraining or fine-tuning and return the last checkpoint."""
 
@@ -1767,6 +1768,8 @@ def _run_training(
             "use torchrun with the configured worker count or override the field"
         )
     checkpoint_group = _checkpoint_process_group(device, world_size)
+    if checkpoint_group is not None and created_checkpoint_groups is not None:
+        created_checkpoint_groups.append(checkpoint_group)
     # Mathematics: rank r starts each global RNG at seed+r; its exact evolved
     # states later enter distributed checkpoints.
     # Interpretation: workers draw distinct augmentations during a run but
@@ -2130,9 +2133,10 @@ def run_training(
     pretrained_checkpoint: Path | None,
     stop_at_update: int | None = None,
 ) -> Path:
-    """Run training and release only a process group initialized by this call."""
+    """Run training and release every process group initialized by this call."""
 
     caller_owned_group = dist.is_initialized()
+    created_checkpoint_groups: list[dist.ProcessGroup] = []
     try:
         return _run_training(
             config,
@@ -2140,9 +2144,13 @@ def run_training(
             resume_path=resume_path,
             pretrained_checkpoint=pretrained_checkpoint,
             stop_at_update=stop_at_update,
+            created_checkpoint_groups=created_checkpoint_groups,
         )
     finally:
-        if not caller_owned_group and dist.is_initialized():
+        if caller_owned_group and dist.is_initialized():
+            for group in reversed(created_checkpoint_groups):
+                dist.destroy_process_group(group)
+        elif not caller_owned_group and dist.is_initialized():
             dist.destroy_process_group()
 
 

@@ -124,6 +124,39 @@ def test_run_training_preserves_caller_owned_process_group(
         )
 
 
+def test_run_training_destroys_subgroup_created_under_caller_owned_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check A2V2 cleans up its subgroup while preserving the caller's default."""
+    checkpoint_group = object()
+    destroyed: list[object | None] = []
+    monkeypatch.setattr(workflows.dist, "is_initialized", lambda: True)
+
+    def fake_run_training(*args: object, **kwargs: object) -> Path:
+        """Register one simulated A2V2-owned subgroup before failing."""
+        created_groups = kwargs.get("created_checkpoint_groups")
+        assert isinstance(created_groups, list)
+        created_groups.append(checkpoint_group)
+        raise RuntimeError("forced training failure")
+
+    def fake_destroy_process_group(group: object | None = None) -> None:
+        """Record the exact group selected for cleanup."""
+        destroyed.append(group)
+
+    monkeypatch.setattr(workflows, "_run_training", fake_run_training)
+    monkeypatch.setattr(workflows.dist, "destroy_process_group", fake_destroy_process_group)
+
+    with pytest.raises(RuntimeError, match="forced training failure"):
+        workflows.run_training(
+            object(),  # type: ignore[arg-type]
+            device_name="cuda",
+            resume_path=None,
+            pretrained_checkpoint=None,
+        )
+
+    assert destroyed == [checkpoint_group]
+
+
 def _tensorboard_tags(directory: Path) -> dict[str, object]:
     """Load tags after the training workflow has closed its event writer."""
 
