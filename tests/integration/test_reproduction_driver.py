@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -170,12 +172,16 @@ def _placeholder_manifests(directory: Path, *, fold: int = 0, fraction: str = "1
     (directory / f"valid_{fold}.tsv").touch()
 
 
-def _run_driver(*arguments: str) -> subprocess.CompletedProcess[str]:
+def _run_driver(
+    *arguments: str,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run the deployment shell while retaining output for exact assertions."""
 
     return subprocess.run(
         ["bash", str(DRIVER), *arguments],
         cwd=ROOT,
+        env=environment,
         text=True,
         capture_output=True,
         check=False,
@@ -197,10 +203,14 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     # dry-run rendering. Removing those escape markers lets assertions inspect
     # semantic command arguments rather than presentation syntax.
     semantic_stdout = stdout.replace("\\", "")
-    # Exactly two distributed training stages are launched: one pretraining
-    # job and one fine-tuning job. Validation is a normal single-GPU process.
-    assert semantic_stdout.count("--nproc-per-node=8") == 2
-    assert semantic_stdout.count("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7") >= 2
+    # Fresh runs probe collectives, burn in one production update, resume the
+    # full pretraining job, and finally fine-tune. Validation is single-GPU.
+    assert semantic_stdout.count("--nproc-per-node=8") == 4
+    assert semantic_stdout.count("CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7") >= 4
+    assert "python -m torch.distributed.run" in semantic_stdout
+    assert "check_reproduction_environment.py" in semantic_stdout
+    assert "tests/gpu/nccl_probe.py" in semantic_stdout
+    assert "--stop-at-update 1" in semantic_stdout
     assert "distributed_training.distributed_world_size=8" in semantic_stdout
 
     # Pretraining is already memory-bound at the published per-rank budget.
@@ -212,12 +222,101 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert "optimization.update_freq=[2]" in semantic_stdout
 
     pretrain_checkpoint = output / "pretrain/checkpoint_last.pt"
+    assert f"--resume {pretrain_checkpoint}" in semantic_stdout
     assert f"--pretrained-checkpoint {pretrain_checkpoint}" in semantic_stdout
     assert "configs/MeerKAT/finetune_mixup_100.yaml" in semantic_stdout
     assert "dataset.train_subset=train_0" in semantic_stdout
     assert "dataset.valid_subset=valid_0" in semantic_stdout
     assert str(output / "final-evaluation/final-evaluation-report.json") in semantic_stdout
     assert str(output / "final-evaluation/tensorboard") in semantic_stdout
+
+
+def test_real_driver_burns_in_resumes_and_appends_phase_logs(tmp_path: Path) -> None:
+    """Check real-mode orchestration with a deterministic fake runtime."""
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _placeholder_manifests(manifests)
+    invocations = tmp_path / "invocations.jsonl"
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+record = Path(os.environ["A2V2_FAKE_INVOCATIONS"])
+with record.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+
+if arguments == ["--version"]:
+    print("Python 3.12.3")
+elif arguments[:3] == ["-m", "pip", "freeze"]:
+    print("a2v2==0.1.0")
+elif arguments and arguments[0].endswith("check_reproduction_environment.py"):
+    print('{"pass": true}')
+elif arguments[:2] == ["-m", "torch.distributed.run"]:
+    if any(value.endswith("nccl_probe.py") for value in arguments):
+        probe_output = Path(arguments[arguments.index("--output-dir") + 1])
+        probe_output.mkdir(parents=True, exist_ok=True)
+        for rank in range(8):
+            (probe_output / f"rank-{rank}.json").write_text(
+                json.dumps({"rank": rank, "pass": True}) + "\\n",
+                encoding="utf-8",
+            )
+    else:
+        overrides = [
+            value.removeprefix("checkpoint.save_dir=")
+            for value in arguments
+            if value.startswith("checkpoint.save_dir=")
+        ]
+        training_output = Path(overrides[0])
+        training_output.mkdir(parents=True, exist_ok=True)
+        (training_output / "checkpoint_last.pt").touch()
+        if any("finetune_mixup" in value for value in arguments):
+            (training_output / "checkpoint_best.pt").touch()
+    print("fake distributed command")
+elif arguments and arguments[0].endswith("evaluate_finetuning_checkpoint.py"):
+    report = Path(arguments[arguments.index("--output") + 1])
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text('{"pass": true}\\n', encoding="utf-8")
+    print('{"pass": true}')
+else:
+    raise SystemExit(f"unexpected fake Python arguments: {arguments}")
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_nvidia_smi = fake_bin / "nvidia-smi"
+    # This container's Bash startup hook probes PATH's nvidia-smi. A shell
+    # script stub would recursively trigger that hook, so use a no-op binary.
+    fake_nvidia_smi.symlink_to("/bin/true")
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_PYTHON": str(fake_python),
+        "A2V2_TRAIN_ENTRY": "/bin/true",
+        "A2V2_FAKE_INVOCATIONS": str(invocations),
+    }
+
+    first = _run_driver(str(manifests), str(output), environment=environment)
+
+    assert first.returncode == 0, first.stderr
+    training_log = output / "pretrain/train.log"
+    first_log = training_log.read_text(encoding="utf-8")
+    assert first_log.count("phase=pretraining-burn-in") == 1
+    assert first_log.count("phase=pretraining-resume") == 1
+
+    second = _run_driver(str(manifests), str(output), environment=environment)
+
+    assert second.returncode == 0, second.stderr
+    second_log = training_log.read_text(encoding="utf-8")
+    assert second_log.startswith(first_log)
+    assert second_log.count("phase=pretraining-burn-in") == 1
+    assert second_log.count("phase=pretraining-resume") == 2
 
 
 def test_dry_run_rejects_a_missing_selected_manifest(tmp_path: Path) -> None:

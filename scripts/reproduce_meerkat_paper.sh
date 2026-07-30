@@ -56,14 +56,18 @@ print_command() {
 
 
 run_logged() {
-    local log_path="$1"
-    shift
-    printf 'Launching:'
-    printf ' %q' "$@"
-    printf '\n'
+    local phase="$1"
+    local log_path="$2"
+    shift 2
+    {
+        printf '\n[%s] phase=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${phase}"
+        printf 'Launching:'
+        printf ' %q' "$@"
+        printf '\n'
+    } | tee -a "${log_path}"
     # With ``pipefail``, a failing training process remains a failure even
     # though tee successfully preserved its output.
-    "$@" 2>&1 | tee "${log_path}"
+    "$@" 2>&1 | tee -a "${log_path}"
 }
 
 
@@ -165,7 +169,11 @@ for gpu_id in "${GPU_IDS[@]}"; do
 done
 
 readonly PYTHON_BIN="${A2V2_PYTHON:-python}"
-readonly TORCHRUN_BIN="${A2V2_TORCHRUN:-torchrun}"
+if [[ -n "${A2V2_TORCHRUN:-}" ]]; then
+    TORCHRUN_COMMAND=("${A2V2_TORCHRUN}")
+else
+    TORCHRUN_COMMAND=("${PYTHON_BIN}" -m torch.distributed.run)
+fi
 TRAIN_ENTRY="${A2V2_TRAIN_ENTRY:-a2v2-train}"
 
 # Per-device pretraining memory cannot be pooled across ranks. The measured
@@ -214,39 +222,34 @@ printf '%s\n' \
     "  finetune: dataset.max_tokens=${FINETUNE_MAX_TOKENS}, optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]" \
     "  scope: one fold on an eight-rank topology; not an exact paper reproduction"
 
+PREFLIGHT_COMMAND=(
+    env
+    "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
+    "${PYTHON_BIN}"
+    "${SCRIPT_DIR}/check_reproduction_environment.py"
+    --output-dir "${OUTPUT_DIR}"
+)
+PROBE_COMMAND=(
+    env
+    "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
+    "${TORCHRUN_COMMAND[@]}"
+    --standalone
+    --nproc-per-node=8
+    "${REPOSITORY_ROOT}/tests/gpu/nccl_probe.py"
+    --output-dir "${OUTPUT_DIR}/environment/nccl-preflight"
+)
+
 if [[ "${DRY_RUN}" == false ]]; then
     command -v "${PYTHON_BIN}" >/dev/null 2>&1 \
         || die "Python command is unavailable: ${PYTHON_BIN}"
-    command -v "${TORCHRUN_BIN}" >/dev/null 2>&1 \
-        || die "torchrun command is unavailable: ${TORCHRUN_BIN}"
+    command -v "${TORCHRUN_COMMAND[0]}" >/dev/null 2>&1 \
+        || die "distributed launcher is unavailable: ${TORCHRUN_COMMAND[0]}"
     if [[ "${TRAIN_ENTRY}" == "a2v2-train" ]]; then
         TRAIN_ENTRY="$(command -v a2v2-train)" \
             || die "a2v2-train is unavailable; install this repository first"
     fi
     [[ -x "${TRAIN_ENTRY}" ]] \
         || die "training entry point is not executable: ${TRAIN_ENTRY}"
-
-    # CUDA preflight runs after applying the requested physical-device mask.
-    # PyTorch then sees these as logical devices 0..7. Requiring 39 GiB allows
-    # for binary/decimal reporting differences while rejecting smaller cards.
-    env CUDA_VISIBLE_DEVICES="${SELECTED_GPUS}" "${PYTHON_BIN}" -c '
-import torch
-
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is unavailable in the selected Python environment")
-if torch.cuda.device_count() != 8:
-    raise SystemExit(f"expected 8 visible CUDA devices, found {torch.cuda.device_count()}")
-minimum_bytes = 39 * 1024**3
-for index in range(8):
-    properties = torch.cuda.get_device_properties(index)
-    if "A100" not in properties.name:
-        raise SystemExit(f"device {index} is not an A100: {properties.name}")
-    if properties.total_memory < minimum_bytes:
-        raise SystemExit(
-            f"device {index} has only {properties.total_memory / 1024**3:.2f} GiB"
-        )
-print(torch.__version__, torch.version.cuda)
-'
 
     mkdir -p \
         "${OUTPUT_DIR}/environment" \
@@ -276,13 +279,24 @@ print(torch.__version__, torch.version.cuda)
         printf 'finetune_max_tokens=%s\n' "${FINETUNE_MAX_TOKENS}"
         printf 'finetune_update_freq=%s\n' "${FINETUNE_UPDATE_FREQ}"
     } > "${OUTPUT_DIR}/environment/run-profile.txt"
+    run_logged \
+        environment-preflight \
+        "${OUTPUT_DIR}/environment/preflight.log" \
+        "${PREFLIGHT_COMMAND[@]}"
+    run_logged \
+        distributed-probe \
+        "${OUTPUT_DIR}/environment/nccl-probe.log" \
+        "${PROBE_COMMAND[@]}"
+else
+    print_command "${PREFLIGHT_COMMAND[@]}"
+    print_command "${PROBE_COMMAND[@]}"
 fi
 
 PRETRAIN_COMMAND=(
     env
     "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-    "${TORCHRUN_BIN}"
+    "${TORCHRUN_COMMAND[@]}"
     --standalone
     --nproc-per-node=8
     "${TRAIN_ENTRY}"
@@ -294,23 +308,55 @@ PRETRAIN_COMMAND=(
     --override "optimization.update_freq=[${PRETRAIN_UPDATE_FREQ}]"
     --device cuda
 )
-if [[ -f "${PRETRAIN_CHECKPOINT}" ]]; then
-    PRETRAIN_COMMAND+=(--resume "${PRETRAIN_CHECKPOINT}")
-fi
+PRETRAIN_BURN_IN_COMMAND=("${PRETRAIN_COMMAND[@]}" --stop-at-update 1)
+PRETRAIN_RESUME_COMMAND=("${PRETRAIN_COMMAND[@]}" --resume "${PRETRAIN_CHECKPOINT}")
+CHECKPOINT_PREFLIGHT_COMMAND=(
+    "${PREFLIGHT_COMMAND[@]}"
+    --checkpoint "${PRETRAIN_CHECKPOINT}"
+)
 
-if [[ "${DRY_RUN}" == true ]]; then
-    print_command "${PRETRAIN_COMMAND[@]}"
+if [[ -f "${PRETRAIN_CHECKPOINT}" ]]; then
+    if [[ "${DRY_RUN}" == true ]]; then
+        print_command "${CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+        print_command "${PRETRAIN_RESUME_COMMAND[@]}"
+    else
+        run_logged \
+            pretraining-checkpoint-validation \
+            "${PRETRAIN_DIR}/train.log" \
+            "${CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+        run_logged \
+            pretraining-resume \
+            "${PRETRAIN_DIR}/train.log" \
+            "${PRETRAIN_RESUME_COMMAND[@]}"
+    fi
 else
-    run_logged "${PRETRAIN_DIR}/train.log" "${PRETRAIN_COMMAND[@]}"
-    [[ -f "${PRETRAIN_CHECKPOINT}" ]] \
-        || die "pretraining completed without ${PRETRAIN_CHECKPOINT}"
+    if [[ "${DRY_RUN}" == true ]]; then
+        print_command "${PRETRAIN_BURN_IN_COMMAND[@]}"
+        print_command "${CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+        print_command "${PRETRAIN_RESUME_COMMAND[@]}"
+    else
+        run_logged \
+            pretraining-burn-in \
+            "${PRETRAIN_DIR}/train.log" \
+            "${PRETRAIN_BURN_IN_COMMAND[@]}"
+        [[ -f "${PRETRAIN_CHECKPOINT}" ]] \
+            || die "pretraining burn-in completed without ${PRETRAIN_CHECKPOINT}"
+        run_logged \
+            pretraining-checkpoint-validation \
+            "${PRETRAIN_DIR}/train.log" \
+            "${CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+        run_logged \
+            pretraining-resume \
+            "${PRETRAIN_DIR}/train.log" \
+            "${PRETRAIN_RESUME_COMMAND[@]}"
+    fi
 fi
 
 FINETUNE_COMMAND=(
     env
     "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-    "${TORCHRUN_BIN}"
+    "${TORCHRUN_COMMAND[@]}"
     --standalone
     --nproc-per-node=8
     "${TRAIN_ENTRY}"
@@ -333,7 +379,7 @@ if [[ "${DRY_RUN}" == true ]]; then
     print_command "${FINETUNE_COMMAND[@]}"
     EVALUATION_CHECKPOINT="${FINETUNE_BEST_CHECKPOINT}"
 else
-    run_logged "${FINETUNE_DIR}/train.log" "${FINETUNE_COMMAND[@]}"
+    run_logged finetuning "${FINETUNE_DIR}/train.log" "${FINETUNE_COMMAND[@]}"
     if [[ -f "${FINETUNE_BEST_CHECKPOINT}" ]]; then
         EVALUATION_CHECKPOINT="${FINETUNE_BEST_CHECKPOINT}"
     elif [[ -f "${FINETUNE_LAST_CHECKPOINT}" ]]; then
@@ -370,7 +416,7 @@ if [[ "${DRY_RUN}" == true ]]; then
     print_command "${EVALUATION_COMMAND[@]}"
     printf 'Dry-run complete. Final report would be written to %s\n' "${FINAL_REPORT}"
 else
-    run_logged "${EVALUATION_DIR}/validation.log" "${EVALUATION_COMMAND[@]}"
+    run_logged evaluation "${EVALUATION_DIR}/validation.log" "${EVALUATION_COMMAND[@]}"
     [[ -f "${FINAL_REPORT}" ]] || die "validation did not write ${FINAL_REPORT}"
     printf '\nFinal evaluation report (%s):\n' "${FINAL_REPORT}"
     cat "${FINAL_REPORT}"
