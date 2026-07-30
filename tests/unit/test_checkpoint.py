@@ -82,6 +82,7 @@ def test_rank_rng_gather_uses_selected_group_and_preserves_order(
         dst: int,
         group: object,
     ) -> None:
+        """Return two encoded rank states through the selected test group."""
         assert encoded == encoded_by_rank[0]
         assert dst == 0
         assert group is selected_group
@@ -123,6 +124,7 @@ def test_rank_rng_gather_rejects_incomplete_or_non_byte_payloads(
         dst: int,
         group: object,
     ) -> None:
+        """Return the parametrized malformed gather result."""
         assert isinstance(encoded, bytes)
         assert dst == 0
         assert group is selected_group

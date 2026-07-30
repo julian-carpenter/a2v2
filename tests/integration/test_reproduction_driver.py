@@ -55,16 +55,21 @@ def _fake_cuda(*, low_free_index: int | None = None) -> object:
         free_by_device[low_free_index] = 37 * gib
 
     class FakeCuda:
+        """Expose only the CUDA inspection methods used by preflight."""
+
         @staticmethod
         def device_count() -> int:
+            """Return the required eight visible devices."""
             return 8
 
         @staticmethod
         def get_device_properties(index: int) -> object:
+            """Return A100 identity and total memory for one device."""
             return SimpleNamespace(name="NVIDIA A100-SXM4-40GB", total_memory=total)
 
         @staticmethod
         def mem_get_info(index: int) -> tuple[int, int]:
+            """Return the configured free and total bytes for one device."""
             return free_by_device[index], total
 
     return FakeCuda()

@@ -28,6 +28,7 @@ def test_checkpoint_process_group_uses_gloo_for_distributed_cuda(
     selected_group = object()
 
     def fake_new_group(*, backend: str) -> object:
+        """Return a sentinel for the requested Gloo group."""
         assert backend == "gloo"
         return selected_group
 
@@ -48,6 +49,7 @@ def test_checkpoint_process_group_skips_cpu_or_single_rank(
     """Check launches that do not need a second backend create no group."""
 
     def unexpected_new_group(*, backend: str) -> object:
+        """Fail if a test case attempts to create an unnecessary group."""
         raise AssertionError(f"unexpected {backend} process group")
 
     monkeypatch.setattr(workflows.dist, "new_group", unexpected_new_group)
@@ -69,10 +71,12 @@ def test_run_training_destroys_process_group_created_during_failure(
     )
 
     def fake_run_training(*args: object, **kwargs: object) -> Path:
+        """Model a failure after this training call initialized distributed state."""
         distributed["initialized"] = True
         raise RuntimeError("forced training failure")
 
     def fake_destroy_process_group() -> None:
+        """Record cleanup and clear the simulated distributed state."""
         destroyed.append(True)
         distributed["initialized"] = False
 
@@ -97,9 +101,11 @@ def test_run_training_preserves_caller_owned_process_group(
     monkeypatch.setattr(workflows.dist, "is_initialized", lambda: True)
 
     def fake_run_training(*args: object, **kwargs: object) -> Path:
+        """Model a training failure beneath a caller-owned process group."""
         raise RuntimeError("forced training failure")
 
     def unexpected_destroy_process_group() -> None:
+        """Fail if training destroys its caller's simulated group."""
         raise AssertionError("caller-owned process group was destroyed")
 
     monkeypatch.setattr(workflows, "_run_training", fake_run_training)
