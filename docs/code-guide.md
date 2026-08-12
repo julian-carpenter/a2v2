@@ -320,10 +320,12 @@ Distributed training gathers one state per rank into the rank-zero checkpoint.
 own stream.
 
 `gather_rank_rng_states` serializes each tensor-bearing state to bytes and
-requires exactly one payload in rank order. CUDA training passes a dedicated
-Gloo process group to this helper: NCCL remains the high-throughput tensor data
-plane, while serialized CPU checkpoint metadata stays off the CUDA allocator.
-CPU distributed training already uses Gloo as its default group.
+requires exactly one payload in rank order. CUDA training creates a dedicated
+Gloo process group with a two-hour timeout for checkpoint and validation
+control data. Serialized CPU checkpoint metadata stays off the CUDA allocator,
+and CPU validation decisions let nonzero ranks wait without holding a pending
+NCCL collective. CPU distributed training already uses Gloo as its default
+group.
 
 `save_checkpoint` writes a temporary file and performs an atomic replacement.
 `validate_checkpoint` enforces the versioned plain-container schema.
@@ -434,10 +436,10 @@ DataLoaders, and owns validation and save cadence.
 
 The public `run_training` function is a lifecycle boundary around the private
 implementation. It destroys the default process group—and therefore the
-auxiliary checkpoint group—when this call initialized distributed training,
+auxiliary control group—when this call initialized distributed training,
 including exception paths. It does not destroy a default group initialized by
-an embedding caller; in that case it destroys only the auxiliary checkpoint
-group created by the training call.
+an embedding caller; in that case it destroys only the auxiliary control group
+created by the training call.
 
 The workflow records batches delivered to training instead of the sampler
 cursor advanced by DataLoader prefetch. It also supplies a private DataLoader

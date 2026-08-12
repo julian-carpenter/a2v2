@@ -106,11 +106,19 @@ one-update burn-in uses the full paper model, data, token budget, accumulation,
 AMP, and eight-rank topology; `--stop-at-update 1` changes only the stopping
 point, not the configured scheduler horizon.
 
-The script explicitly validates and resumes pretraining when its
-`checkpoint_last.pt` exists; fine-tuning resumes through the trainer's native
-checkpoint validation. Do not change world size or batch variables between an
-interrupted run and its resume: sampler and optimizer state belong to the
-stored topology.
+The script validates and resumes pretraining from `checkpoint_last.pt`. For
+fine-tuning it prefers `checkpoint_last.pt`; when that file is absent after an
+interruption, it selects the newest `checkpoint_best.pt`,
+`checkpoint_<update>.pt`, or `checkpoint_epoch_<epoch>.pt`. Before torchrun,
+preflight requires the selected file to match the training stage and contain
+optimizer, scheduler, and one RNG state for each of the eight ranks. Do not
+change world size or batch variables between an interrupted run and its resume:
+sampler and optimizer state belong to the stored topology.
+
+Scheduled training validation runs on rank zero. CUDA workers exchange the
+result through a CPU Gloo control group with a two-hour timeout, so the other
+ranks do not hold an NCCL collective while rank zero evaluates the full split.
+
 Validation prefers `checkpoint_best.pt`, falls back to `checkpoint_last.pt`
 with a warning, and records the selected checkpoint hash. Logs contain UTC
 phase headers and append across invocations. The output directory also retains
