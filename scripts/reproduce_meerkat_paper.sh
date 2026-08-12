@@ -213,6 +213,23 @@ readonly EVALUATION_TENSORBOARD_DIR="${EVALUATION_DIR}/tensorboard"
 readonly PRETRAIN_CHECKPOINT="${PRETRAIN_DIR}/checkpoint_last.pt"
 readonly FINETUNE_BEST_CHECKPOINT="${FINETUNE_DIR}/checkpoint_best.pt"
 readonly FINETUNE_LAST_CHECKPOINT="${FINETUNE_DIR}/checkpoint_last.pt"
+FINETUNE_RESUME_CHECKPOINT=""
+if [[ -f "${FINETUNE_LAST_CHECKPOINT}" ]]; then
+    FINETUNE_RESUME_CHECKPOINT="${FINETUNE_LAST_CHECKPOINT}"
+else
+    for candidate in \
+        "${FINETUNE_BEST_CHECKPOINT}" \
+        "${FINETUNE_DIR}"/checkpoint_[0-9]*.pt \
+        "${FINETUNE_DIR}"/checkpoint_epoch_*.pt
+    do
+        [[ -f "${candidate}" ]] || continue
+        if [[ -z "${FINETUNE_RESUME_CHECKPOINT}" \
+            || "${candidate}" -nt "${FINETUNE_RESUME_CHECKPOINT}" ]]
+        then
+            FINETUNE_RESUME_CHECKPOINT="${candidate}"
+        fi
+    done
+fi
 
 printf '%s\n' \
     "A2V2 approximate Animal2Vec 1.0 MeerKAT reproduction" \
@@ -313,6 +330,7 @@ PRETRAIN_RESUME_COMMAND=("${PRETRAIN_COMMAND[@]}" --resume "${PRETRAIN_CHECKPOIN
 CHECKPOINT_PREFLIGHT_COMMAND=(
     "${PREFLIGHT_COMMAND[@]}"
     --checkpoint "${PRETRAIN_CHECKPOINT}"
+    --expected-stage pretrain
 )
 
 if [[ -f "${PRETRAIN_CHECKPOINT}" ]]; then
@@ -371,14 +389,28 @@ FINETUNE_COMMAND=(
     --override "optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]"
     --device cuda
 )
-if [[ -f "${FINETUNE_LAST_CHECKPOINT}" ]]; then
-    FINETUNE_COMMAND+=(--resume "${FINETUNE_LAST_CHECKPOINT}")
+if [[ -n "${FINETUNE_RESUME_CHECKPOINT}" ]]; then
+    FINETUNE_COMMAND+=(--resume "${FINETUNE_RESUME_CHECKPOINT}")
+    FINETUNE_CHECKPOINT_PREFLIGHT_COMMAND=(
+        "${PREFLIGHT_COMMAND[@]}"
+        --checkpoint "${FINETUNE_RESUME_CHECKPOINT}"
+        --expected-stage finetune
+    )
 fi
 
 if [[ "${DRY_RUN}" == true ]]; then
+    if [[ -n "${FINETUNE_RESUME_CHECKPOINT}" ]]; then
+        print_command "${FINETUNE_CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+    fi
     print_command "${FINETUNE_COMMAND[@]}"
     EVALUATION_CHECKPOINT="${FINETUNE_BEST_CHECKPOINT}"
 else
+    if [[ -n "${FINETUNE_RESUME_CHECKPOINT}" ]]; then
+        run_logged \
+            finetuning-checkpoint-validation \
+            "${FINETUNE_DIR}/train.log" \
+            "${FINETUNE_CHECKPOINT_PREFLIGHT_COMMAND[@]}"
+    fi
     run_logged finetuning "${FINETUNE_DIR}/train.log" "${FINETUNE_COMMAND[@]}"
     if [[ -f "${FINETUNE_BEST_CHECKPOINT}" ]]; then
         EVALUATION_CHECKPOINT="${FINETUNE_BEST_CHECKPOINT}"

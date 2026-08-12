@@ -268,6 +268,7 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert "optimization.update_freq=[2]" in semantic_stdout
 
     pretrain_checkpoint = output / "pretrain/checkpoint_last.pt"
+    assert f"--checkpoint {pretrain_checkpoint} --expected-stage pretrain" in semantic_stdout
     assert f"--resume {pretrain_checkpoint}" in semantic_stdout
     assert f"--pretrained-checkpoint {pretrain_checkpoint}" in semantic_stdout
     assert "configs/MeerKAT/finetune_mixup_100.yaml" in semantic_stdout
@@ -275,6 +276,55 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert "dataset.valid_subset=valid_0" in semantic_stdout
     assert str(output / "final-evaluation/final-evaluation-report.json") in semantic_stdout
     assert str(output / "final-evaluation/tensorboard") in semantic_stdout
+
+
+def test_dry_run_recovers_from_newest_periodic_finetune_checkpoint(tmp_path: Path) -> None:
+    """Resume fine-tuning from the newest periodic checkpoint when last is absent."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+    finetune = output / "finetune"
+    finetune.mkdir(parents=True)
+    best = finetune / "checkpoint_best.pt"
+    update = finetune / "checkpoint_9000.pt"
+    epoch = finetune / "checkpoint_epoch_20.pt"
+    best.touch()
+    update.touch()
+    epoch.touch()
+    os.utime(best, (1, 1))
+    os.utime(update, (2, 2))
+    os.utime(epoch, (3, 3))
+
+    completed = _run_driver(str(manifests), str(output), "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = completed.stdout.replace("\\", "")
+    assert f"--checkpoint {epoch} --expected-stage finetune" in rendered
+    assert f"--resume {epoch}" in rendered
+
+
+def test_dry_run_prefers_finetune_last_over_newer_periodic_checkpoint(tmp_path: Path) -> None:
+    """Prefer the canonical fine-tuning resume checkpoint over a newer periodic file."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+    finetune = output / "finetune"
+    finetune.mkdir(parents=True)
+    last = finetune / "checkpoint_last.pt"
+    periodic = finetune / "checkpoint_epoch_20.pt"
+    last.touch()
+    periodic.touch()
+    os.utime(last, (1, 1))
+    os.utime(periodic, (2, 2))
+
+    completed = _run_driver(str(manifests), str(output), "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = completed.stdout.replace("\\", "")
+    assert f"--resume {last}" in rendered
+    assert f"--resume {periodic}" not in rendered
 
 
 def test_real_driver_burns_in_resumes_and_appends_phase_logs(tmp_path: Path) -> None:
