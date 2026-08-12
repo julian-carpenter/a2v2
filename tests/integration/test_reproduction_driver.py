@@ -249,6 +249,14 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     # dry-run rendering. Removing those escape markers lets assertions inspect
     # semantic command arguments rather than presentation syntax.
     semantic_stdout = stdout.replace("\\", "")
+    training_launches = [
+        line.replace("\\", "")
+        for line in stdout.splitlines()
+        if line.startswith("Launching:") and "a2v2-train" in line
+    ]
+    assert len(training_launches) == 3
+    assert all("OMP_NUM_THREADS=8" in line for line in training_launches)
+    assert "  CPU: OMP_NUM_THREADS=8" in stdout
     # Fresh runs probe collectives, burn in one production update, resume the
     # full pretraining job, and finally fine-tune. Validation is single-GPU.
     assert semantic_stdout.count("--nproc-per-node=8") == 4
@@ -276,6 +284,54 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert "dataset.valid_subset=valid_0" in semantic_stdout
     assert str(output / "final-evaluation/final-evaluation-report.json") in semantic_stdout
     assert str(output / "final-evaluation/tensorboard") in semantic_stdout
+
+
+def test_dry_run_applies_the_requested_training_thread_budget(tmp_path: Path) -> None:
+    """Apply one explicit CPU-thread budget to every distributed training rank."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+    environment = {**os.environ, "A2V2_OMP_NUM_THREADS": "4"}
+
+    completed = _run_driver(
+        str(manifests),
+        str(output),
+        "--dry-run",
+        environment=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    training_launches = [
+        line.replace("\\", "")
+        for line in completed.stdout.splitlines()
+        if line.startswith("Launching:") and "a2v2-train" in line
+    ]
+    assert len(training_launches) == 3
+    assert all("OMP_NUM_THREADS=4" in line for line in training_launches)
+    assert "  CPU: OMP_NUM_THREADS=4" in completed.stdout
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_driver_rejects_an_invalid_training_thread_budget(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    """Reject thread budgets that cannot produce a positive worker pool."""
+
+    manifests = tmp_path / "manifests"
+    _placeholder_manifests(manifests)
+    environment = {**os.environ, "A2V2_OMP_NUM_THREADS": value}
+
+    completed = _run_driver(
+        str(manifests),
+        str(tmp_path / "experiment"),
+        "--dry-run",
+        environment=environment,
+    )
+
+    assert completed.returncode != 0
+    assert "A2V2_OMP_NUM_THREADS must be a positive integer" in completed.stderr
 
 
 def test_dry_run_recovers_from_newest_periodic_finetune_checkpoint(tmp_path: Path) -> None:
@@ -401,6 +457,10 @@ else:
     first = _run_driver(str(manifests), str(output), environment=environment)
 
     assert first.returncode == 0, first.stderr
+    run_profile = (output / "environment/run-profile.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "omp_num_threads=8\n" in run_profile
     training_log = output / "pretrain/train.log"
     first_log = training_log.read_text(encoding="utf-8")
     assert first_log.count("phase=pretraining-burn-in") == 1

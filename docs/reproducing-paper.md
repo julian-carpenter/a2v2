@@ -92,6 +92,13 @@ The deployment controls are:
 | `A2V2_PYTHON` | `python` | Interpreter used for preflight, `torch.distributed.run`, and evaluation |
 | `A2V2_TORCHRUN` | unset | Optional single launcher executable replacing `python -m torch.distributed.run` |
 | `A2V2_TRAIN_ENTRY` | `a2v2-train` | Training script passed to the distributed launcher |
+| `A2V2_OMP_NUM_THREADS` | `8` | Per-rank PyTorch CPU thread budget for distributed training and rank-zero validation |
+
+The default gives the eight training ranks 64 PyTorch intra-op threads in
+total. Together with the configured 20 data-loader workers per rank, the
+conservative upper bound is 224 threads on the 256-logical-CPU reproduction
+host. Override `A2V2_OMP_NUM_THREADS` only with a positive integer; values of
+16 or more can oversubscribe this host during distributed loading.
 
 Use `--fold N` for another single fold and `--fraction 025` or
 `--fraction 001` for one reduced-label recipe. Use `--dry-run` to check

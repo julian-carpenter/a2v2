@@ -49,7 +49,7 @@ require_positive_integer() {
 print_command() {
     # ``%q`` makes the dry-run an executable audit record even when a path
     # contains spaces. No command is evaluated by this function.
-    printf 'DRY-RUN:'
+    printf 'Launching:'
     printf ' %q' "$@"
     printf '\n'
 }
@@ -196,12 +196,14 @@ readonly FINETUNE_MAX_TOKENS="${A2V2_FINETUNE_MAX_TOKENS:-960000}"
 readonly FINETUNE_UPDATE_FREQ="${A2V2_FINETUNE_UPDATE_FREQ:-2}"
 readonly EVAL_MAX_TOKENS="${A2V2_EVAL_MAX_TOKENS:-320000}"
 readonly EVAL_WORKERS="${A2V2_EVAL_WORKERS:-20}"
+readonly TRAIN_OMP_NUM_THREADS="${A2V2_OMP_NUM_THREADS:-8}"
 
 require_positive_integer A2V2_PRETRAIN_MAX_TOKENS "${PRETRAIN_MAX_TOKENS}"
 require_positive_integer A2V2_PRETRAIN_UPDATE_FREQ "${PRETRAIN_UPDATE_FREQ}"
 require_positive_integer A2V2_FINETUNE_MAX_TOKENS "${FINETUNE_MAX_TOKENS}"
 require_positive_integer A2V2_FINETUNE_UPDATE_FREQ "${FINETUNE_UPDATE_FREQ}"
 require_positive_integer A2V2_EVAL_MAX_TOKENS "${EVAL_MAX_TOKENS}"
+require_positive_integer A2V2_OMP_NUM_THREADS "${TRAIN_OMP_NUM_THREADS}"
 [[ "${EVAL_WORKERS}" =~ ^[0-9]+$ ]] \
     || die "A2V2_EVAL_WORKERS must be a non-negative integer"
 
@@ -237,6 +239,7 @@ printf '%s\n' \
     "  CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}, distributed_training.distributed_world_size=8" \
     "  pretrain: dataset.max_tokens=${PRETRAIN_MAX_TOKENS}, optimization.update_freq=[${PRETRAIN_UPDATE_FREQ}]" \
     "  finetune: dataset.max_tokens=${FINETUNE_MAX_TOKENS}, optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]" \
+    "  CPU: OMP_NUM_THREADS=${TRAIN_OMP_NUM_THREADS}" \
     "  scope: one fold on an eight-rank topology; not an exact paper reproduction"
 
 PREFLIGHT_COMMAND=(
@@ -295,6 +298,7 @@ if [[ "${DRY_RUN}" == false ]]; then
         printf 'pretrain_update_freq=%s\n' "${PRETRAIN_UPDATE_FREQ}"
         printf 'finetune_max_tokens=%s\n' "${FINETUNE_MAX_TOKENS}"
         printf 'finetune_update_freq=%s\n' "${FINETUNE_UPDATE_FREQ}"
+        printf 'omp_num_threads=%s\n' "${TRAIN_OMP_NUM_THREADS}"
     } > "${OUTPUT_DIR}/environment/run-profile.txt"
     run_logged \
         environment-preflight \
@@ -313,6 +317,7 @@ PRETRAIN_COMMAND=(
     env
     "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+    "OMP_NUM_THREADS=${TRAIN_OMP_NUM_THREADS}"
     "${TORCHRUN_COMMAND[@]}"
     --standalone
     --nproc-per-node=8
@@ -374,6 +379,7 @@ FINETUNE_COMMAND=(
     env
     "CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}"
     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+    "OMP_NUM_THREADS=${TRAIN_OMP_NUM_THREADS}"
     "${TORCHRUN_COMMAND[@]}"
     --standalone
     --nproc-per-node=8
