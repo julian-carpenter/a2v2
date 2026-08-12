@@ -95,36 +95,108 @@ def check_training_checkpoint(
 ) -> dict[str, object]:
     """Validate that a native checkpoint can resume eight-rank optimization."""
 
-    checkpoint = load_checkpoint(path, map_location="cpu")
+    resolved = path.resolve()
+
+    def fail(reason: str) -> None:
+        """Raise one actionable failure that always identifies the selected file."""
+
+        raise RuntimeError(f"checkpoint {resolved}: {reason}")
+
+    try:
+        checkpoint = load_checkpoint(resolved, map_location="cpu")
+    except Exception as error:
+        fail(f"cannot load or validate native checkpoint: {error}")
     stage = str(checkpoint["stage"])
     if expected_stage is not None and stage != expected_stage:
-        raise RuntimeError(
-            f"checkpoint stage is {stage}; expected {expected_stage}: {path.resolve()}"
-        )
-    if checkpoint["optimizer"] is None:
-        raise RuntimeError("checkpoint optimizer state is missing; cannot resume training")
-    if checkpoint["scheduler"] is None:
-        raise RuntimeError("checkpoint scheduler state is missing; cannot resume training")
+        fail(f"checkpoint stage is {stage}; expected {expected_stage}")
+    if not isinstance(checkpoint["optimizer"], Mapping):
+        fail("optimizer state is not a mapping; cannot resume training")
+    if not isinstance(checkpoint["scheduler"], Mapping):
+        fail("scheduler state is not a mapping; cannot resume training")
+
+    stored_config = checkpoint["config"]
+    active_config = (
+        stored_config.get("active") if isinstance(stored_config, Mapping) else None
+    )
+    common_config = (
+        active_config.get("common") if isinstance(active_config, Mapping) else None
+    )
+    amp_enabled = (
+        isinstance(common_config, Mapping) and common_config.get("fp16") is True
+    )
+    if amp_enabled and not isinstance(checkpoint["scaler"], Mapping):
+        fail("AMP scaler state is not a mapping; cannot resume fp16 training")
+
     rng_state = checkpoint["rng_state"]
     if not isinstance(rng_state, Mapping):
-        raise RuntimeError("checkpoint RNG state is not a mapping")
-    saved_world_size = int(rng_state.get("world_size", 0))
+        fail("RNG state is not a mapping")
+    try:
+        saved_world_size = int(rng_state.get("world_size", 0))
+    except (TypeError, ValueError, OverflowError) as error:
+        fail(f"RNG world size is invalid: {error}")
     ranked = rng_state.get("by_rank")
     if saved_world_size != expected_world_size:
-        raise RuntimeError(
-            f"checkpoint RNG world size is {saved_world_size}; expected {expected_world_size}"
+        fail(
+            f"RNG world size is {saved_world_size}; expected {expected_world_size}"
         )
     if not isinstance(ranked, (list, tuple)) or len(ranked) != expected_world_size:
-        raise RuntimeError(
-            "checkpoint does not contain one RNG state for every expected rank"
-        )
+        fail("does not contain exactly one RNG state for every expected rank")
+    for rank, rank_state in enumerate(ranked):
+        if not isinstance(rank_state, Mapping):
+            fail(f"RNG state for rank {rank} is not a mapping")
+        if "python" not in rank_state:
+            fail(f"RNG state for rank {rank} is missing Python state")
+        numpy_state = rank_state.get("numpy")
+        if not isinstance(numpy_state, Mapping):
+            fail(f"NumPy RNG state for rank {rank} is not a mapping")
+        missing_numpy = sorted({
+            "algorithm",
+            "keys",
+            "position",
+            "has_gauss",
+            "cached_gaussian",
+        } - set(numpy_state))
+        if missing_numpy:
+            fail(
+                f"NumPy RNG state for rank {rank} is missing fields: "
+                f"{missing_numpy}"
+            )
+        if not isinstance(numpy_state["keys"], torch.Tensor):
+            fail(f"NumPy RNG keys for rank {rank} are not a tensor")
+        if not isinstance(rank_state.get("torch"), torch.Tensor):
+            fail(f"torch RNG state for rank {rank} is not a tensor")
+        cuda_state = rank_state.get("cuda")
+        if cuda_state is None:
+            if amp_enabled:
+                fail(f"RNG state for rank {rank} is missing CUDA state")
+        elif (
+            not isinstance(cuda_state, (list, tuple))
+            or not cuda_state
+            or not all(isinstance(item, torch.Tensor) for item in cuda_state)
+        ):
+            fail(f"CUDA RNG state for rank {rank} is invalid")
+
+    sampler_state = checkpoint["sampler_state"]
+    if not isinstance(sampler_state, Mapping):
+        fail("sampler state is not a mapping")
+    for cursor in ("epoch", "next_batch"):
+        value = sampler_state.get(cursor)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            fail(f"sampler state {cursor} is not a non-negative integer")
+
+    try:
+        update = int(checkpoint["update"])
+        epoch = int(checkpoint["epoch"])
+        size_bytes = resolved.stat().st_size
+    except (TypeError, ValueError, OverflowError, OSError) as error:
+        fail(f"metadata is invalid: {error}")
     return {
-        "path": str(path.resolve()),
+        "path": str(resolved),
         "stage": stage,
-        "update": int(checkpoint["update"]),
-        "epoch": int(checkpoint["epoch"]),
+        "update": update,
+        "epoch": epoch,
         "rng_world_size": saved_world_size,
-        "size_bytes": path.stat().st_size,
+        "size_bytes": size_bytes,
     }
 
 

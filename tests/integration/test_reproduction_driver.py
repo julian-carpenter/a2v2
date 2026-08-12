@@ -128,27 +128,38 @@ def test_environment_preflight_rejects_low_output_space(
         preflight.check_output_space(tmp_path, min_free_bytes=64 * gib)
 
 
-def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) -> None:
-    """Check a burn-in artifact is a complete eight-rank training checkpoint."""
-    preflight = _load_preflight()
-    checkpoint = tmp_path / "checkpoint_last.pt"
+def _training_checkpoint_payload(*, fp16: bool = False) -> dict[str, object]:
+    """Return a complete resumable payload for checkpoint preflight tests."""
+
     rank_state = capture_rng_state()
-    payload = {
+    if fp16:
+        rank_state["cuda"] = [torch.zeros(8, dtype=torch.uint8)]
+    return {
         "format_version": 1,
         "stage": "pretrain",
-        "config": {"active": {"name": "preflight-test"}},
+        "config": {"active": {"common": {"fp16": fp16}}},
         "model": {},
         "teacher": {},
         "optimizer": {"state": {}, "param_groups": []},
         "scheduler": {"last_update": 1},
-        "scaler": None,
+        "scaler": {"scale": 1.0} if fp16 else None,
         "update": 1,
         "epoch": 1,
         "batch_in_epoch": 0,
-        "rng_state": {"world_size": 8, "by_rank": [rank_state] * 8},
+        "rng_state": {
+            "world_size": 8,
+            "by_rank": [dict(rank_state) for _ in range(8)],
+        },
         "sampler_state": {"epoch": 1, "next_batch": 0},
         "best_metric": None,
     }
+
+
+def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) -> None:
+    """Check a burn-in artifact is a complete eight-rank training checkpoint."""
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "checkpoint_last.pt"
+    payload = _training_checkpoint_payload()
     save_checkpoint(checkpoint, payload)
 
     report = preflight.check_training_checkpoint(
@@ -172,6 +183,121 @@ def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) 
     save_checkpoint(checkpoint, payload)
     with pytest.raises(RuntimeError, match="optimizer.*resume"):
         preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+
+@pytest.mark.parametrize("field,value", [("optimizer", []), ("scheduler", "state")])
+def test_checkpoint_preflight_rejects_non_mapping_optimization_state(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    """Reject optimizer and scheduler payloads native restore cannot load."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload()
+    payload[field] = value
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    assert str(checkpoint.resolve()) in str(raised.value)
+    assert f"{field} state is not a mapping" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "sampler_state,reason",
+    [
+        (None, "sampler state is not a mapping"),
+        ({"next_batch": 0}, "sampler state epoch is not a non-negative integer"),
+        ({"epoch": True, "next_batch": 0}, "sampler state epoch is not a non-negative integer"),
+        ({"epoch": 1, "next_batch": -1}, "sampler state next_batch is not a non-negative integer"),
+    ],
+)
+def test_checkpoint_preflight_rejects_missing_or_invalid_sampler_cursor(
+    tmp_path: Path,
+    sampler_state: object,
+    reason: str,
+) -> None:
+    """Reject absent or non-integer sampler positions that cannot resume exactly."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload()
+    payload["sampler_state"] = sampler_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    assert str(checkpoint.resolve()) in str(raised.value)
+    assert reason in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "malformation,reason",
+    [
+        ("rank", "RNG state for rank 3 is not a mapping"),
+        ("python", "RNG state for rank 3 is missing Python state"),
+        ("numpy", "NumPy RNG state for rank 3 is not a mapping"),
+        ("torch", "torch RNG state for rank 3 is not a tensor"),
+        ("cuda", "CUDA RNG state for rank 3 is invalid"),
+        ("amp_cuda", "RNG state for rank 3 is missing CUDA state"),
+    ],
+)
+def test_checkpoint_preflight_rejects_malformed_rank_rng_state(
+    tmp_path: Path,
+    malformation: str,
+    reason: str,
+) -> None:
+    """Reject per-rank random state that native restoration cannot consume."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload(fp16=malformation == "amp_cuda")
+    rng_state = payload["rng_state"]
+    assert isinstance(rng_state, dict)
+    ranked = rng_state["by_rank"]
+    assert isinstance(ranked, list)
+    if malformation == "rank":
+        ranked[3] = None
+    else:
+        rank_state = dict(ranked[3])
+        if malformation == "python":
+            del rank_state["python"]
+        elif malformation == "numpy":
+            rank_state["numpy"] = []
+        elif malformation == "torch":
+            rank_state["torch"] = "state"
+        elif malformation == "cuda":
+            rank_state["cuda"] = ["state"]
+        else:
+            del rank_state["cuda"]
+        ranked[3] = rank_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    assert str(checkpoint.resolve()) in str(raised.value)
+    assert reason in str(raised.value)
+
+
+def test_checkpoint_preflight_requires_scaler_state_for_amp_resume(tmp_path: Path) -> None:
+    """Reject an AMP checkpoint whose gradient scaler cannot be restored."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload(fp16=True)
+    payload["scaler"] = None
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    assert str(checkpoint.resolve()) in str(raised.value)
+    assert "AMP scaler state is not a mapping" in str(raised.value)
 
 
 def test_environment_preflight_cli_normalizes_unexpected_check_errors(
@@ -360,6 +486,35 @@ def test_dry_run_recovers_from_newest_periodic_finetune_checkpoint(tmp_path: Pat
     assert f"--resume {epoch}" in rendered
 
 
+def test_dry_run_ignores_newer_malformed_finetune_checkpoint_names(tmp_path: Path) -> None:
+    """Select only an exact numeric recovery filename when malformed files are newer."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+    finetune = output / "finetune"
+    finetune.mkdir(parents=True)
+    valid_update = finetune / "checkpoint_8000.pt"
+    valid_epoch = finetune / "checkpoint_epoch_20.pt"
+    malformed_update = finetune / "checkpoint_9junk.pt"
+    malformed_epoch = finetune / "checkpoint_epoch_latest.pt"
+    for checkpoint in (valid_update, valid_epoch, malformed_update, malformed_epoch):
+        checkpoint.touch()
+    os.utime(valid_epoch, (1, 1))
+    os.utime(valid_update, (2, 2))
+    os.utime(malformed_update, (3, 3))
+    os.utime(malformed_epoch, (4, 4))
+
+    completed = _run_driver(str(manifests), str(output), "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = completed.stdout.replace("\\", "")
+    assert f"--checkpoint {valid_update} --expected-stage finetune" in rendered
+    assert f"--resume {valid_update}" in rendered
+    assert str(malformed_update) not in rendered
+    assert str(malformed_epoch) not in rendered
+
+
 def test_dry_run_prefers_finetune_last_over_newer_periodic_checkpoint(tmp_path: Path) -> None:
     """Prefer the canonical fine-tuning resume checkpoint over a newer periodic file."""
 
@@ -473,6 +628,92 @@ else:
     assert second_log.startswith(first_log)
     assert second_log.count("phase=pretraining-burn-in") == 1
     assert second_log.count("phase=pretraining-resume") == 2
+
+
+def test_real_driver_stops_when_selected_finetune_checkpoint_fails_preflight(
+    tmp_path: Path,
+) -> None:
+    """Do not fall back or launch fine-tuning after selected-checkpoint failure."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _placeholder_manifests(manifests)
+    pretrain = output / "pretrain/checkpoint_last.pt"
+    selected = output / "finetune/checkpoint_last.pt"
+    fallback = output / "finetune/checkpoint_best.pt"
+    pretrain.parent.mkdir(parents=True)
+    selected.parent.mkdir(parents=True)
+    pretrain.touch()
+    selected.touch()
+    fallback.touch()
+    invocations = tmp_path / "invocations.jsonl"
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+record = Path(os.environ["A2V2_FAKE_INVOCATIONS"])
+with record.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(arguments) + "\\n")
+
+if arguments == ["--version"]:
+    print("Python 3.12.3")
+elif arguments[:3] == ["-m", "pip", "freeze"]:
+    print("a2v2==0.1.0")
+elif arguments and arguments[0].endswith("check_reproduction_environment.py"):
+    if (
+        "--checkpoint" in arguments
+        and arguments[arguments.index("--checkpoint") + 1]
+        == os.environ["A2V2_FAIL_CHECKPOINT"]
+    ):
+        print(json.dumps({"pass": False, "error": "selected checkpoint is malformed"}))
+        raise SystemExit(1)
+    print('{"pass": true}')
+elif arguments[:2] == ["-m", "torch.distributed.run"]:
+    print("fake distributed command")
+else:
+    raise SystemExit(f"unexpected fake Python arguments: {arguments}")
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    (fake_bin / "nvidia-smi").symlink_to("/bin/true")
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_PYTHON": str(fake_python),
+        "A2V2_TRAIN_ENTRY": "/bin/true",
+        "A2V2_FAKE_INVOCATIONS": str(invocations),
+        "A2V2_FAIL_CHECKPOINT": str(selected),
+    }
+
+    completed = _run_driver(str(manifests), str(output), environment=environment)
+
+    assert completed.returncode != 0
+    calls = [
+        json.loads(line)
+        for line in invocations.read_text(encoding="utf-8").splitlines()
+    ]
+    checkpoint_preflights = [
+        call[call.index("--checkpoint") + 1]
+        for call in calls
+        if call
+        and call[0].endswith("check_reproduction_environment.py")
+        and "--checkpoint" in call
+    ]
+    assert checkpoint_preflights == [str(pretrain), str(selected)]
+    assert str(fallback) not in checkpoint_preflights
+    assert not any(
+        call[:2] == ["-m", "torch.distributed.run"]
+        and any("finetune_mixup" in argument for argument in call)
+        for call in calls
+    )
 
 
 def test_dry_run_rejects_a_missing_selected_manifest(tmp_path: Path) -> None:

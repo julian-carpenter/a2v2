@@ -96,9 +96,12 @@ The deployment controls are:
 
 The default gives the eight training ranks 64 PyTorch intra-op threads in
 total. Together with the configured 20 data-loader workers per rank, the
-conservative upper bound is 224 threads on the 256-logical-CPU reproduction
-host. Override `A2V2_OMP_NUM_THREADS` only with a positive integer; values of
-16 or more can oversubscribe this host during distributed loading.
+steady-state training count is 224 threads on the 256-logical-CPU reproduction
+host. During scheduled rank-zero validation, the validation loader can add
+another 20 workers temporarily while the training loaders remain alive, for a
+simple modeled count of 244 threads before runtime and helper threads.
+Override `A2V2_OMP_NUM_THREADS` only with a positive integer; values of 16 or
+more can oversubscribe this host during distributed loading.
 
 Use `--fold N` for another single fold and `--fraction 025` or
 `--fraction 001` for one reduced-label recipe. Use `--dry-run` to check

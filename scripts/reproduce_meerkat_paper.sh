@@ -225,6 +225,11 @@ else
         "${FINETUNE_DIR}"/checkpoint_epoch_*.pt
     do
         [[ -f "${candidate}" ]] || continue
+        candidate_name="$(basename -- "${candidate}")"
+        [[ "${candidate_name}" == "checkpoint_best.pt"
+            || "${candidate_name}" =~ ^checkpoint_[0-9]+\.pt$
+            || "${candidate_name}" =~ ^checkpoint_epoch_[0-9]+\.pt$ ]] \
+            || continue
         if [[ -z "${FINETUNE_RESUME_CHECKPOINT}" \
             || "${candidate}" -nt "${FINETUNE_RESUME_CHECKPOINT}" ]]
         then
