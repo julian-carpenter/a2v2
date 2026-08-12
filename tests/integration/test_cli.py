@@ -66,6 +66,7 @@ def test_validation_decision_uses_cpu_control_group(
     selected_group = object()
 
     def fake_broadcast(tensor: torch.Tensor, *, src: int, group: object) -> None:
+        """Populate the received decision while checking the control-plane contract."""
         assert tensor.device.type == "cpu"
         assert tensor.dtype == torch.float64
         assert src == 0
