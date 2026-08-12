@@ -1402,11 +1402,27 @@ def _checkpoint_process_group(
     device: torch.device,
     world_size: int,
 ) -> dist.ProcessGroup | None:
-    """Create a CPU control plane for object checkpoint collectives when needed."""
+    """Create a timed CPU control plane for checkpoint and validation data."""
 
     if world_size > 1 and device.type == "cuda":
-        return dist.new_group(backend="gloo")
+        return dist.new_group(backend="gloo", timeout=timedelta(hours=2))
     return None
+
+
+def _synchronize_validation_decision(
+    current: float,
+    improved: bool,
+    *,
+    world_size: int,
+    group: dist.ProcessGroup | None,
+) -> tuple[float, bool]:
+    """Broadcast rank zero's validation decision over the CPU control plane."""
+
+    if world_size <= 1:
+        return current, improved
+    decision = torch.tensor([current, float(improved)], dtype=torch.float64)
+    dist.broadcast(decision, src=0, group=group)
+    return float(decision[0]), bool(decision[1])
 
 
 def _ddp_find_unused_parameters(config: Animal2VecConfig) -> bool:
@@ -1946,15 +1962,12 @@ def _run_training(
             improved = engine.best_metric is None or (
                 current > engine.best_metric if maximize else current < engine.best_metric
             )
-        if world_size > 1:
-            decision = torch.tensor(
-                [current, float(improved)],
-                dtype=torch.float64,
-                device=device,
-            )
-            dist.broadcast(decision, src=0)
-            current = float(decision[0])
-            improved = bool(decision[1])
+        current, improved = _synchronize_validation_decision(
+            current,
+            improved,
+            world_size=world_size,
+            group=checkpoint_group,
+        )
         if improved:
             engine.best_metric = current
             write_checkpoint(output_directory / "checkpoint_best.pt")

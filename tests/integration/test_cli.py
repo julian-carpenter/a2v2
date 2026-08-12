@@ -3,6 +3,7 @@ The suite checks checkpoint continuity, DataLoader prefetch accounting, schedule
 horizons, overrides, and distributed launch validation."""
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,15 +22,16 @@ from a2v2.training import load_checkpoint
 ROOT = Path(__file__).parents[2]
 
 
-def test_checkpoint_process_group_uses_gloo_for_distributed_cuda(
+def test_checkpoint_process_group_uses_timed_gloo_for_distributed_cuda(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Check CUDA training separates checkpoint objects from NCCL collectives."""
     selected_group = object()
 
-    def fake_new_group(*, backend: str) -> object:
+    def fake_new_group(*, backend: str, timeout: timedelta) -> object:
         """Return a sentinel for the requested Gloo group."""
         assert backend == "gloo"
+        assert timeout == timedelta(hours=2)
         return selected_group
 
     monkeypatch.setattr(workflows.dist, "new_group", fake_new_group)
@@ -48,13 +50,36 @@ def test_checkpoint_process_group_skips_cpu_or_single_rank(
 ) -> None:
     """Check launches that do not need a second backend create no group."""
 
-    def unexpected_new_group(*, backend: str) -> object:
+    def unexpected_new_group(*, backend: str, timeout: timedelta) -> object:
         """Fail if a test case attempts to create an unnecessary group."""
         raise AssertionError(f"unexpected {backend} process group")
 
     monkeypatch.setattr(workflows.dist, "new_group", unexpected_new_group)
 
     assert workflows._checkpoint_process_group(device, world_size) is None
+
+
+def test_validation_decision_uses_cpu_control_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check validation decisions leave rank zero through the CPU control plane."""
+    selected_group = object()
+
+    def fake_broadcast(tensor: torch.Tensor, *, src: int, group: object) -> None:
+        assert tensor.device.type == "cpu"
+        assert tensor.dtype == torch.float64
+        assert src == 0
+        assert group is selected_group
+        tensor.copy_(torch.tensor([0.75, 1.0], dtype=torch.float64))
+
+    monkeypatch.setattr(workflows.dist, "broadcast", fake_broadcast)
+
+    assert workflows._synchronize_validation_decision(
+        0.0,
+        False,
+        world_size=8,
+        group=selected_group,  # type: ignore[arg-type]
+    ) == (0.75, True)
 
 
 def test_run_training_destroys_process_group_created_during_failure(
