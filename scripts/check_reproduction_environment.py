@@ -91,10 +91,16 @@ def check_output_space(path: Path, min_free_bytes: int) -> dict[str, object]:
 def check_training_checkpoint(
     path: Path,
     expected_world_size: int,
+    expected_stage: str | None = None,
 ) -> dict[str, object]:
     """Validate that a native checkpoint can resume eight-rank optimization."""
 
     checkpoint = load_checkpoint(path, map_location="cpu")
+    stage = str(checkpoint["stage"])
+    if expected_stage is not None and stage != expected_stage:
+        raise RuntimeError(
+            f"checkpoint stage is {stage}; expected {expected_stage}: {path.resolve()}"
+        )
     if checkpoint["optimizer"] is None:
         raise RuntimeError("checkpoint optimizer state is missing; cannot resume training")
     if checkpoint["scheduler"] is None:
@@ -114,7 +120,7 @@ def check_training_checkpoint(
         )
     return {
         "path": str(path.resolve()),
-        "stage": checkpoint["stage"],
+        "stage": stage,
         "update": int(checkpoint["update"]),
         "epoch": int(checkpoint["epoch"]),
         "rng_world_size": saved_world_size,
@@ -151,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-free-gib", type=float, default=38.0)
     parser.add_argument("--min-disk-gib", type=float, default=64.0)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--expected-stage", choices=("pretrain", "finetune"))
     return parser
 
 
@@ -176,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["checkpoint"] = check_training_checkpoint(
                 arguments.checkpoint,
                 arguments.expected_gpus,
+                arguments.expected_stage,
             )
     except Exception as error:
         print(json.dumps({"pass": False, "error": str(error)}, sort_keys=True))

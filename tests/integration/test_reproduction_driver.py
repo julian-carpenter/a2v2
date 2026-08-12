@@ -151,11 +151,22 @@ def test_checkpoint_preflight_requires_distributed_resume_state(tmp_path: Path) 
     }
     save_checkpoint(checkpoint, payload)
 
-    report = preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+    report = preflight.check_training_checkpoint(
+        checkpoint,
+        expected_world_size=8,
+        expected_stage="pretrain",
+    )
 
     assert report["path"] == str(checkpoint.resolve())
     assert report["update"] == 1
     assert report["rng_world_size"] == 8
+
+    with pytest.raises(RuntimeError, match=r"checkpoint stage is pretrain; expected finetune"):
+        preflight.check_training_checkpoint(
+            checkpoint,
+            expected_world_size=8,
+            expected_stage="finetune",
+        )
 
     payload["optimizer"] = None
     save_checkpoint(checkpoint, payload)
