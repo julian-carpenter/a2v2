@@ -59,8 +59,80 @@ Regression tests will prove these behaviors before implementation:
 - The reproduction driver resumes from a periodic epoch checkpoint when `checkpoint_last.pt` is absent and validates that checkpoint before launch.
 - `checkpoint_last.pt` remains the preferred resume source when present.
 
-After focused tests pass, verification will run the full CPU test suite and the existing eight-GPU NCCL preflight. A bounded production run will resume the preserved update-8,295 checkpoint, stop at update 10,000, complete the 13,283-recording validation, synchronize all ranks through Gloo, and write a valid best checkpoint. The bounded run should finish within two hours. It will not continue the full 30,000-update recipe.
+After focused tests pass, verification will run the full CPU test suite and the
+existing eight-GPU NCCL preflight. The first bounded production run will resume
+the update-8,295 checkpoint and stop at update 10,000. The CPU Threading
+Amendment below records that run's result and supersedes its acceptance
+procedure. Verification will not continue the full 30,000-update recipe.
 
 ## Out of Scope
 
 This change will not shard validation across ranks, alter metric aggregation, raise the default NCCL timeout, or optimize the 54-minute validation implementation. Those changes carry numerical or operational tradeoffs that the timeout repair does not require.
+
+## CPU Threading Amendment
+
+### Verification Finding
+
+The first bounded production verification proved the control-plane repair but
+hit its 7,200-second wall cap before rank 0 completed validation. The run
+resumed correctly, reached the same update-9,747 metrics as the interrupted
+job, and kept all ranks alive for about 88 minutes of rank-asymmetric
+validation without an NCCL, Gloo, CUDA, or rank failure.
+
+Torchrun printed that it had set `OMP_NUM_THREADS=1`. On this host, that
+environment value makes `torch.get_num_threads()` return 1. Rank 0 then stayed
+at 100 percent of one CPU during the validation tail. The same Python runtime
+without the environment override reports 128 PyTorch intra-op threads and had
+completed the standalone validation in 53 minutes and 47 seconds. The host has
+128 physical cores, 256 logical CPUs, and eight NUMA nodes.
+
+The capped run advanced the periodic recovery checkpoint atomically from
+update 8,295 to a complete update-8,710 state. That checkpoint retains the
+optimizer, scheduler, AMP scaler, sampler, and eight-rank RNG state and becomes
+the next bounded verification's resume point.
+
+### Considered Approaches
+
+The approved approach sets an explicit thread budget in the reproduction
+driver. `A2V2_OMP_NUM_THREADS` defaults to 8, and both distributed training
+commands receive `OMP_NUM_THREADS=8`. Eight ranks can therefore use at most 64
+intra-op threads. The recipes configure 20 DataLoader workers per rank, so the
+combined upper bound of 224 threads fits within the host's 256 logical CPUs.
+
+Leaving the variable unset would preserve torchrun's one-thread fallback and
+repeat the measured bottleneck. Setting 16 or more threads per rank would put
+128 or more intra-op threads beside 160 DataLoader workers and oversubscribe
+this host. Changing `torch.set_num_threads` only around `_validate` would hide a
+deployment constraint inside the training workflow and add asymmetric runtime
+state that the paper driver can express directly.
+
+### Driver Contract
+
+The driver will:
+
+- resolve `TRAIN_OMP_NUM_THREADS` from `A2V2_OMP_NUM_THREADS`, defaulting to 8;
+- require a positive integer before preflight or torchrun;
+- pass `OMP_NUM_THREADS=<resolved value>` to pretraining and fine-tuning;
+- print the resolved value in the launch summary;
+- record `omp_num_threads=<resolved value>` in `environment/run-profile.txt`;
+- list the override in `docs/reproducing-paper.md`.
+
+This setting changes host CPU parallelism only. It does not change model
+parameters, batches, optimizer state, validation metrics, checkpoint format,
+or distributed topology. Operators can lower the setting for a constrained
+host without editing the script.
+
+### Amendment Tests and Acceptance
+
+Driver tests will verify the default value, a valid environment override, and
+rejection of zero or non-numeric values. The dry-run command graph must show
+the resolved value in both training launches. The fake real-mode test must
+record the value in the run profile.
+
+After the complete automated suite and eight-rank transport probe pass, the
+bounded production verification will resume the complete update-8,710 epoch
+checkpoint and stop at update 10,000. The same 7,200-second cap remains in
+force. Acceptance requires rank-zero validation to finish, every rank to
+synchronize without a collective error, and `checkpoint_best.pt` and
+`checkpoint_last.pt` to load as complete eight-rank fine-tuning checkpoints at
+update 10,000.
