@@ -194,6 +194,7 @@ readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-3}"
 # recording-length distributions affect allocator peaks.
 readonly FINETUNE_MAX_TOKENS="${A2V2_FINETUNE_MAX_TOKENS:-960000}"
 readonly FINETUNE_UPDATE_FREQ="${A2V2_FINETUNE_UPDATE_FREQ:-2}"
+readonly FINETUNE_CHECKPOINT_ACTIVATIONS=true
 readonly EVAL_MAX_TOKENS="${A2V2_EVAL_MAX_TOKENS:-320000}"
 readonly EVAL_WORKERS="${A2V2_EVAL_WORKERS:-20}"
 readonly TRAIN_OMP_NUM_THREADS="${A2V2_OMP_NUM_THREADS:-8}"
@@ -243,7 +244,7 @@ printf '%s\n' \
     "  fold=${FOLD}, label_fraction=${FRACTION}" \
     "  CUDA_VISIBLE_DEVICES=${SELECTED_GPUS}, distributed_training.distributed_world_size=8" \
     "  pretrain: dataset.max_tokens=${PRETRAIN_MAX_TOKENS}, optimization.update_freq=[${PRETRAIN_UPDATE_FREQ}]" \
-    "  finetune: dataset.max_tokens=${FINETUNE_MAX_TOKENS}, optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]" \
+    "  finetune: dataset.max_tokens=${FINETUNE_MAX_TOKENS}, optimization.update_freq=[${FINETUNE_UPDATE_FREQ}], model.checkpoint_activations=${FINETUNE_CHECKPOINT_ACTIVATIONS}" \
     "  CPU: OMP_NUM_THREADS=${TRAIN_OMP_NUM_THREADS}" \
     "  scope: one fold on an eight-rank topology; not an exact paper reproduction"
 
@@ -303,6 +304,7 @@ if [[ "${DRY_RUN}" == false ]]; then
         printf 'pretrain_update_freq=%s\n' "${PRETRAIN_UPDATE_FREQ}"
         printf 'finetune_max_tokens=%s\n' "${FINETUNE_MAX_TOKENS}"
         printf 'finetune_update_freq=%s\n' "${FINETUNE_UPDATE_FREQ}"
+        printf 'finetune_checkpoint_activations=%s\n' "${FINETUNE_CHECKPOINT_ACTIVATIONS}"
         printf 'omp_num_threads=%s\n' "${TRAIN_OMP_NUM_THREADS}"
     } > "${OUTPUT_DIR}/environment/run-profile.txt"
     run_logged \
@@ -398,6 +400,7 @@ FINETUNE_COMMAND=(
     --override "distributed_training.distributed_world_size=8"
     --override "dataset.max_tokens=${FINETUNE_MAX_TOKENS}"
     --override "optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]"
+    --override "model.checkpoint_activations=${FINETUNE_CHECKPOINT_ACTIVATIONS}"
     --device cuda
 )
 if [[ -n "${FINETUNE_RESUME_CHECKPOINT}" ]]; then

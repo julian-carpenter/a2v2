@@ -518,6 +518,41 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert str(output / "final-evaluation/tensorboard") in semantic_stdout
 
 
+def test_dry_run_enables_activation_checkpointing_only_for_finetuning(
+    tmp_path: Path,
+) -> None:
+    """Enable recomputation only for the memory-bound fine-tuning stage."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+
+    completed = _run_driver(str(manifests), str(output), "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    launches = [
+        line.replace("\\", "")
+        for line in completed.stdout.splitlines()
+        if line.startswith("Launching:") and "a2v2-train" in line
+    ]
+    pretraining = [
+        line for line in launches if "a2v_large_pretrain_best.yaml" in line
+    ]
+    finetuning = [
+        line for line in launches if "finetune_mixup_100.yaml" in line
+    ]
+
+    assert len(pretraining) == 2
+    assert len(finetuning) == 1
+    assert all("model.checkpoint_activations=true" not in line for line in pretraining)
+    assert "--override model.checkpoint_activations=true" in finetuning[0]
+    assert (
+        "  finetune: dataset.max_tokens=960000, "
+        "optimization.update_freq=[2], model.checkpoint_activations=true"
+        in completed.stdout
+    )
+
+
 def test_dry_run_applies_the_requested_training_thread_budget(tmp_path: Path) -> None:
     """Apply one explicit CPU-thread budget to every distributed training rank."""
 
@@ -722,6 +757,7 @@ else:
         encoding="utf-8"
     )
     assert "omp_num_threads=8\n" in run_profile
+    assert "finetune_checkpoint_activations=true\n" in run_profile
     training_log = output / "pretrain/train.log"
     first_log = training_log.read_text(encoding="utf-8")
     assert first_log.count("phase=pretraining-burn-in") == 1
