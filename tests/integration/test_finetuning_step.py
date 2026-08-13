@@ -18,7 +18,10 @@ def test_finetuning_freezes_then_unfreezes_backbone() -> None:
     """Check finetuning freezes then unfreezes backbone."""
     torch.manual_seed(18)
     pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
-    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    finetune = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=("model.checkpoint_activations=true",),
+    )
     model = Animal2VecFineTuningModel.from_config(finetune, pretrained_config=pretrain).train()
     waveform = torch.randn(2, 64)
     target = torch.randint(0, 2, (2, 16, 2)).float()

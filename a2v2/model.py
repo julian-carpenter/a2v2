@@ -30,6 +30,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .config import (
     Animal2VecConfig,
@@ -1454,7 +1455,22 @@ class TransformerStack(nn.Module):
                 # Interpretation: deeper layers may operate at a different
                 # temporal range while sharing the same base distance matrix.
                 layer_bias = layer_bias * scale.to(layer_bias)
-            value, target = block(value, padding_mask, layer_bias)
+            should_checkpoint = (
+                self.checkpoint_activations
+                and self.training
+                and torch.is_grad_enabled()
+            )
+            if should_checkpoint:
+                value, target = activation_checkpoint(
+                    block,
+                    value,
+                    padding_mask,
+                    layer_bias,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                value, target = block(value, padding_mask, layer_bias)
             layer_outputs.append(target)
         if self.norm is not None and self.norm_after:
             value = self.norm(value)

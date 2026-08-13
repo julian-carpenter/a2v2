@@ -287,7 +287,10 @@ def test_finetuning_amp_freezes_then_unfreezes_transformer(
 ) -> None:
     """Check finetuning AMP freezes then unfreezes transformer."""
     pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
-    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    finetune = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=("model.checkpoint_activations=true",),
+    )
     finetune = replace(
         finetune,
         common=replace(

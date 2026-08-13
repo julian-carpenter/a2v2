@@ -1,8 +1,14 @@
 """Test the archived pre-norm and post-norm Transformer residual order. The suite also
 checks that the stack returns one teacher-target tensor for each block that executes."""
 
+from contextlib import nullcontext
+from copy import deepcopy
+
+import numpy as np
+import pytest
 import torch
 
+import a2v2.model as model_module
 from a2v2.model import TransformerBlock, TransformerStack
 from a2v2.model import alibi_bias
 
@@ -53,3 +59,165 @@ def test_stack_returns_one_target_per_executed_layer() -> None:
     assert len(layers) == 3
     assert all(layer.shape == output.shape for layer in layers)
 
+
+@pytest.mark.parametrize(
+    ("enabled", "training", "with_grad", "expected_calls"),
+    [
+        (True, True, True, 2),
+        (False, True, True, 0),
+        (True, False, True, 0),
+        (True, True, False, 0),
+    ],
+)
+def test_stack_checkpoints_only_training_grad_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    training: bool,
+    with_grad: bool,
+    expected_calls: int,
+) -> None:
+    """Gate recomputation on the option, training mode, and autograd."""
+
+    calls: list[dict[str, object]] = []
+
+    def checkpoint_spy(function: object, *args: object, **kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        return function(*args)  # type: ignore[operator]
+
+    monkeypatch.setattr(model_module, "activation_checkpoint", checkpoint_spy)
+    stack = TransformerStack(
+        8,
+        2,
+        depth=2,
+        checkpoint_activations=enabled,
+    )
+    stack.train(training)
+    value = torch.randn(2, 5, 8, requires_grad=with_grad)
+    context = nullcontext() if with_grad else torch.no_grad()
+
+    with context:
+        stack(value)
+
+    assert len(calls) == expected_calls
+    assert all(
+        call == {"use_reentrant": False, "preserve_rng_state": True}
+        for call in calls
+    )
+
+
+def test_checkpointed_stack_matches_stochastic_forward_backward_and_rng() -> None:
+    """Match ordinary block values, gradients, and post-backward RNG state."""
+
+    torch.manual_seed(41)
+    ordinary = TransformerStack(
+        8,
+        2,
+        depth=2,
+        dropout=0.2,
+        attention_dropout=0.2,
+        activation_dropout=0.2,
+        post_mlp_dropout=0.2,
+        drop_path_rates=(0.1, 0.2),
+        input_dropout=0.2,
+        layerdrop=0.0,
+    ).train()
+    checkpointed = deepcopy(ordinary)
+    checkpointed.checkpoint_activations = True
+    base_value = torch.randn(2, 5, 8)
+    ordinary_value = base_value.clone().requires_grad_(True)
+    checkpointed_value = base_value.clone().requires_grad_(True)
+    padding = torch.tensor([
+        [False, False, False, False, False],
+        [False, False, False, False, True],
+    ])
+    bias = alibi_bias(2, 5).unsqueeze(0).expand(2, -1, -1, -1)
+    ordinary_scale = torch.ones(2, 1, 2, 1, 1, requires_grad=True)
+    checkpointed_scale = ordinary_scale.detach().clone().requires_grad_(True)
+
+    def run(
+        stack: TransformerStack,
+        value: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        torch.manual_seed(314)
+        output, targets = stack(value * 1.0, padding, bias, scale)
+        loss = output.square().sum() + sum(
+            target.square().sum() for target in targets
+        )
+        loss.backward()
+        return (
+            output.detach().clone(),
+            [target.detach().clone() for target in targets],
+            torch.get_rng_state().clone(),
+        )
+
+    ordinary_output, ordinary_targets, ordinary_rng = run(
+        ordinary,
+        ordinary_value,
+        ordinary_scale,
+    )
+    checkpointed_output, checkpointed_targets, checkpointed_rng = run(
+        checkpointed,
+        checkpointed_value,
+        checkpointed_scale,
+    )
+
+    torch.testing.assert_close(checkpointed_output, ordinary_output, rtol=0, atol=0)
+    assert len(checkpointed_targets) == len(ordinary_targets)
+    for actual, expected in zip(checkpointed_targets, ordinary_targets, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        checkpointed_value.grad,
+        ordinary_value.grad,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        checkpointed_scale.grad,
+        ordinary_scale.grad,
+        rtol=0,
+        atol=0,
+    )
+    for (actual_name, actual), (expected_name, expected) in zip(
+        checkpointed.named_parameters(),
+        ordinary.named_parameters(),
+        strict=True,
+    ):
+        assert actual_name == expected_name
+        assert actual.grad is not None
+        assert expected.grad is not None
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+    assert torch.equal(checkpointed_rng, ordinary_rng)
+
+
+def test_checkpoint_backward_does_not_repeat_numpy_layerdrop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Draw each NumPy layerdrop decision once outside recomputation."""
+
+    draws = iter((0.1, 0.9, 0.2))
+    observed: list[float] = []
+
+    def random_draw() -> float:
+        value = next(draws)
+        observed.append(value)
+        return value
+
+    monkeypatch.setattr(np.random, "random", random_draw)
+    stack = TransformerStack(
+        8,
+        2,
+        depth=3,
+        layerdrop=0.5,
+        checkpoint_activations=True,
+    ).train()
+    value = torch.randn(2, 5, 8, requires_grad=True)
+
+    output, targets = stack(value)
+    loss = output.square().sum() + sum(
+        target.square().sum() for target in targets
+    )
+    loss.backward()
+
+    assert observed == [0.1, 0.9, 0.2]
+    assert len(targets) == 1
