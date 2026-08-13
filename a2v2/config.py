@@ -240,6 +240,7 @@ class ModelConfig:
     final_dropout: float = 0.0
     drop_path: float = 0.0
     load_pretrain_weights: bool = True
+    checkpoint_activations: bool = False
     audio: AudioModelConfig = field(default_factory=AudioModelConfig)
 
 
@@ -595,7 +596,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         "modalities", "w2v_path", "freeze_finetune_updates", "feature_grad_mult", "apply_mask",
         "mask_prob", "mask_length", "mask_channel_prob", "mask_channel_length", "dropout",
         "dropout_input", "activation_dropout", "attention_dropout", "final_dropout", "drop_path",
-        "load_pretrain_weights",
+        "load_pretrain_weights", "checkpoint_activations",
     })
     modalities = model_raw.get("modalities", {})
     if modalities is None:

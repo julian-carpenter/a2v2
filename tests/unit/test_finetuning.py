@@ -6,11 +6,44 @@ from pathlib import Path
 import torch
 
 from a2v2.config import load_config
-from a2v2.model import Animal2VecFineTuningModel, mix_targets
+from a2v2.model import Animal2VecFineTuningModel, AudioEncoder, mix_targets
 from a2v2.model import SigmoidFocalLoss
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_audio_encoder_propagates_activation_checkpointing_to_both_stacks() -> None:
+    """Apply one config value to the prenet and main Transformer stacks."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.checkpoint_activations=true",),
+    )
+
+    encoder = AudioEncoder.from_config(config)
+
+    assert encoder.prenet.checkpoint_activations is True
+    assert encoder.transformer.checkpoint_activations is True
+
+
+def test_active_finetuning_config_controls_encoder_checkpointing() -> None:
+    """Do not let an older pretrained config disable the active policy."""
+
+    pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    finetune = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=("model.checkpoint_activations=true",),
+    )
+
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+    )
+
+    assert pretrain.model.checkpoint_activations is False
+    assert model.encoder.prenet.checkpoint_activations is True
+    assert model.encoder.transformer.checkpoint_activations is True
 
 
 def test_sigmoid_focal_loss_matches_hand_calculation() -> None:

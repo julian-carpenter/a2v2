@@ -1393,8 +1393,10 @@ class TransformerStack(nn.Module):
         input_dropout: float = 0.0,
         norm_before: bool = False,
         norm_after: bool | None = None,
+        checkpoint_activations: bool = False,
     ) -> None:
         super().__init__()
+        self.checkpoint_activations = checkpoint_activations
         rates = list(drop_path_rates or [0.0] * depth)
         if len(rates) != depth:
             raise ValueError("drop_path_rates must match transformer depth")
@@ -1674,6 +1676,7 @@ class AudioEncoder(nn.Module):
         use_alibi: bool = True,
         learned_alibi_scale: bool = True,
         learned_alibi_scale_per_head: bool = True,
+        checkpoint_activations: bool = False,
     ) -> None:
         super().__init__()
         self.layers = tuple(layers)
@@ -1712,6 +1715,7 @@ class AudioEncoder(nn.Module):
             input_dropout=prenet_dropout,
             norm_before=not layer_norm_first,
             norm_after=False,
+            checkpoint_activations=checkpoint_activations,
             **common,
         )
         # Mathematics: drop-path probability p_l interpolates linearly from
@@ -1725,6 +1729,7 @@ class AudioEncoder(nn.Module):
             layerdrop=layerdrop,
             drop_path_rates=rates,
             input_dropout=dropout_input,
+            checkpoint_activations=checkpoint_activations,
             **common,
         )
         scale_heads = num_heads if learned_alibi_scale_per_head else 1
@@ -1775,6 +1780,7 @@ class AudioEncoder(nn.Module):
             use_alibi=audio.use_alibi_encoder,
             learned_alibi_scale=audio.learned_alibi_scale,
             learned_alibi_scale_per_head=audio.learned_alibi_scale_per_head,
+            checkpoint_activations=model.checkpoint_activations,
         )
 
     @staticmethod
@@ -2152,6 +2158,7 @@ class Animal2VecFineTuningModel(nn.Module):
             layerdrop=fine_model.layerdrop,
             start_drop_path_rate=fine_model.drop_path,
             end_drop_path_rate=fine_model.drop_path,
+            checkpoint_activations=fine_model.checkpoint_activations,
             audio=replace(
                 pretrained_config.model.audio,
                 prenet_layerdrop=fine_model.layerdrop,

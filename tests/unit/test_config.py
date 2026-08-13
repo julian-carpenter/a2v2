@@ -2,16 +2,54 @@
 covers restricted convolution expressions, defaults, overrides, AMP values, DDP
 settings, and unknown fields."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import torch
 
-from a2v2.config import ConfigError, load_config, parse_conv_feature_layers
+from a2v2.config import (
+    ConfigError,
+    config_from_serialized_dict,
+    config_to_dict,
+    load_config,
+    parse_conv_feature_layers,
+)
 from a2v2.workflows import _ddp_bucket_cap_mb_list, _ddp_find_unused_parameters
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_checkpoint_activations_defaults_overrides_and_round_trips() -> None:
+    """Keep activation checkpointing opt-in and checkpoint-compatible."""
+
+    path = ROOT / "tests/fixtures/tiny_finetune.yaml"
+    default = load_config(path)
+    explicit_false = load_config(
+        path,
+        overrides=("model.checkpoint_activations=false",),
+    )
+    enabled = load_config(
+        path,
+        overrides=("model.checkpoint_activations=true",),
+    )
+
+    assert default.model.checkpoint_activations is False
+    assert explicit_false.model.checkpoint_activations is False
+    assert enabled.model.checkpoint_activations is True
+
+    serialized = config_to_dict(enabled)
+    serialized_model = serialized["model"]
+    assert isinstance(serialized_model, dict)
+    assert serialized_model["checkpoint_activations"] is True
+    assert config_from_serialized_dict(serialized).model.checkpoint_activations is True
+
+    legacy = deepcopy(serialized)
+    legacy_model = legacy["model"]
+    assert isinstance(legacy_model, dict)
+    legacy_model.pop("checkpoint_activations")
+    assert config_from_serialized_dict(legacy).model.checkpoint_activations is False
 
 
 def test_parses_legacy_conv_expression_without_eval() -> None:
