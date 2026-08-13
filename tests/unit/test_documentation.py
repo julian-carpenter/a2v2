@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -176,6 +177,9 @@ def test_finetuning_activation_memory_contract_is_documented() -> None:
         "changing `max_tokens` is not an exact resume",
         "batch and activation-memory profile\nprovenance",
         "`--override model.checkpoint_activations=true`",
+        "Activation checkpointing is a fixed fine-tuning override in this 40 GB driver",
+        "The activation-checkpointing flag changes execution policy and adds no\ncheckpoint tensors",
+        "Do not use `A2V2_FINETUNE_MAX_TOKENS=800000` as an OOM recovery setting",
     ):
         assert required in reproduction
 
@@ -185,8 +189,20 @@ def test_finetuning_activation_memory_contract_is_documented() -> None:
         "RNG preservation",
         "An older pretrained snapshot\ntherefore cannot disable the current execution policy",
         "Fine-tuning activation memory",
+        "model state dictionaries remain unchanged",
     ):
         assert required in code_guide
 
-    assert "A2V2_FINETUNE_MAX_TOKENS=800000 \\\n" not in reproduction
+    shell_fences = re.findall(r"```(?:bash|sh|shell)\n(.*?)```", reproduction, re.DOTALL)
+    assert shell_fences
+    executable_lines = (
+        line
+        for fence in shell_fences
+        for line in fence.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert not any(
+        re.search(r"\bA2V2_FINETUNE_MAX_TOKENS\s*=\s*800000\b", line)
+        for line in executable_lines
+    )
     assert "substantially more measured headroom" not in reproduction

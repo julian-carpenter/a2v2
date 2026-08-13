@@ -81,6 +81,8 @@ def test_stack_checkpoints_only_training_grad_blocks(
     calls: list[dict[str, object]] = []
 
     def checkpoint_spy(function: object, *args: object, **kwargs: object) -> object:
+        """Record checkpoint options while executing the intercepted block."""
+
         calls.append(dict(kwargs))
         return function(*args)  # type: ignore[operator]
 
@@ -139,6 +141,8 @@ def test_checkpointed_stack_matches_stochastic_forward_backward_and_rng() -> Non
         value: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        """Run one stack from a fixed RNG state and capture its results."""
+
         torch.manual_seed(314)
         output, targets = stack(value * 1.0, padding, bias, scale)
         loss = output.square().sum() + sum(
@@ -199,6 +203,8 @@ def test_checkpoint_backward_does_not_repeat_numpy_layerdrop(
     observed: list[float] = []
 
     def random_draw() -> float:
+        """Return and record the next deterministic NumPy layerdrop draw."""
+
         value = next(draws)
         observed.append(value)
         return value
