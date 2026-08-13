@@ -14,6 +14,7 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -164,6 +165,43 @@ def test_checked_in_recipes_exclude_ignored_legacy_options() -> None:
     )
 
 
+def _shell_fences(markdown: str) -> list[str]:
+    """Return the contents of Bash, sh, and shell Markdown fences."""
+
+    return re.findall(
+        r"```(?:bash|sh|shell)\n(.*?)```",
+        markdown,
+        re.DOTALL,
+    )
+
+
+def _has_finetune_800000_shell_assignment(markdown: str) -> bool:
+    """Conservatively flag any shell-fence use of the obsolete budget variable."""
+
+    return any(
+        "A2V2_FINETUNE_MAX_TOKENS" in fence
+        for fence in _shell_fences(markdown)
+    )
+
+
+@pytest.mark.parametrize(
+    ("assignment",),
+    (
+        ("A2V2_FINETUNE_MAX_TOKENS=800000 bash reproduce.sh",),
+        ("  export A2V2_FINETUNE_MAX_TOKENS=800000",),
+        ("A2V2_FINETUNE_MAX_TOKENS='800000' bash reproduce.sh",),
+        ('A2V2_FINETUNE_MAX_TOKENS="800000" bash reproduce.sh',),
+        ("A2V2_FINETUNE_MAX_TOKENS=\\\n800000 bash reproduce.sh",),
+    ),
+)
+def test_shell_fence_guard_rejects_800000_assignments(assignment: str) -> None:
+    """Reject obsolete budgets across executable shell assignment layouts."""
+
+    markdown = f"```bash\n{assignment}\n```"
+
+    assert _has_finetune_800000_shell_assignment(markdown)
+
+
 def test_finetuning_activation_memory_contract_is_documented() -> None:
     """Keep 40 GB fine-tuning guidance tied to the saved sampler topology."""
 
@@ -193,16 +231,6 @@ def test_finetuning_activation_memory_contract_is_documented() -> None:
     ):
         assert required in code_guide
 
-    shell_fences = re.findall(r"```(?:bash|sh|shell)\n(.*?)```", reproduction, re.DOTALL)
-    assert shell_fences
-    executable_lines = (
-        line
-        for fence in shell_fences
-        for line in fence.splitlines()
-        if not line.lstrip().startswith("#")
-    )
-    assert not any(
-        re.search(r"\bA2V2_FINETUNE_MAX_TOKENS\s*=\s*800000\b", line)
-        for line in executable_lines
-    )
+    assert _shell_fences(reproduction)
+    assert not _has_finetune_800000_shell_assignment(reproduction)
     assert "substantially more measured headroom" not in reproduction
