@@ -113,6 +113,11 @@ and infers pretraining versus fine-tuning.
 `config_to_dict` converts paths and tuples into portable containers for
 checkpoints. `config_from_serialized_dict` performs the inverse operation.
 
+`ModelConfig.checkpoint_activations` defaults to false. The field changes
+autograd execution and creates no parameter or buffer, so serialized configs
+record it while model state dictionaries remain unchanged. Older serialized
+configs that omit it restore the false default.
+
 ## `a2v2/data.py`
 
 This file covers the path from an audio filename to a device-ready batch.
@@ -262,6 +267,13 @@ It copies buffers and never enables dropout.
 `TransformerStack` runs the optional prenet and main blocks while retaining
 intermediate target tensors.
 
+When `checkpoint_activations`, training mode, and gradient tracking are all
+active, `TransformerStack` runs each selected block through non-reentrant
+PyTorch activation checkpointing with RNG preservation. The stack draws NumPy
+layerdrop decisions before entering the checkpointed block, so backward
+recomputation cannot select a different layer path. Evaluation and frozen
+fine-tuning call blocks directly.
+
 `AudioEncoder.encode_projected` has two paths:
 
 - The teacher and fine-tuning path keeps all projected frames.
@@ -289,6 +301,20 @@ waveform
 pretraining configuration. It applies fine-tuning dropout, masks, mixup, and
 freeze schedules, averages final transformer layers, and produces framewise
 multilabel logits.
+
+Fine-tuning copies the active `checkpoint_activations` value into the encoder
+model derived from the pretrained configuration. An older pretrained snapshot
+therefore cannot disable the current execution policy.
+
+### Fine-tuning activation memory
+
+A fine-tuning checkpoint at update 10,000 has not completed the 30,000-update
+recipe. Its next forward is the first trainable-backbone forward and retains
+dense attention activations that the frozen phase discarded. On the eight-A100
+40 GB reproduction profile, the driver preserves the saved batch topology and
+uses block recomputation to control that peak. Allocator mapping warnings near
+the failure report exhausted capacity; changing allocator fragmentation
+settings cannot replace the activation-memory policy.
 
 ## `a2v2/training.py`
 

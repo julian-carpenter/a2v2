@@ -161,3 +161,32 @@ def test_checked_in_recipes_exclude_ignored_legacy_options() -> None:
         "Checked-in recipes contain ignored legacy options:\n"
         + "\n".join(sorted(violations))
     )
+
+
+def test_finetuning_activation_memory_contract_is_documented() -> None:
+    """Keep 40 GB fine-tuning guidance tied to the saved sampler topology."""
+
+    reproduction = (ROOT / "docs/reproducing-paper.md").read_text(encoding="utf-8")
+    code_guide = (ROOT / "docs/code-guide.md").read_text(encoding="utf-8")
+
+    for required in (
+        "Fine-tuning update 10,000 is the first update with a trainable Transformer",
+        "`model.checkpoint_activations=true` for fine-tuning",
+        "both 960,000 and 800,000 produce\neight-record microbatches",
+        "changing `max_tokens` is not an exact resume",
+        "batch and activation-memory profile\nprovenance",
+        "`--override model.checkpoint_activations=true`",
+    ):
+        assert required in reproduction
+
+    for required in (
+        "`ModelConfig.checkpoint_activations` defaults to false",
+        "non-reentrant",
+        "RNG preservation",
+        "An older pretrained snapshot\ntherefore cannot disable the current execution policy",
+        "Fine-tuning activation memory",
+    ):
+        assert required in code_guide
+
+    assert "A2V2_FINETUNE_MAX_TOKENS=800000 \\\n" not in reproduction
+    assert "substantially more measured headroom" not in reproduction

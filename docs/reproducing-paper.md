@@ -51,27 +51,29 @@ published: 408,000 × 4 ranks × 5 accumulation = 8,160,000 tokens/update
 driver:    408,000 × 8 ranks × 3 accumulation = 9,792,000 tokens/update
 ```
 
-Fine-tuning had substantially more measured headroom. The default raises its
-per-rank token budget to 960,000 and reduces accumulation to two:
+The driver keeps the fine-tuning global token target while each rank processes
+a larger microbatch:
 
 ```text
 published: 426,667 × 4 ranks × 9 accumulation = 15,360,012 tokens/update
 driver:    960,000 × 8 ranks × 2 accumulation = 15,360,000 tokens/update
 ```
 
-The fine-tuning global token batch is therefore essentially unchanged, while
-each rank processes a larger microbatch. These quantities are padded-sample
-budgets; actual memory also depends on recording lengths, packing, PyTorch,
-and the update-10,000 transformer unfreeze. If the deployed data produces a
-genuine out-of-memory error, lower only the relevant token budget and retain
-the emitted log as part of the experiment record:
+Fine-tuning update 10,000 is the first update with a trainable Transformer
+backbone. The checkpoint saved at update 10,000 contains the last frozen
+forward; its first resumed forward retains activations for all eight prenet and
+16 main Transformer blocks. On 40 GB A100s, the driver sets
+`model.checkpoint_activations=true` for fine-tuning. PyTorch retains block
+boundaries and recomputes each block during backward. Frozen training,
+validation, evaluation, and inference bypass recomputation because they run
+without encoder gradients.
 
-```bash
-A2V2_FINETUNE_MAX_TOKENS=800000 \
-bash scripts/reproduce_meerkat_paper.sh \
-  /datasets/MeerKAT/manifests \
-  /experiments/a2v2-meerkat-fold0
-```
+Do not use `A2V2_FINETUNE_MAX_TOKENS=800000` as an OOM recovery setting for the
+published MeerKAT manifests. All 53,114 training records contain 80,000 samples,
+and the inherited batch-size multiple makes both 960,000 and 800,000 produce
+eight-record microbatches. Lower token budgets also repartition shuffled
+batches. Applying the saved numeric sampler cursor to that new partition would
+duplicate and skip examples, so changing `max_tokens` is not an exact resume.
 
 The complete batch controls are:
 
@@ -83,6 +85,10 @@ The complete batch controls are:
 | `A2V2_FINETUNE_UPDATE_FREQ` | 2 |
 | `A2V2_EVAL_MAX_TOKENS` | 320000 |
 | `A2V2_EVAL_WORKERS` | 20 |
+
+Activation checkpointing is a fixed fine-tuning override in this 40 GB driver,
+not an environment-variable batch control. It adds computation during the
+unfrozen backward pass while preserving the batch and checkpoint cursor.
 
 The deployment controls are:
 
@@ -125,6 +131,10 @@ optimizer, scheduler, and one RNG state for each of the eight ranks. Do not
 change world size or batch variables between an interrupted run and its resume:
 sampler and optimizer state belong to the stored topology.
 
+The activation-checkpointing flag changes execution policy and adds no
+checkpoint tensors. The driver can therefore enable it while resuming the
+untouched update-10,000 checkpoint under the same sampler topology.
+
 Scheduled training validation runs on rank zero. CUDA workers exchange the
 result through a CPU Gloo control group with a two-hour timeout, so the other
 ranks do not hold an NCCL collective while rank zero evaluates the full split.
@@ -132,7 +142,8 @@ ranks do not hold an NCCL collective while rank zero evaluates the full split.
 Validation prefers `checkpoint_best.pt`, falls back to `checkpoint_last.pt`
 with a warning, and records the selected checkpoint hash. Logs contain UTC
 phase headers and append across invocations. The output directory also retains
-package, GPU, manifest, recipe, and batch profile provenance.
+package, GPU, manifest, recipe, and batch and activation-memory profile
+provenance.
 
 ## 1. Select the published recipe
 
@@ -265,6 +276,11 @@ torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
   --pretrained-checkpoint /checkpoints/meerkat-pretrain/checkpoint_last.pt \
   --device cuda
 ```
+
+On 40 GB devices, add
+`--override model.checkpoint_activations=true` to trade block recomputation for
+lower unfrozen-backbone activation memory. The field defaults to false, so
+canonical YAML files and inference retain their existing execution path.
 
 Validation follows `validate_after_updates` and `validate_interval_updates`.
 Each pass logs normalized loss, micro precision, recall, F1, accuracy, and micro
