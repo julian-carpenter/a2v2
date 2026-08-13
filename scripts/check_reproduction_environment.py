@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import random
 import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -146,6 +147,12 @@ def check_training_checkpoint(
             fail(f"RNG state for rank {rank} is not a mapping")
         if "python" not in rank_state:
             fail(f"RNG state for rank {rank} is missing Python state")
+        try:
+            random.Random().setstate(rank_state["python"])
+        except Exception as error:
+            fail(
+                f"Python RNG state for rank {rank} cannot be restored: {error}"
+            )
         numpy_state = rank_state.get("numpy")
         if not isinstance(numpy_state, Mapping):
             fail(f"NumPy RNG state for rank {rank} is not a mapping")
@@ -163,8 +170,27 @@ def check_training_checkpoint(
             )
         if not isinstance(numpy_state["keys"], torch.Tensor):
             fail(f"NumPy RNG keys for rank {rank} are not a tensor")
-        if not isinstance(rank_state.get("torch"), torch.Tensor):
+        try:
+            np.random.RandomState().set_state((
+                str(numpy_state["algorithm"]),
+                numpy_state["keys"].cpu().numpy().astype(np.uint32, copy=False),
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            ))
+        except Exception as error:
+            fail(
+                f"NumPy RNG state for rank {rank} cannot be restored: {error}"
+            )
+        torch_state = rank_state.get("torch")
+        if not isinstance(torch_state, torch.Tensor):
             fail(f"torch RNG state for rank {rank} is not a tensor")
+        try:
+            torch.Generator(device="cpu").set_state(torch_state.cpu())
+        except Exception as error:
+            fail(
+                f"CPU torch RNG state for rank {rank} cannot be restored: {error}"
+            )
         cuda_state = rank_state.get("cuda")
         if cuda_state is None:
             if amp_enabled:
@@ -175,6 +201,11 @@ def check_training_checkpoint(
             or not all(isinstance(item, torch.Tensor) for item in cuda_state)
         ):
             fail(f"CUDA RNG state for rank {rank} is invalid")
+        elif amp_enabled and len(cuda_state) != expected_world_size:
+            fail(
+                f"CUDA RNG state for rank {rank} has {len(cuda_state)} entries; "
+                f"expected {expected_world_size}"
+            )
 
     sampler_state = checkpoint["sampler_state"]
     if not isinstance(sampler_state, Mapping):

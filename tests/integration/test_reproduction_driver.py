@@ -133,7 +133,9 @@ def _training_checkpoint_payload(*, fp16: bool = False) -> dict[str, object]:
 
     rank_state = capture_rng_state()
     if fp16:
-        rank_state["cuda"] = [torch.zeros(8, dtype=torch.uint8)]
+        rank_state["cuda"] = [
+            torch.zeros(16, dtype=torch.uint8) for _ in range(8)
+        ]
     return {
         "format_version": 1,
         "stage": "pretrain",
@@ -282,6 +284,110 @@ def test_checkpoint_preflight_rejects_malformed_rank_rng_state(
 
     assert str(checkpoint.resolve()) in str(raised.value)
     assert reason in str(raised.value)
+
+
+def test_checkpoint_preflight_rejects_unrestorable_python_rng_state(
+    tmp_path: Path,
+) -> None:
+    """Reject a present Python RNG value that Random.setstate cannot restore."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload()
+    rng_state = payload["rng_state"]
+    assert isinstance(rng_state, dict)
+    ranked = rng_state["by_rank"]
+    assert isinstance(ranked, list)
+    rank_state = dict(ranked[3])
+    rank_state["python"] = None
+    ranked[3] = rank_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    message = str(raised.value)
+    assert str(checkpoint.resolve()) in message
+    assert "Python RNG state for rank 3 cannot be restored" in message
+
+
+def test_checkpoint_preflight_rejects_unrestorable_numpy_rng_state(
+    tmp_path: Path,
+) -> None:
+    """Reject a present NumPy RNG value that RandomState cannot restore."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload()
+    rng_state = payload["rng_state"]
+    assert isinstance(rng_state, dict)
+    ranked = rng_state["by_rank"]
+    assert isinstance(ranked, list)
+    rank_state = dict(ranked[3])
+    numpy_state = dict(rank_state["numpy"])
+    numpy_state["algorithm"] = "not-a-generator"
+    rank_state["numpy"] = numpy_state
+    ranked[3] = rank_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    message = str(raised.value)
+    assert str(checkpoint.resolve()) in message
+    assert "NumPy RNG state for rank 3 cannot be restored" in message
+
+
+def test_checkpoint_preflight_rejects_unrestorable_cpu_torch_rng_state(
+    tmp_path: Path,
+) -> None:
+    """Reject a byte tensor that a fresh CPU torch generator cannot restore."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload()
+    rng_state = payload["rng_state"]
+    assert isinstance(rng_state, dict)
+    ranked = rng_state["by_rank"]
+    assert isinstance(ranked, list)
+    rank_state = dict(ranked[3])
+    rank_state["torch"] = torch.zeros(8, dtype=torch.uint8)
+    ranked[3] = rank_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    message = str(raised.value)
+    assert str(checkpoint.resolve()) in message
+    assert "CPU torch RNG state for rank 3 cannot be restored" in message
+
+
+def test_checkpoint_preflight_requires_one_cuda_rng_state_per_amp_device(
+    tmp_path: Path,
+) -> None:
+    """Reject AMP rank state without one CUDA generator state per device."""
+
+    preflight = _load_preflight()
+    checkpoint = tmp_path / "selected.pt"
+    payload = _training_checkpoint_payload(fp16=True)
+    rng_state = payload["rng_state"]
+    assert isinstance(rng_state, dict)
+    ranked = rng_state["by_rank"]
+    assert isinstance(ranked, list)
+    rank_state = dict(ranked[3])
+    cuda_state = rank_state["cuda"]
+    assert isinstance(cuda_state, list)
+    rank_state["cuda"] = cuda_state[:7]
+    ranked[3] = rank_state
+    save_checkpoint(checkpoint, payload)
+
+    with pytest.raises(RuntimeError) as raised:
+        preflight.check_training_checkpoint(checkpoint, expected_world_size=8)
+
+    message = str(raised.value)
+    assert str(checkpoint.resolve()) in message
+    assert "CUDA RNG state for rank 3 has 7 entries; expected 8" in message
 
 
 def test_checkpoint_preflight_requires_scaler_state_for_amp_resume(tmp_path: Path) -> None:
