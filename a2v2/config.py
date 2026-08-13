@@ -391,6 +391,14 @@ def _mapping(raw: Mapping[str, Any], key: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _checkpoint_activations_bool(value: object) -> bool:
+    """Validate the execution-policy flag without changing legacy bool parsing."""
+
+    if type(value) is not bool:
+        raise ConfigError("model.checkpoint_activations must be a boolean")
+    return value
+
+
 # =============================================================================
 # PUBLISHED RECIPE TRANSLATION
 # =============================================================================
@@ -642,6 +650,9 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         for key in ModelConfig.__dataclass_fields__ if key not in {"name", "audio", "depth", "embed_dim", "num_heads"}
     }
     model_kwargs["norm_eps"] = float(model_kwargs["norm_eps"])
+    model_kwargs["checkpoint_activations"] = _checkpoint_activations_bool(
+        model_kwargs["checkpoint_activations"]
+    )
     model = ModelConfig(
         name=str(model_raw.get("_name", "data2vec_multi")),
         depth=int(model_raw.get("depth", inferred_depth)),
@@ -745,6 +756,9 @@ def config_from_serialized_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         optimizer = OptimizerConfig(**optimizer_values)
         scheduler = SchedulerConfig(**dict(raw["scheduler"]))  # type: ignore[arg-type]
         model_values = dict(raw["model"])  # type: ignore[arg-type]
+        model_values["checkpoint_activations"] = _checkpoint_activations_bool(
+            model_values.get("checkpoint_activations", False)
+        )
         audio_values = dict(model_values.pop("audio"))
         decoder = DecoderConfig(**dict(audio_values.pop("decoder")))
         audio = AudioModelConfig(**audio_values, decoder=decoder)

@@ -185,8 +185,11 @@ TRAIN_ENTRY="${A2V2_TRAIN_ENTRY:-a2v2-train}"
 readonly PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-408000}"
 readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-3}"
 
-# Fine-tuning had much more measured headroom. Increasing its per-rank token
-# budget and reducing accumulation gives
+# The 960,000-token profile had measured headroom while the fine-tuning
+# backbone was frozen. Update 10,000 is the first trainable-backbone boundary
+# and has a different activation peak, so the driver fixes Transformer
+# activation recomputation on. Increasing the per-rank token budget and
+# reducing accumulation gives
 #   B_ft = 960,000 × 8 × 2 = 15,360,000,
 # essentially identical to the published 426,667 × 4 × 9 = 15,360,012.
 # Thus GPUs process larger microbatches without changing the learning rate's

@@ -176,10 +176,15 @@ def _shell_fences(markdown: str) -> list[str]:
 
 
 def _has_finetune_800000_shell_assignment(markdown: str) -> bool:
-    """Conservatively flag any shell-fence use of the obsolete budget variable."""
+    """Flag executable shell-fence assignments of the obsolete budget."""
 
+    assignment = re.compile(
+        r"(?m)^[ \t]*(?:export[ \t]+)?"
+        r"A2V2_FINETUNE_MAX_TOKENS=[ \t]*"
+        r"(?:800000|'800000'|\"800000\")(?=$|[ \t;&|])"
+    )
     return any(
-        "A2V2_FINETUNE_MAX_TOKENS" in fence
+        assignment.search(re.sub(r"\\\r?\n[ \t]*", "", fence)) is not None
         for fence in _shell_fences(markdown)
     )
 
@@ -200,6 +205,25 @@ def test_shell_fence_guard_rejects_800000_assignments(assignment: str) -> None:
     markdown = f"```bash\n{assignment}\n```"
 
     assert _has_finetune_800000_shell_assignment(markdown)
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "A2V2_FINETUNE_MAX_TOKENS=960000 bash reproduce.sh",
+        "  export A2V2_FINETUNE_MAX_TOKENS='960000'",
+        "# A2V2_FINETUNE_MAX_TOKENS=800000 is obsolete",
+        'printf \'%s\\n\' "A2V2_FINETUNE_MAX_TOKENS=800000 is obsolete"',
+    ),
+)
+def test_shell_fence_guard_allows_current_budget_and_harmless_mentions(
+    content: str,
+) -> None:
+    """Allow the current assignment plus comment and prose mentions."""
+
+    markdown = f"```bash\n{content}\n```"
+
+    assert not _has_finetune_800000_shell_assignment(markdown)
 
 
 def test_finetuning_activation_memory_contract_is_documented() -> None:

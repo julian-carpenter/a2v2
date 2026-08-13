@@ -16,7 +16,7 @@ import torch
 
 from a2v2.config import config_to_dict, load_config
 from a2v2.model import Animal2VecFineTuningModel
-from a2v2.model import Animal2VecPretrainingModel
+from a2v2.model import Animal2VecPretrainingModel, TransformerStack, alibi_bias
 from a2v2.training import (
     capture_rng_state,
     load_checkpoint,
@@ -354,6 +354,119 @@ def test_finetuning_amp_freezes_then_unfreezes_transformer(
     assert any(parameter.grad is not None for parameter in model.encoder.transformer.parameters())
     assert not any(parameter.grad is not None for parameter in model.encoder.local_encoder.parameters())
     assert torch.isfinite(torch.tensor(unfrozen.loss))
+
+
+def test_transformer_activation_checkpointing_autocast_cuda_parity(
+    cuda_device: torch.device,
+) -> None:
+    """Match direct and checkpointed stochastic Transformer execution in AMP."""
+
+    torch.manual_seed(701)
+    torch.cuda.manual_seed_all(702)
+    direct = TransformerStack(
+        8,
+        2,
+        depth=2,
+        dropout=0.2,
+        attention_dropout=0.2,
+        activation_dropout=0.2,
+        post_mlp_dropout=0.2,
+        drop_path_rates=(0.1, 0.2),
+        input_dropout=0.2,
+    ).to(cuda_device).train()
+    checkpointed = deepcopy(direct)
+    checkpointed.checkpoint_activations = True
+    base_value = torch.randn(2, 5, 8, device=cuda_device)
+    direct_value = base_value.clone().requires_grad_(True)
+    checkpointed_value = base_value.clone().requires_grad_(True)
+    padding = torch.tensor(
+        [
+            [False, False, False, False, False],
+            [False, False, False, False, True],
+        ],
+        device=cuda_device,
+    )
+    bias = alibi_bias(2, 5).unsqueeze(0).expand(2, -1, -1, -1).to(cuda_device)
+    direct_scale = torch.ones(2, 1, 2, 1, 1, device=cuda_device, requires_grad=True)
+    checkpointed_scale = direct_scale.detach().clone().requires_grad_(True)
+
+    def run(
+        stack: TransformerStack,
+        value: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Run from fixed CPU/CUDA RNG states and retain final CUDA RNG."""
+
+        torch.manual_seed(703)
+        torch.cuda.manual_seed_all(704)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            output, targets = stack(value * 1.0, padding, bias, scale)
+            loss = output.square().sum() + sum(
+                target.square().sum() for target in targets
+            )
+        loss.backward()
+        return (
+            output.detach().clone(),
+            [target.detach().clone() for target in targets],
+            loss.detach().clone(),
+            torch.cuda.get_rng_state(cuda_device).clone(),
+        )
+
+    direct_output, direct_targets, direct_loss, direct_rng = run(
+        direct,
+        direct_value,
+        direct_scale,
+    )
+    checkpointed_output, checkpointed_targets, checkpointed_loss, checkpointed_rng = run(
+        checkpointed,
+        checkpointed_value,
+        checkpointed_scale,
+    )
+
+    value_rtol, value_atol = 2e-3, 2e-3
+    gradient_rtol, gradient_atol = 3e-3, 3e-4
+    torch.testing.assert_close(
+        checkpointed_output,
+        direct_output,
+        rtol=value_rtol,
+        atol=value_atol,
+    )
+    assert len(checkpointed_targets) == len(direct_targets)
+    for actual, expected in zip(checkpointed_targets, direct_targets, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=value_rtol, atol=value_atol)
+    torch.testing.assert_close(
+        checkpointed_loss,
+        direct_loss,
+        rtol=value_rtol,
+        atol=value_atol,
+    )
+    torch.testing.assert_close(
+        checkpointed_value.grad,
+        direct_value.grad,
+        rtol=gradient_rtol,
+        atol=gradient_atol,
+    )
+    torch.testing.assert_close(
+        checkpointed_scale.grad,
+        direct_scale.grad,
+        rtol=gradient_rtol,
+        atol=gradient_atol,
+    )
+    for (actual_name, actual), (expected_name, expected) in zip(
+        checkpointed.named_parameters(),
+        direct.named_parameters(),
+        strict=True,
+    ):
+        assert actual_name == expected_name
+        assert actual.grad is not None
+        assert expected.grad is not None
+        torch.testing.assert_close(
+            actual.grad,
+            expected.grad,
+            rtol=gradient_rtol,
+            atol=gradient_atol,
+        )
+    assert torch.equal(checkpointed_rng, direct_rng)
 
 
 def test_amp_overflow_skips_update_and_reduces_scale(

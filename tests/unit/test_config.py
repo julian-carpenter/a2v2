@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from a2v2.config import (
     ConfigError,
+    config_from_dict,
     config_from_serialized_dict,
     config_to_dict,
     load_config,
@@ -50,6 +52,56 @@ def test_checkpoint_activations_defaults_overrides_and_round_trips() -> None:
     assert isinstance(legacy_model, dict)
     legacy_model.pop("checkpoint_activations")
     assert config_from_serialized_dict(legacy).model.checkpoint_activations is False
+
+
+@pytest.mark.parametrize("invalid", (0, 1, [], [False], "false"))
+def test_checkpoint_activations_rejects_invalid_recipe_values(
+    invalid: object,
+) -> None:
+    """Reject non-boolean checkpoint policy values in published recipes."""
+
+    path = ROOT / "tests/fixtures/tiny_finetune.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    model = raw["model"]
+    assert isinstance(model, dict)
+    model["checkpoint_activations"] = invalid
+
+    with pytest.raises(ConfigError, match=r"model\.checkpoint_activations"):
+        config_from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        "model.checkpoint_activations=0",
+        "model.checkpoint_activations=1",
+        "model.checkpoint_activations=[]",
+        "model.checkpoint_activations=[false]",
+        "model.checkpoint_activations='false'",
+        'model.checkpoint_activations="false"',
+    ),
+)
+def test_checkpoint_activations_rejects_invalid_overrides(override: str) -> None:
+    """Reject CLI overrides that do not decode to Python booleans."""
+
+    with pytest.raises(ConfigError, match=r"model\.checkpoint_activations"):
+        load_config(ROOT / "tests/fixtures/tiny_finetune.yaml", overrides=(override,))
+
+
+@pytest.mark.parametrize("invalid", (0, 1, [], [False], "false"))
+def test_checkpoint_activations_rejects_invalid_serialized_values(
+    invalid: object,
+) -> None:
+    """Reject non-boolean checkpoint policy values in native snapshots."""
+
+    serialized = config_to_dict(load_config(ROOT / "tests/fixtures/tiny_finetune.yaml"))
+    model = serialized["model"]
+    assert isinstance(model, dict)
+    model["checkpoint_activations"] = invalid
+
+    with pytest.raises(ConfigError, match=r"model\.checkpoint_activations"):
+        config_from_serialized_dict(serialized)
 
 
 def test_parses_legacy_conv_expression_without_eval() -> None:
