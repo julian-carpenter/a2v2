@@ -296,8 +296,22 @@ esac
 
 PRETRAIN_CONFIG="${PRETRAIN_CONFIG_OVERRIDE:-${REPOSITORY_ROOT}/configs/MeerKAT/a2v_large_pretrain_best.yaml}"
 FINETUNE_CONFIG="${FINETUNE_CONFIG_OVERRIDE:-${DEFAULT_FINETUNE_CONFIG}}"
-[[ -f "${PRETRAIN_CONFIG}" ]] || die "pretraining config does not exist: ${PRETRAIN_CONFIG}"
-[[ -f "${FINETUNE_CONFIG}" ]] || die "fine-tuning config does not exist: ${FINETUNE_CONFIG}"
+case "${PHASE}" in
+    pretrain)
+        [[ -f "${PRETRAIN_CONFIG}" ]] \
+            || die "pretraining config does not exist: ${PRETRAIN_CONFIG}"
+        ;;
+    finetune|evaluate)
+        [[ -f "${FINETUNE_CONFIG}" ]] \
+            || die "fine-tuning config does not exist: ${FINETUNE_CONFIG}"
+        ;;
+    all)
+        [[ -f "${PRETRAIN_CONFIG}" ]] \
+            || die "pretraining config does not exist: ${PRETRAIN_CONFIG}"
+        [[ -f "${FINETUNE_CONFIG}" ]] \
+            || die "fine-tuning config does not exist: ${FINETUNE_CONFIG}"
+        ;;
+esac
 
 if [[ "${DRY_RUN}" == false ]]; then
     for variable in SLURM_JOB_ID SLURM_JOB_NUM_NODES SLURM_GPUS_ON_NODE SLURM_JOB_NODELIST
@@ -425,7 +439,7 @@ case "${PHASE}" in
     all) REQUIRED_MANIFESTS=("${PRETRAIN_MANIFEST}" "${TRAIN_MANIFEST}" "${VALID_MANIFEST}") ;;
     pretrain) REQUIRED_MANIFESTS=("${PRETRAIN_MANIFEST}") ;;
     finetune) REQUIRED_MANIFESTS=("${TRAIN_MANIFEST}" "${VALID_MANIFEST}") ;;
-    evaluate) REQUIRED_MANIFESTS=("${VALID_MANIFEST}") ;;
+    evaluate) REQUIRED_MANIFESTS=("${TRAIN_MANIFEST}" "${VALID_MANIFEST}") ;;
 esac
 
 if [[ -n "${PRETRAIN_CHECKPOINT_OVERRIDE}" ]]; then
@@ -466,36 +480,66 @@ LAUNCH_CONTRACT_COMMAND=(
     --nodes "${NODES}"
     --processes-per-node "${GPUS_PER_NODE}"
     --rendezvous-endpoint "${RDZV_ENDPOINT}"
-    --pretrain-output-directory "${PRETRAIN_DIR}"
-    --finetune-output-directory "${FINETUNE_DIR}"
-    --pretrain-config "${PRETRAIN_CONFIG}"
-    --finetune-config "${FINETUNE_CONFIG}"
-    --pretrain-manifest-entry "pretrain.tsv=${PRETRAIN_MANIFEST}"
-    --finetune-manifest-entry "${TRAIN_SUBSET}.tsv=${TRAIN_MANIFEST}"
-    --finetune-manifest-entry "${VALID_SUBSET}.tsv=${VALID_MANIFEST}"
 )
-for override in "${PRETRAIN_OVERRIDES[@]}"; do
-    LAUNCH_CONTRACT_COMMAND+=(--pretrain-override "${override}")
-done
-for override in "${FINETUNE_OVERRIDES[@]}"; do
-    LAUNCH_CONTRACT_COMMAND+=(--finetune-override "${override}")
-done
+if [[ "${PHASE}" == pretrain || "${PHASE}" == all ]]; then
+    LAUNCH_CONTRACT_COMMAND+=(
+        --phase pretrain
+        --pretrain-output-directory "${PRETRAIN_DIR}"
+        --pretrain-config "${PRETRAIN_CONFIG}"
+        --pretrain-manifest-entry "pretrain.tsv=${PRETRAIN_MANIFEST}"
+    )
+    for override in "${PRETRAIN_OVERRIDES[@]}"; do
+        LAUNCH_CONTRACT_COMMAND+=(--pretrain-override "${override}")
+    done
+fi
+if [[ "${PHASE}" == finetune || "${PHASE}" == evaluate || "${PHASE}" == all ]]; then
+    LAUNCH_CONTRACT_COMMAND+=(
+        --phase finetune
+        --finetune-output-directory "${FINETUNE_DIR}"
+        --finetune-config "${FINETUNE_CONFIG}"
+        --finetune-manifest-entry "${TRAIN_SUBSET}.tsv=${TRAIN_MANIFEST}"
+        --finetune-manifest-entry "${VALID_SUBSET}.tsv=${VALID_MANIFEST}"
+    )
+    for override in "${FINETUNE_OVERRIDES[@]}"; do
+        LAUNCH_CONTRACT_COMMAND+=(--finetune-override "${override}")
+    done
+fi
 if [[ "${DRY_RUN}" == true ]]; then
     LAUNCH_CONTRACT_COMMAND+=(--allow-missing-manifests)
 fi
 LAUNCH_CONTRACT_OUTPUT="$("${LAUNCH_CONTRACT_COMMAND[@]}")" \
     || die "could not construct canonical phase RunContracts"
 mapfile -t LAUNCH_CONTRACT_FIELDS <<< "${LAUNCH_CONTRACT_OUTPUT}"
-[[ ${#LAUNCH_CONTRACT_FIELDS[@]} -eq 8 ]] \
-    || die "canonical phase RunContract helper returned an incomplete record"
-PRETRAIN_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[0]}"
-PRETRAIN_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[1]}"
-PRETRAIN_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[2]}"
-PRETRAIN_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[3]}"
-FINETUNE_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[4]}"
-FINETUNE_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[5]}"
-FINETUNE_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[6]}"
-FINETUNE_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[7]}"
+case "${PHASE}" in
+    pretrain)
+        [[ ${#LAUNCH_CONTRACT_FIELDS[@]} -eq 4 ]] \
+            || die "canonical pretraining RunContract helper returned an incomplete record"
+        PRETRAIN_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[0]}"
+        PRETRAIN_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[1]}"
+        PRETRAIN_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[2]}"
+        PRETRAIN_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[3]}"
+        ;;
+    finetune|evaluate)
+        [[ ${#LAUNCH_CONTRACT_FIELDS[@]} -eq 4 ]] \
+            || die "canonical fine-tuning RunContract helper returned an incomplete record"
+        FINETUNE_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[0]}"
+        FINETUNE_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[1]}"
+        FINETUNE_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[2]}"
+        FINETUNE_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[3]}"
+        ;;
+    all)
+        [[ ${#LAUNCH_CONTRACT_FIELDS[@]} -eq 8 ]] \
+            || die "canonical phase RunContract helper returned an incomplete record"
+        PRETRAIN_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[0]}"
+        PRETRAIN_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[1]}"
+        PRETRAIN_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[2]}"
+        PRETRAIN_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[3]}"
+        FINETUNE_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[4]}"
+        FINETUNE_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[5]}"
+        FINETUNE_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[6]}"
+        FINETUNE_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[7]}"
+        ;;
+esac
 
 for recovery in "${RECOVERY_REQUESTS[@]}"; do
     recovery_phase="${recovery%%:*}"

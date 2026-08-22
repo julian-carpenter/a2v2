@@ -435,3 +435,96 @@ long-running job was started. The real-site gate and the site-specific
 concerns listed above remain unrun/unchanged. Fix Round 1 is committed as the
 single commit reported in the parent handoff; the report intentionally does
 not embed a self-referential commit hash.
+
+## Fix Round 2
+
+### Root cause and RED evidence
+
+The phase-specific `REQUIRED_MANIFESTS` validation was correct, but the next
+`launcher-contracts` invocation unconditionally passed both configs and all
+three manifests. The helper's parser also marked every stage option required,
+so a valid standalone stage could not avoid loading the unrelated stage.
+
+Real-mode regression tests were added before changing either interface. They
+use the real canonical contract and marker implementations while mocking only
+unavailable `srun` and native checkpoint loading. The RED result was:
+
+```text
+6 passed, 3 failed
+pretrain: ERROR: fine-tuning config does not exist
+finetune/evaluate: ERROR: pretraining config does not exist
+```
+
+The six passing cases proved selected pretraining, fine-tuning, and `all`
+inputs still failed actionably when their own config or manifest was missing.
+
+### Phase-selective single-process contract construction
+
+`launcher-contracts` now accepts one or more explicit `--phase` values.
+It validates and loads only the options for those phases, rejects duplicate
+phase requests, and keeps the canonical four-line record per stage:
+
+- manifest fingerprint;
+- canonical RunContract JSON;
+- RunContract fingerprint;
+- resolved-config fingerprint.
+
+The outer launcher selects contracts as follows:
+
+```text
+pretrain          -> pretrain
+finetune          -> finetune
+evaluate          -> finetune
+all               -> pretrain + finetune (one Python process)
+```
+
+Standalone pretraining therefore does not inspect the fine-tuning config or
+train/validation manifests. Standalone fine-tuning and final evaluation do not
+inspect the pretraining config or manifest. Evaluation requires both
+fine-tuning train and validation manifests because both are part of the exact
+completed fine-tuning RunContract it validates.
+
+The helper uses the identical stage-building branch whether a stage is
+selected alone or beside the other stage. Existing Python-canonical and
+`all`-versus-standalone identity tests remain unchanged and pass.
+
+### GREEN and verification evidence
+
+The exact Round 2 regression slice passed:
+
+```text
+9 passed
+```
+
+Canonical identity, Python fingerprint parity, and dry-run topology:
+
+```text
+3 passed
+```
+
+Complete focused SLURM/Gloo/frozen-driver gate:
+
+```text
+131 passed
+```
+
+Fresh full CPU gate:
+
+```text
+504 passed
+```
+
+`bash -n`, `git diff --check`, and a bounded standalone pretraining
+dry-run with an inaccessible fine-tuning config all exited zero. The frozen
+local reproduction driver remains byte-identical:
+
+```text
+SHA256 485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18
+```
+
+Atomic completion markers, per-rank runtime validation, signal latching,
+quoting, lock recovery, bracketed IPv6, and no-auto-requeue behavior were not
+changed. No real `sbatch`, multi-node step, CUDA training, or long-running
+job was started; the same real-site gate remains unrun. Fix Round 2 is
+committed as the single commit reported in the parent handoff; the report
+avoids a self-referential commit hash.

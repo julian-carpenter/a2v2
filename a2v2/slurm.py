@@ -1347,27 +1347,33 @@ def _manifest_cli(arguments: argparse.Namespace) -> int:
 
 
 def _launcher_contracts_cli(arguments: argparse.Namespace) -> int:
-    """Render both stable stage identities in one Python process."""
+    """Render the selected stable stage identities in one Python process."""
 
     from .config import config_to_dict, load_config
 
-    phase_specs = (
-        (
-            "pretrain",
+    if len(set(arguments.phase)) != len(arguments.phase):
+        raise TopologyError("launcher contract phases must not be duplicated")
+    phase_specs = {
+        "pretrain": (
             arguments.pretrain_output_directory,
             arguments.pretrain_config,
             arguments.pretrain_override,
             arguments.pretrain_manifest_entry,
         ),
-        (
-            "finetune",
+        "finetune": (
             arguments.finetune_output_directory,
             arguments.finetune_config,
             arguments.finetune_override,
             arguments.finetune_manifest_entry,
         ),
-    )
-    for phase, output_directory, config_path, overrides, raw_entries in phase_specs:
+    }
+    for phase in arguments.phase:
+        output_directory, config_path, overrides, raw_entries = phase_specs[phase]
+        if output_directory is None or config_path is None or not raw_entries:
+            raise TopologyError(
+                f"{phase} launcher contract requires its output directory, config, "
+                "and manifest entries"
+            )
         entries: list[tuple[str, str]] = []
         for entry in raw_entries:
             logical_name, separator, path = entry.partition("=")
@@ -1461,23 +1467,27 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     launcher.add_argument("--nodes", required=True, type=int)
     launcher.add_argument("--processes-per-node", required=True, type=int)
     launcher.add_argument("--rendezvous-endpoint", required=True)
-    launcher.add_argument("--pretrain-output-directory", required=True)
-    launcher.add_argument("--finetune-output-directory", required=True)
-    launcher.add_argument("--pretrain-config", required=True, type=Path)
-    launcher.add_argument("--finetune-config", required=True, type=Path)
+    launcher.add_argument(
+        "--phase",
+        action="append",
+        choices=("pretrain", "finetune"),
+        required=True,
+    )
+    launcher.add_argument("--pretrain-output-directory")
+    launcher.add_argument("--finetune-output-directory")
+    launcher.add_argument("--pretrain-config", type=Path)
+    launcher.add_argument("--finetune-config", type=Path)
     launcher.add_argument("--pretrain-override", action="append", default=[])
     launcher.add_argument("--finetune-override", action="append", default=[])
     launcher.add_argument(
         "--pretrain-manifest-entry",
         action="append",
         default=[],
-        required=True,
     )
     launcher.add_argument(
         "--finetune-manifest-entry",
         action="append",
         default=[],
-        required=True,
     )
     launcher.add_argument("--allow-missing-manifests", action="store_true")
     for name in ("write-completion", "validate-completion"):

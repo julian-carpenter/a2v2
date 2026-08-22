@@ -95,6 +95,32 @@ def _slurm_environment(
     }
 
 
+def _single_node_stage_environment(tmp_path: Path) -> dict[str, str]:
+    """Provide real contract construction with only external SLURM work mocked."""
+
+    fake_bin = tmp_path / "fake-stage-bin"
+    fake_bin.mkdir()
+    _write_executable(fake_bin / "python", "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "srun",
+        """#!/usr/bin/env bash
+output=''
+while (($#)); do
+    if [[ "$1" == '--output-dir' ]]; then output="$2"; shift 2; else shift; fi
+done
+if [[ -n "$output" ]]; then
+    mkdir -p "$output"
+    printf 'stage checkpoint\n' > "$output/checkpoint_last.pt"
+fi
+""",
+    )
+    return {
+        **_slurm_environment(nodes=1, gpus_per_node=1),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_PYTHON": str(fake_bin / "python"),
+    }
+
+
 def _run_shell(
     script: Path,
     *arguments: str,
@@ -754,6 +780,148 @@ def test_all_and_standalone_launches_share_each_phase_contract_identity(
     assert all_contracts["pretrain"] == contracts("pretrain")["pretrain"]
     assert all_contracts["finetune"] == contracts("finetune")["finetune"]
     assert all_contracts["pretrain"] != all_contracts["finetune"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "manifest_names", "unrelated_config_option", "checkpoint"),
+    (
+        (
+            "pretrain",
+            ("pretrain.tsv",),
+            "--finetune-config",
+            "pretrain/checkpoint_last.pt",
+        ),
+        (
+            "finetune",
+            ("train_0.tsv", "valid_0.tsv"),
+            "--pretrain-config",
+            "finetune/checkpoint_last.pt",
+        ),
+    ),
+)
+def test_real_selected_stage_ignores_unrelated_manifest_and_config_inputs(
+    tmp_path: Path,
+    phase: str,
+    manifest_names: tuple[str, ...],
+    unrelated_config_option: str,
+    checkpoint: str,
+) -> None:
+    """Catch a standalone stage loading the other stage's inaccessible inputs."""
+
+    manifests = tmp_path / "selected manifests"
+    manifests.mkdir()
+    for name in manifest_names:
+        (manifests / name).write_text("selected\n", encoding="utf-8")
+    output = tmp_path / "output"
+    if phase == "finetune":
+        pretrained = output / "pretrain/checkpoint_last.pt"
+        pretrained.parent.mkdir(parents=True)
+        pretrained.write_bytes(b"pretrained")
+
+    completed = _run_shell(
+        SLURM_DRIVER,
+        str(manifests),
+        str(output),
+        "--phase", phase,
+        "--master-addr", "node01",
+        unrelated_config_option, str(tmp_path / "inaccessible unrelated.yaml"),
+        environment=_single_node_stage_environment(tmp_path),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (output / checkpoint).is_file()
+    assert (output / f"{checkpoint}.stage-complete").is_file()
+
+
+def test_real_evaluation_uses_only_finetune_contract_inputs(tmp_path: Path) -> None:
+    """Catch final evaluation loading the unrelated pretraining config or manifest."""
+
+    manifests = tmp_path / "finetune manifests"
+    manifests.mkdir()
+    for name in ("train_0.tsv", "valid_0.tsv"):
+        (manifests / name).write_text("selected\n", encoding="utf-8")
+    output = tmp_path / "output"
+    pretrained = output / "pretrain/checkpoint_last.pt"
+    pretrained.parent.mkdir(parents=True)
+    pretrained.write_bytes(b"pretrained")
+    environment = _single_node_stage_environment(tmp_path)
+    missing_pretrain_config = tmp_path / "inaccessible pretrain.yaml"
+    common = (
+        str(manifests),
+        str(output),
+        "--master-addr", "node01",
+        "--pretrain-config", str(missing_pretrain_config),
+    )
+    trained = _run_shell(
+        SLURM_DRIVER,
+        *common,
+        "--phase", "finetune",
+        environment=environment,
+    )
+    assert trained.returncode == 0, trained.stderr
+
+    evaluated = _run_shell(
+        SLURM_DRIVER,
+        *common,
+        "--phase", "evaluate",
+        environment=environment,
+    )
+
+    assert evaluated.returncode == 0, evaluated.stderr
+
+
+@pytest.mark.parametrize(
+    ("phase", "present_manifests", "config_option", "expected_error"),
+    (
+        ("pretrain", (), None, "pretrain.tsv"),
+        ("finetune", ("valid_0.tsv",), None, "train_0.tsv"),
+        ("all", ("pretrain.tsv", "valid_0.tsv"), None, "train_0.tsv"),
+        ("pretrain", ("pretrain.tsv",), "--pretrain-config", "pretraining config"),
+        (
+            "finetune",
+            ("train_0.tsv", "valid_0.tsv"),
+            "--finetune-config",
+            "fine-tuning config",
+        ),
+        (
+            "all",
+            ("pretrain.tsv", "train_0.tsv", "valid_0.tsv"),
+            "--finetune-config",
+            "fine-tuning config",
+        ),
+    ),
+)
+def test_real_selected_stage_still_requires_its_own_inputs(
+    tmp_path: Path,
+    phase: str,
+    present_manifests: tuple[str, ...],
+    config_option: str | None,
+    expected_error: str,
+) -> None:
+    """Catch phase isolation weakening actionable selected-input validation."""
+
+    manifests = tmp_path / "selected manifests"
+    manifests.mkdir()
+    for name in present_manifests:
+        (manifests / name).write_text("selected\n", encoding="utf-8")
+    output = tmp_path / "output"
+    arguments = [
+        str(manifests),
+        str(output),
+        "--phase", phase,
+        "--master-addr", "node01",
+    ]
+    if config_option is not None:
+        arguments.extend((config_option, str(tmp_path / "missing selected.yaml")))
+
+    completed = _run_shell(
+        SLURM_DRIVER,
+        *arguments,
+        environment=_single_node_stage_environment(tmp_path),
+    )
+
+    assert completed.returncode == 2
+    assert expected_error in completed.stderr
 
 
 def test_node_launcher_fails_before_torchrun_on_output_lock_contention(
