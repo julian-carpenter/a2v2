@@ -180,7 +180,7 @@ def test_bitsandbytes_optimizer_missing_extra_error_is_actionable(
 
     monkeypatch.setattr(importlib, "import_module", missing)
 
-    with pytest.raises(RuntimeError, match=r"a2v2\[bnb\]"):
+    with pytest.raises(training.OptimizerSetupError, match=r"a2v2\[bnb\]"):
         build_optimizer(
             GroupFixture(),
             name="adam8bit",
@@ -248,6 +248,9 @@ def test_bitsandbytes_optimizer_selection_forwards_groups_and_adam_hyperparamete
 
     fake_module = SimpleNamespace(
         __version__="0.49.1",
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=True),
+        ),
         optim=SimpleNamespace(
             Adam8bit=FakeAdam8bit,
             AdamW8bit=FakeAdamW8bit,
@@ -280,6 +283,186 @@ def test_bitsandbytes_optimizer_selection_forwards_groups_and_adam_hyperparamete
     }
     assert [group["weight_decay"] for group in optimizer.param_groups] == [0.12, 0.0]
     assert optimizer._a2v2_bitsandbytes_version == "0.49.1"
+
+
+@pytest.mark.parametrize("version", ("0.48.9", "0.50.0"))
+def test_bitsandbytes_optimizer_rejects_versions_outside_pinned_range(
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+) -> None:
+    """Catch constructing against an unvalidated bitsandbytes release."""
+
+    class AvailableOptimizer:
+        """Stand in for an optimizer that must not be constructed."""
+
+        def __init__(self, groups: object, **kwargs: object) -> None:
+            self.param_groups = groups
+
+    fake_module = SimpleNamespace(
+        __version__=version,
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=True),
+        ),
+        optim=SimpleNamespace(Adam8bit=AvailableOptimizer),
+    )
+    monkeypatch.setattr(importlib, "import_module", lambda _: fake_module)
+
+    with pytest.raises(
+        training.OptimizerSetupError,
+        match=r"bitsandbytes>=0\.49,<0\.50",
+    ):
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            device=torch.device("cuda"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("optional_api", "message"),
+    (
+        (SimpleNamespace(), "bitsandbytes.optim"),
+        (SimpleNamespace(optim=SimpleNamespace()), "Adam8bit"),
+    ),
+)
+def test_bitsandbytes_optimizer_rejects_missing_optimizer_api(
+    monkeypatch: pytest.MonkeyPatch,
+    optional_api: SimpleNamespace,
+    message: str,
+) -> None:
+    """Catch leaking raw attribute errors for an incomplete optional package."""
+
+    fake_module = SimpleNamespace(
+        __version__="0.49.2",
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=True),
+        ),
+        **vars(optional_api),
+    )
+    monkeypatch.setattr(importlib, "import_module", lambda _: fake_module)
+
+    with pytest.raises(training.OptimizerSetupError, match=message):
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            device=torch.device("cuda"),
+        )
+
+
+def test_bitsandbytes_optimizer_rejects_unloaded_cuda_native_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch deferring a missing CUDA binary until the first optimizer step."""
+
+    class AvailableOptimizer:
+        """Stand in for an optimizer hidden behind a failed native load."""
+
+        def __init__(self, groups: object, **kwargs: object) -> None:
+            self.param_groups = groups
+
+    fake_module = SimpleNamespace(
+        __version__="0.49.2",
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=False),
+        ),
+        optim=SimpleNamespace(Adam8bit=AvailableOptimizer),
+    )
+    monkeypatch.setattr(importlib, "import_module", lambda _: fake_module)
+
+    with pytest.raises(
+        training.OptimizerSetupError,
+        match="CUDA native library",
+    ) as raised:
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            device=torch.device("cuda"),
+        )
+    assert "compatible bitsandbytes binary" in str(raised.value)
+    assert "BNB_CUDA_VERSION" in str(raised.value)
+
+
+def test_bitsandbytes_optimizer_translates_constructor_backend_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch exposing an optional backend's raw constructor exception."""
+
+    class BrokenOptimizer:
+        """Simulate a constructor rejected by the installed backend ABI."""
+
+        def __init__(self, groups: object, **kwargs: object) -> None:
+            raise TypeError("incompatible backend constructor")
+
+    fake_module = SimpleNamespace(
+        __version__="0.49.2",
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=True),
+        ),
+        optim=SimpleNamespace(Adam8bit=BrokenOptimizer),
+    )
+    monkeypatch.setattr(importlib, "import_module", lambda _: fake_module)
+
+    with pytest.raises(
+        training.OptimizerSetupError,
+        match="could not initialize adam8bit",
+    ) as raised:
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            device=torch.device("cuda"),
+        )
+    assert isinstance(raised.value.__cause__, TypeError)
+
+
+def test_bitsandbytes_optimizer_does_not_translate_terminal_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch converting A2V2 terminal failures into recoverable setup errors."""
+
+    terminal = training.DistributedOptimizerStepError("terminal optimizer state")
+
+    class TerminalOptimizer:
+        """Raise an existing A2V2 terminal exception during construction."""
+
+        def __init__(self, groups: object, **kwargs: object) -> None:
+            raise terminal
+
+    fake_module = SimpleNamespace(
+        __version__="0.49.2",
+        cextension=SimpleNamespace(
+            lib=SimpleNamespace(compiled_with_cuda=True),
+        ),
+        optim=SimpleNamespace(Adam8bit=TerminalOptimizer),
+    )
+    monkeypatch.setattr(importlib, "import_module", lambda _: fake_module)
+
+    with pytest.raises(training.DistributedOptimizerStepError) as raised:
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            device=torch.device("cuda"),
+        )
+    assert raised.value is terminal
 
 
 def test_bitsandbytes_extra_uses_the_pinned_compatible_range() -> None:
@@ -393,8 +576,8 @@ def test_cosine_weight_decay_applies_start_midpoint_end_clamp_and_zero_group() -
     assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.02, 0.0])
 
 
-def test_cosine_weight_decay_omitted_end_defaults_to_current_fixed_decay() -> None:
-    """Catch an omitted endpoint that silently changes the established decay."""
+def test_cosine_weight_decay_omitted_end_defaults_to_zero() -> None:
+    """Catch an opt-in cosine schedule that keeps fixed decay without an endpoint."""
 
     model = GroupFixture()
     optimizer = build_optimizer(
@@ -413,8 +596,10 @@ def test_cosine_weight_decay_omitted_end_defaults_to_current_fixed_decay() -> No
     )
 
     assert scheduler is not None
-    assert scheduler.step_update(4) == pytest.approx(0.2)
-    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.2, 0.0])
+    assert scheduler.step_update(2) == pytest.approx(0.1)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.1, 0.0])
+    assert scheduler.step_update(4) == pytest.approx(0.0)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.0, 0.0])
 
 
 @pytest.mark.parametrize(

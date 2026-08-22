@@ -4,6 +4,7 @@ state together."""
 
 from copy import deepcopy
 from dataclasses import replace
+import math
 from pathlib import Path
 from typing import Any
 
@@ -131,7 +132,11 @@ def _adagc_engine() -> tuple[TeacherFixture, TrainingEngine]:
     )
 
 
-def _decay_engine() -> tuple[nn.Linear, TrainingEngine]:
+def _decay_engine(
+    *,
+    max_updates: int = 4,
+    weight_decay_end: float | None = 0.02,
+) -> tuple[nn.Linear, TrainingEngine]:
     """Build a tiny engine with an update-zero cosine decay schedule."""
 
     model = nn.Linear(2, 1)
@@ -148,13 +153,13 @@ def _decay_engine() -> tuple[nn.Linear, TrainingEngine]:
         max_lr=1e-2,
         min_lr=1e-4,
         warmup_updates=1,
-        max_updates=4,
+        max_updates=max_updates,
     )
     decay = training.build_weight_decay_scheduler(
         optimizer,
         schedule="cosine",
-        weight_decay_end=0.02,
-        max_updates=4,
+        weight_decay_end=weight_decay_end,
+        max_updates=max_updates,
     )
     return model, TrainingEngine(
         model,
@@ -369,6 +374,63 @@ def test_cosine_weight_decay_resume_matches_every_next_state_exactly(
     }
 
     _assert_tree_equal(actual, expected)
+
+
+def test_cosine_weight_decay_resume_recomputes_extended_horizon_before_next_update() -> None:
+    """Catch restore that keeps the saved short-horizon decay after extension."""
+
+    torch.manual_seed(83)
+    saved_model, saved_engine = _decay_engine(
+        max_updates=4,
+        weight_decay_end=None,
+    )
+    zero_batch = torch.ones(1, 2)
+    for _ in range(2):
+        saved_engine.step(
+            [zero_batch],
+            lambda value: Result(saved_model(value).sum() * 0.0, value.shape[0]),
+        )
+    checkpoint = saved_engine.checkpoint_payload(
+        stage="pretrain",
+        config={"active": {}},
+    )
+    assert checkpoint["update"] == 2
+    assert checkpoint["optimizer"]["param_groups"][0]["weight_decay"] == pytest.approx(0.1)
+
+    resumed_model, resumed_engine = _decay_engine(
+        max_updates=8,
+        weight_decay_end=None,
+    )
+    resumed_engine.restore(checkpoint)
+    expected_restore_decay = 0.1 * (1 + math.cos(math.pi * 2 / 8))
+    expected_restore_lr = 1e-4 + 0.5 * (1e-2 - 1e-4) * (
+        1 + math.cos(math.pi * 1 / 7)
+    )
+    assert resumed_engine.weight_decay_scheduler is not None
+    assert resumed_engine.weight_decay_scheduler.state_dict() == {"last_update": 2}
+    assert resumed_engine.optimizer.param_groups[0]["weight_decay"] == pytest.approx(
+        expected_restore_decay
+    )
+    assert resumed_engine.optimizer.param_groups[0]["lr"] == pytest.approx(
+        expected_restore_lr
+    )
+
+    weight_before = resumed_model.weight.detach().clone()
+    bias_before = resumed_model.bias.detach().clone()
+    result = resumed_engine.step(
+        [zero_batch],
+        lambda value: Result(resumed_model(value).sum() * 0.0, value.shape[0]),
+    )
+    expected_next_decay = 0.1 * (1 + math.cos(math.pi * 3 / 8))
+
+    torch.testing.assert_close(
+        resumed_model.weight,
+        weight_before * (1 - expected_restore_lr * expected_restore_decay),
+    )
+    assert torch.equal(resumed_model.bias, bias_before)
+    assert result.update == 3
+    assert result.weight_decay == pytest.approx(expected_next_decay)
+    assert resumed_engine.weight_decay_scheduler.state_dict() == {"last_update": 3}
 
 
 def test_cosine_weight_decay_resume_rejects_missing_past_update_zero_state() -> None:

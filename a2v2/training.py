@@ -18,6 +18,7 @@ import io
 import math
 import os
 import random
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,10 @@ class CheckpointError(ValueError):
 
 class DistributedOptimizerStepError(RuntimeError):
     """Mark a distributed engine terminal after any rank's optimizer failure."""
+
+
+class OptimizerSetupError(RuntimeError):
+    """Raised when a selected optional optimizer cannot be initialized safely."""
 
 
 _DISTRIBUTED_OPTIMIZER_FAILURE = (
@@ -746,6 +751,54 @@ class FairseqCompatibleAdam(torch.optim.Optimizer):
         return loss
 
 
+_BITSANDBYTES_VERSION_RANGE = "bitsandbytes>=0.49,<0.50"
+
+
+def _bitsandbytes_optimizer_class(
+    bitsandbytes: object,
+    optimizer_name: str,
+) -> tuple[type[torch.optim.Optimizer], str]:
+    """Validate the optional package and return its selected optimizer class."""
+
+    version = str(getattr(bitsandbytes, "__version__", "unknown"))
+    supported = re.fullmatch(
+        r"0\.49(?:\.\d+)?(?:\.post\d+)?(?:\+[A-Za-z0-9.-]+)?",
+        version,
+    )
+    if supported is None:
+        raise OptimizerSetupError(
+            f"optimizer {optimizer_name} requires {_BITSANDBYTES_VERSION_RANGE}; "
+            f"found bitsandbytes {version}"
+        )
+
+    optim_module = getattr(bitsandbytes, "optim", None)
+    if optim_module is None:
+        raise OptimizerSetupError(
+            f"bitsandbytes {version} does not expose bitsandbytes.optim; "
+            f"reinstall the optional dependency with pip install 'a2v2[bnb]'"
+        )
+    class_name = "Adam8bit" if optimizer_name == "adam8bit" else "AdamW8bit"
+    optimizer_class = getattr(optim_module, class_name, None)
+    if not callable(optimizer_class):
+        raise OptimizerSetupError(
+            f"bitsandbytes {version} does not expose bitsandbytes.optim.{class_name}; "
+            f"reinstall a compatible {_BITSANDBYTES_VERSION_RANGE} build"
+        )
+
+    cextension = getattr(bitsandbytes, "cextension", None)
+    native_library = getattr(cextension, "lib", None)
+    if not bool(getattr(native_library, "compiled_with_cuda", False)):
+        pytorch_cuda = torch.version.cuda or "unknown"
+        raise OptimizerSetupError(
+            f"bitsandbytes {version} did not load a CUDA native library for "
+            f"PyTorch CUDA {pytorch_cuda}; install or build a compatible "
+            "bitsandbytes binary. If another compatible CUDA toolkit is "
+            "installed, set BNB_CUDA_VERSION to its numeric version (for "
+            "example, 130 for CUDA 13.0) before starting A2V2"
+        )
+    return optimizer_class, version
+
+
 def build_optimizer(
     model: nn.Module,
     *,
@@ -807,25 +860,34 @@ def build_optimizer(
         try:
             bitsandbytes = importlib.import_module("bitsandbytes")
         except (ImportError, OSError) as error:
-            raise RuntimeError(
+            raise OptimizerSetupError(
                 f"optimizer {normalized_name} requires bitsandbytes; "
                 "install the optional dependency with pip install 'a2v2[bnb]'"
             ) from error
-        optimizer_class = getattr(
-            bitsandbytes.optim,
-            "Adam8bit" if normalized_name == "adam8bit" else "AdamW8bit",
+        optimizer_class, bitsandbytes_version = _bitsandbytes_optimizer_class(
+            bitsandbytes,
+            normalized_name,
         )
-        optimizer = optimizer_class(
-            groups,
-            lr=learning_rate,
-            betas=betas,
-            eps=eps,
-            min_8bit_size=min_8bit_size,
-        )
+        try:
+            optimizer = optimizer_class(
+                groups,
+                lr=learning_rate,
+                betas=betas,
+                eps=eps,
+                min_8bit_size=min_8bit_size,
+            )
+        except (CheckpointError, DistributedOptimizerStepError, OptimizerSetupError):
+            raise
+        except (ImportError, OSError, AttributeError, RuntimeError, TypeError, ValueError) as error:
+            raise OptimizerSetupError(
+                f"could not initialize {normalized_name} with bitsandbytes "
+                f"{bitsandbytes_version}; check the installed CUDA, PyTorch, "
+                "and bitsandbytes binary compatibility"
+            ) from error
         setattr(
             optimizer,
             "_a2v2_bitsandbytes_version",
-            str(getattr(bitsandbytes, "__version__", "unknown")),
+            bitsandbytes_version,
         )
         return optimizer
     else:
@@ -956,7 +1018,7 @@ class CosineWeightDecayScheduler:
 
         if initial == 0.0:
             return 0.0
-        end = initial if self.weight_decay_end is None else self.weight_decay_end
+        end = 0.0 if self.weight_decay_end is None else self.weight_decay_end
         position = min(update, self.max_updates) / self.max_updates
         return end + 0.5 * (initial - end) * (
             1 + math.cos(math.pi * position)
