@@ -71,6 +71,7 @@ from .training import (
     gather_rank_rng_states,
     load_checkpoint,
     save_checkpoint,
+    sequence_classification_metrics,
 )
 
 
@@ -166,6 +167,8 @@ class TensorBoardLogger:
         labels: Sequence[str] = (),
         frame_scores: Tensor | None = None,
         frame_targets: Tensor | None = None,
+        sequence_scores: Tensor | None = None,
+        sequence_targets: Tensor | None = None,
         segmented_evaluations: Sequence[SegmentedEvaluation] = (),
         metric_threshold: float = 0.5,
     ) -> None:
@@ -177,6 +180,8 @@ class TensorBoardLogger:
                 tag = f"{base}/loss"
             elif name.startswith("segmented_"):
                 tag = f"{base}/segmented/{name.removeprefix('segmented_')}"
+            elif name.startswith("sequence_"):
+                tag = f"{base}/sequence/{name.removeprefix('sequence_')}"
             else:
                 tag = f"{base}/frame/{name}"
             self.writer.add_scalar(tag, value, update)
@@ -226,6 +231,55 @@ class TensorBoardLogger:
                 )
                 self.writer.add_scalar(
                     f"{base}/frame/f1/{safe_label}",
+                    counts.f1,
+                    update,
+                )
+
+        if sequence_scores is not None and sequence_targets is not None:
+            scores = sequence_scores.detach().float().cpu()
+            targets = sequence_targets.detach().long().cpu()
+            if scores.shape != targets.shape or scores.ndim != 2:
+                raise ValueError(
+                    "TensorBoard sequence scores and targets must share [examples, labels] shape"
+                )
+            if scores.shape[1] != len(labels):
+                raise ValueError("TensorBoard labels must match sequence score columns")
+            self.writer.add_pr_curve(
+                f"{base}/sequence/pr_micro",
+                targets.reshape(-1),
+                scores.reshape(-1),
+                global_step=update,
+            )
+            predictions = scores >= metric_threshold
+            for index, label in enumerate(labels):
+                safe_label = _tensorboard_label(label)
+                self.writer.add_pr_curve(
+                    f"{base}/sequence/pr/{safe_label}",
+                    targets[:, index],
+                    scores[:, index],
+                    global_step=update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/sequence/average_precision/{safe_label}",
+                    average_precision(scores[:, index], targets[:, index]),
+                    update,
+                )
+                counts = FrameCounts.from_predictions(
+                    predictions[:, index],
+                    targets[:, index].bool(),
+                )
+                self.writer.add_scalar(
+                    f"{base}/sequence/precision/{safe_label}",
+                    counts.precision,
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/sequence/recall/{safe_label}",
+                    counts.recall,
+                    update,
+                )
+                self.writer.add_scalar(
+                    f"{base}/sequence/f1/{safe_label}",
                     counts.f1,
                     update,
                 )
@@ -816,6 +870,11 @@ class InferenceRunner:
             raise CheckpointError("fine-tuning checkpoint lacks active/pretrained native configs")
         self.config = config_from_serialized_dict(stored_config["active"])
         self.pretrained_config = config_from_serialized_dict(stored_config["pretrained"])
+        if self.config.model.classification_head != "frame":
+            raise CheckpointError(
+                "event inference requires model.classification_head=frame; "
+                f"received {self.config.model.classification_head} sequence classification checkpoint"
+            )
         self.model = Animal2VecFineTuningModel.from_config(
             self.config, pretrained_config=self.pretrained_config
         ).to(self.device)
@@ -873,6 +932,8 @@ class InferenceRunner:
             probabilities = torch.sigmoid(output.logits[0]).cpu()
             layer_count = min(self.config.model.average_top_k_layers, len(output.layer_outputs))
             embeddings = torch.stack(output.layer_outputs[-layer_count:]).mean(dim=0)[0].cpu()
+            if self.model.encoder.use_cls_token:
+                embeddings = embeddings[1:]
             # Mathematics: local frame centers receive absolute offset
             # start/f_target before segments are concatenated.
             # Interpretation: splitting for memory does not reset time to zero
@@ -1576,6 +1637,10 @@ def _validate(
     score_parts: list[Tensor] = []
     target_parts: list[Tensor] = []
     segmented_evaluations: list[SegmentedEvaluation] = []
+    sequence_mode = (
+        config.stage == "finetune"
+        and config.model.classification_head == "cls"
+    )
     try:
         for cpu_batch in loader:
             batch = _move_batch(cpu_batch, device)
@@ -1608,6 +1673,12 @@ def _validate(
                 targets = output.targets
                 if targets is None:
                     raise ValueError("fine-tuning validation did not return targets")
+                if sequence_mode:
+                    cpu_scores = scores.detach().float().cpu()
+                    cpu_targets = targets.detach().float().cpu()
+                    score_parts.append(cpu_scores)
+                    target_parts.append(cpu_targets)
+                    continue
                 for sample_index in range(scores.shape[0]):
                     if output.padding_mask is None:
                         valid_frames = torch.ones(
@@ -1672,52 +1743,69 @@ def _validate(
 
     metrics = {"loss": total_loss / max(total_sample_size, 1)}
     if config.stage == "finetune":
-        frame_scores = torch.cat(score_parts) if score_parts else torch.empty(
+        collected_scores = torch.cat(score_parts) if score_parts else torch.empty(
             0, len(config.task.unique_labels)
         )
-        frame_targets = torch.cat(target_parts) if target_parts else torch.empty_like(
-            frame_scores
+        collected_targets = torch.cat(target_parts) if target_parts else torch.empty_like(
+            collected_scores
         )
-        metrics.update({
-            "precision": counts.precision,
-            "recall": counts.recall,
-            "f1": counts.f1,
-            "accuracy": counts.accuracy,
-            "average_precision": average_precision(
-                frame_scores.reshape(-1), frame_targets.reshape(-1)
-            ) if score_parts else 0.0,
-        })
-        segmented = aggregate_segmented_metrics(
-            segmented_evaluations,
-            config.task.unique_labels,
-            metric_threshold=config.criterion.metric_threshold,
-        )
-        metrics.update({
-            "segmented_precision": segmented.precision,
-            "segmented_recall": segmented.recall,
-            "segmented_f1": segmented.f1,
-            "segmented_accuracy": segmented.accuracy,
-            "segmented_average_precision": segmented.macro_average_precision,
-            "segmented_micro_average_precision": segmented.micro_average_precision,
-        })
-        if segmented.focal_threshold is not None:
+        if sequence_mode:
+            metrics.update(sequence_classification_metrics(
+                collected_scores,
+                collected_targets,
+                threshold=config.criterion.metric_threshold,
+            ))
+            if tensorboard_logger is not None:
+                tensorboard_logger.log_validation(
+                    metrics,
+                    update=update,
+                    subset=config.dataset.valid_subset,
+                    labels=config.task.unique_labels,
+                    sequence_scores=collected_scores,
+                    sequence_targets=collected_targets,
+                    metric_threshold=config.criterion.metric_threshold,
+                )
+        else:
             metrics.update({
-                "segmented_focal_threshold": segmented.focal_threshold,
-                "segmented_focal_f1": segmented.focal_f1 or 0.0,
-                "segmented_focal_precision": segmented.focal_precision or 0.0,
-                "segmented_focal_recall": segmented.focal_recall or 0.0,
+                "precision": counts.precision,
+                "recall": counts.recall,
+                "f1": counts.f1,
+                "accuracy": counts.accuracy,
+                "average_precision": average_precision(
+                    collected_scores.reshape(-1), collected_targets.reshape(-1)
+                ) if score_parts else 0.0,
             })
-        if tensorboard_logger is not None:
-            tensorboard_logger.log_validation(
-                metrics,
-                update=update,
-                subset=config.dataset.valid_subset,
-                labels=config.task.unique_labels,
-                frame_scores=frame_scores,
-                frame_targets=frame_targets,
-                segmented_evaluations=segmented_evaluations,
+            segmented = aggregate_segmented_metrics(
+                segmented_evaluations,
+                config.task.unique_labels,
                 metric_threshold=config.criterion.metric_threshold,
             )
+            metrics.update({
+                "segmented_precision": segmented.precision,
+                "segmented_recall": segmented.recall,
+                "segmented_f1": segmented.f1,
+                "segmented_accuracy": segmented.accuracy,
+                "segmented_average_precision": segmented.macro_average_precision,
+                "segmented_micro_average_precision": segmented.micro_average_precision,
+            })
+            if segmented.focal_threshold is not None:
+                metrics.update({
+                    "segmented_focal_threshold": segmented.focal_threshold,
+                    "segmented_focal_f1": segmented.focal_f1 or 0.0,
+                    "segmented_focal_precision": segmented.focal_precision or 0.0,
+                    "segmented_focal_recall": segmented.focal_recall or 0.0,
+                })
+            if tensorboard_logger is not None:
+                tensorboard_logger.log_validation(
+                    metrics,
+                    update=update,
+                    subset=config.dataset.valid_subset,
+                    labels=config.task.unique_labels,
+                    frame_scores=collected_scores,
+                    frame_targets=collected_targets,
+                    segmented_evaluations=segmented_evaluations,
+                    metric_threshold=config.criterion.metric_threshold,
+                )
     elif tensorboard_logger is not None:
         tensorboard_logger.log_validation(
             metrics,

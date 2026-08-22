@@ -2411,9 +2411,24 @@ def mix_targets(
     return result
 
 
+def sequence_targets(targets: Tensor, padding_mask: Tensor | None = None) -> Tensor:
+    """Reduce frame labels to padding-aware recording-level occurrences."""
+
+    if targets.ndim != 3:
+        raise ValueError("sequence targets require [batch, frames, classes] labels")
+    if padding_mask is not None:
+        if padding_mask.shape != targets.shape[:2]:
+            raise ValueError("target padding mask must match the batch and frame axes")
+        targets = targets.masked_fill(padding_mask.bool().unsqueeze(-1), 0)
+    # Mathematics: y_bc=max_{t not padded} y_btc.
+    # Interpretation: a class is present for the recording if it occurs in any
+    # real frame; annotations belonging only to batch padding are ignored.
+    return targets.amax(dim=1)
+
+
 @dataclass(frozen=True)
 class FineTuningOutput:
-    """Frame logits, optional loss, and encoder intermediates for one batch."""
+    """Frame or sequence logits, loss, and encoder intermediates for one batch."""
 
     logits: Tensor
     padding_mask: Tensor | None
@@ -2424,7 +2439,7 @@ class FineTuningOutput:
 
 
 class Animal2VecFineTuningModel(nn.Module):
-    """Framewise classifier built on a converted pretrained encoder.
+    """Framewise or CLS classifier built on a converted pretrained encoder.
 
     The pretrained recipe remains the authority for encoder architecture. The
     fine-tuning recipe supplies dropout, masking, mixup, freezing, labels, and
@@ -2444,6 +2459,11 @@ class Animal2VecFineTuningModel(nn.Module):
             raise ValueError("fine-tuning and pretraining sample rates differ")
         if config.task.conv_feature_layers != pretrained_config.task.conv_feature_layers:
             raise ValueError("fine-tuning and pretraining convolution specifications differ")
+        if config.model.classification_head == "cls" and not pretrained_config.model.use_cls_token:
+            raise ValueError(
+                "model.classification_head=cls requires a pretrained encoder "
+                "built with model.use_cls_token=true"
+            )
         self.config = config
         self.pretrained_config = pretrained_config
         fine_model = config.model
@@ -2581,11 +2601,14 @@ class Animal2VecFineTuningModel(nn.Module):
         sample_ids: Tensor | None = None,
         update: int = 0,
     ) -> FineTuningOutput:
-        """Produce frame logits and, when targets are supplied, focal loss."""
+        """Produce configured logits and, when targets are supplied, focal loss."""
 
         cfg = self.config
         if sample_ids is None:
             sample_ids = torch.arange(waveform.shape[0], device=waveform.device)
+        if target is not None and cfg.model.classification_head == "cls":
+            target_padding = self.encoder.convert_padding_mask(target, padding_mask)
+            target = sequence_targets(target, target_padding)
         if self.training and cfg.model.source_mixup >= 0 and cfg.model.mixup_prob > 0:
             mixed = mix_waveforms(
                 waveform,
@@ -2623,16 +2646,33 @@ class Animal2VecFineTuningModel(nn.Module):
         # Interpretation: the classifier combines several semantic depths,
         # mirroring the top-layer averaging used for pretraining targets.
         features = torch.stack(encoded.layer_outputs[-layer_count:]).mean(dim=0)
+        output_padding = encoded.padding_mask
+        if cfg.model.classification_head == "cls":
+            features = features[:, 0]
+            output_padding = None
+        elif self.encoder.use_cls_token:
+            features = features[:, 1:]
+            if output_padding is not None:
+                output_padding = output_padding[:, 1:]
         logits = self.classifier(self.final_dropout(features))
         loss = self.focal_loss(logits, target) if target is not None else None
-        # Mathematics: sample_size=B×T counts frame tokens; the class dimension
-        # stays inside the summed focal loss and is not counted again.
-        # Interpretation: gradient normalization remains compatible with the
-        # archived criterion across different label vocabularies.
-        sample_size = target.shape[0] * target.shape[1] if target is not None else logits.shape[0] * logits.shape[1]
+        if cfg.model.classification_head == "cls":
+            # Mathematics: sequence loss sums B×C decisions but normalizes by B.
+            # Interpretation: each recording contributes one classification
+            # example regardless of its duration or label-vocabulary size.
+            sample_size = logits.shape[0]
+        else:
+            # Mathematics: sample_size=B×T counts frame tokens; the class
+            # dimension stays inside the summed focal loss and is not counted.
+            # Interpretation: the default retains archived loss normalization.
+            sample_size = (
+                target.shape[0] * target.shape[1]
+                if target is not None
+                else logits.shape[0] * logits.shape[1]
+            )
         return FineTuningOutput(
             logits=logits,
-            padding_mask=encoded.padding_mask,
+            padding_mask=output_padding,
             layer_outputs=encoded.layer_outputs,
             targets=target,
             loss=loss,

@@ -3,6 +3,7 @@ cover resampling, chunk timing, partial segments, event limits, and TSV label ou
 
 from pathlib import Path
 
+import pytest
 import soundfile
 import torch
 
@@ -16,7 +17,7 @@ from a2v2.workflows import (
     infer_main,
 )
 from a2v2.model import Animal2VecFineTuningModel
-from a2v2.training import capture_rng_state, save_checkpoint
+from a2v2.training import CheckpointError, capture_rng_state, save_checkpoint
 
 
 ROOT = Path(__file__).parents[2]
@@ -76,6 +77,75 @@ def _checkpoint(tmp_path: Path) -> Path:
         "best_metric": None,
     })
     return path
+
+
+def _cls_checkpoint(tmp_path: Path, classification_head: str = "cls") -> Path:
+    """Create a CLS-encoder checkpoint with the requested classification head."""
+
+    pretrain = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.use_cls_token=true",),
+    )
+    finetune = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=(
+            "model.use_cls_token=true",
+            f"model.classification_head={classification_head}",
+        ),
+    )
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+    )
+    path = tmp_path / f"{classification_head}.pt"
+    save_checkpoint(path, {
+        "format_version": 1,
+        "stage": "finetune",
+        "config": {
+            "active": config_to_dict(finetune),
+            "pretrained": config_to_dict(pretrain),
+        },
+        "model": model.state_dict(),
+        "teacher": None,
+        "optimizer": None,
+        "scheduler": None,
+        "scaler": None,
+        "update": 2,
+        "epoch": 1,
+        "batch_in_epoch": 0,
+        "rng_state": capture_rng_state(),
+        "sampler_state": None,
+        "best_metric": None,
+    })
+    return path
+
+
+def test_event_inference_rejects_cls_sequence_checkpoint(tmp_path: Path) -> None:
+    """Do not reinterpret clip logits as framewise event probabilities."""
+
+    with pytest.raises(
+        CheckpointError,
+        match=r"event inference.*classification_head=frame.*cls",
+    ):
+        InferenceRunner(_cls_checkpoint(tmp_path), device=torch.device("cpu"))
+
+
+def test_event_inference_strips_cls_from_frame_embeddings(tmp_path: Path) -> None:
+    """Keep frame probabilities, embeddings, and timestamps aligned with CLS."""
+
+    runner = InferenceRunner(
+        _cls_checkpoint(tmp_path, "frame"),
+        device=torch.device("cpu"),
+    )
+
+    result = runner.run_tensor(
+        torch.randn(64),
+        8_000,
+        segment_seconds=1.0,
+    )
+
+    assert len(result.probabilities) == len(result.embeddings)
+    assert len(result.probabilities) == len(result.timestamps)
 
 
 def test_chunked_resampled_inference_preserves_final_segment_timing(tmp_path: Path) -> None:

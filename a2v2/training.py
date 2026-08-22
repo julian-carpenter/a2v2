@@ -612,6 +612,26 @@ def average_precision(scores: Tensor, targets: Tensor) -> float:
     return float(-(torch.diff(decreasing_recall) * precision.flip(0)).sum())
 
 
+def sequence_classification_metrics(
+    scores: Tensor,
+    targets: Tensor,
+    *,
+    threshold: float,
+) -> dict[str, float]:
+    """Measure flattened recording-class decisions for multilabel validation."""
+
+    if scores.ndim != 2 or targets.shape != scores.shape:
+        raise ValueError("sequence scores and targets must share [batch, classes] shape")
+    counts = FrameCounts.from_predictions(scores >= threshold, targets >= 0.5)
+    return {
+        "sequence_precision": counts.precision,
+        "sequence_recall": counts.recall,
+        "sequence_f1": counts.f1,
+        "sequence_accuracy": counts.accuracy,
+        "sequence_average_precision": average_precision(scores, targets),
+    }
+
+
 # =============================================================================
 # UPDATE-BASED TRAINING ENGINE
 # =============================================================================
