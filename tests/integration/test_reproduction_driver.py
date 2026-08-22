@@ -533,13 +533,49 @@ def test_reproduction_driver_retains_frozen_local_command_graph(tmp_path: Path) 
         for line in completed.stdout.splitlines()
         if line.startswith("Launching:") and "a2v2-train" in line
     ]
-    assert len(launches) == 3
-    assert "a2v_large_pretrain_best.yaml" in launches[0]
-    assert "--stop-at-update 1" in launches[0]
-    assert "a2v_large_pretrain_best.yaml" in launches[1]
-    assert f"--resume {output / 'pretrain/checkpoint_last.pt'}" in launches[1]
-    assert "finetune_mixup_100.yaml" in launches[2]
-    assert f"--pretrained-checkpoint {output / 'pretrain/checkpoint_last.pt'}" in launches[2]
+    assert launches == [
+        " ".join((
+            "Launching: env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7",
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+            "OMP_NUM_THREADS=8 python -m torch.distributed.run --standalone",
+            "--nproc-per-node=8 a2v2-train",
+            f"--config {ROOT / 'configs/MeerKAT/a2v_large_pretrain_best.yaml'}",
+            f"--override task.data={manifests}",
+            f"--override checkpoint.save_dir={output / 'pretrain'}",
+            "--override distributed_training.distributed_world_size=8",
+            "--override dataset.max_tokens=408000",
+            "--override optimization.update_freq=[3] --device cuda --stop-at-update 1",
+        )),
+        " ".join((
+            "Launching: env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7",
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+            "OMP_NUM_THREADS=8 python -m torch.distributed.run --standalone",
+            "--nproc-per-node=8 a2v2-train",
+            f"--config {ROOT / 'configs/MeerKAT/a2v_large_pretrain_best.yaml'}",
+            f"--override task.data={manifests}",
+            f"--override checkpoint.save_dir={output / 'pretrain'}",
+            "--override distributed_training.distributed_world_size=8",
+            "--override dataset.max_tokens=408000",
+            "--override optimization.update_freq=[3] --device cuda",
+            f"--resume {output / 'pretrain/checkpoint_last.pt'}",
+        )),
+        " ".join((
+            "Launching: env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7",
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+            "OMP_NUM_THREADS=8 python -m torch.distributed.run --standalone",
+            "--nproc-per-node=8 a2v2-train",
+            f"--config {ROOT / 'configs/MeerKAT/finetune_mixup_100.yaml'}",
+            f"--pretrained-checkpoint {output / 'pretrain/checkpoint_last.pt'}",
+            f"--override task.data={manifests}",
+            "--override dataset.train_subset=train_0",
+            "--override dataset.valid_subset=valid_0",
+            f"--override checkpoint.save_dir={output / 'finetune'}",
+            "--override distributed_training.distributed_world_size=8",
+            "--override dataset.max_tokens=960000",
+            "--override optimization.update_freq=[2]",
+            "--override model.checkpoint_activations=true --device cuda",
+        )),
+    ]
 
 
 def test_dry_run_enables_activation_checkpointing_only_for_finetuning(
