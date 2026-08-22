@@ -306,3 +306,193 @@ Both exited successfully without diagnostic output.
   tasks.
 - No unresolved Task 9 correctness blocker remains within locally testable
   scope.
+
+## Fix Round 1
+
+### Review findings and root cause
+
+Independent review found that the initial distributed writer had multiple
+exception boundaries between collectives. A rank-local payload or RNG
+serialization failure could send that rank to the preemption success
+`all_reduce` while peers remained in `gather_object`; rank-zero RNG decode could
+skip the later topology gather; and a rank-zero periodic/final save failure had
+no outcome broadcast, so peers could continue toward a terminal barrier. The
+initial post-write `MIN` description above is therefore superseded by the
+staged protocol in this fix round.
+
+Shared-output visibility also remained a rank-local decision after the creation
+barrier. Finally, RNG restore validated types up front but installed Python and
+NumPy state before Torch/CUDA state setters had proved their payloads valid.
+
+### Distributed checkpoint and visibility RED
+
+The real two-process Gloo harness gained bounded process-group timeouts and
+rank-specific failure injection. A nonzero payload-preparation exception first
+demonstrated the mismatched payload-gather/preemption-all-reduce path:
+
+```text
+rtk python -m pytest -q tests/integration/test_slurm_launcher.py::test_two_rank_gloo_preemption_checkpoint_failures_are_common[prepare]
+1 failed in 23.62s
+rank 0: connection closed in preemption all_reduce
+rank 1: timed out in preemption all_reduce while its peer had entered gather_object
+```
+
+Corrupt rank-one RNG bytes then demonstrated rank zero leaving before the
+topology gather:
+
+```text
+rtk python -m pytest -q tests/integration/test_slurm_launcher.py::test_two_rank_gloo_preemption_checkpoint_failures_are_common[merge]
+1 failed in 24.27s
+rank 0/1: mismatched-collective timeout/connection closure
+```
+
+Writer and visibility coverage was added in the same test-first cycle:
+
+```text
+rtk python -m pytest -q tests/integration/test_slurm_launcher.py::test_two_rank_gloo_preemption_checkpoint_failures_are_common[write] tests/integration/test_slurm_launcher.py::test_two_rank_gloo_ordinary_writer_failure_is_common tests/integration/test_slurm_launcher.py::test_two_rank_gloo_output_visibility_failure_is_common
+2 failed, 1 passed in 36.27s
+```
+
+The existing preemption wrapper happened to synchronize a rank-zero write
+failure, so that case passed. The ordinary writer failed RED with rank zero
+raising the injected `OSError` while rank one continued, and visibility failed
+RED with rank zero reporting success while only rank one reported the missing
+directory.
+
+### Staged checkpoint protocol and failure matrix
+
+Every distributed checkpoint call, including periodic, epoch, best, final, and
+preemption saves, now uses one protocol:
+
+1. Each rank builds its engine payload, serializes its local RNG, and prepares
+   JSON-safe topology inside a local `try` block.
+2. All ranks `all_gather_object` readiness/error records. Any local failure
+   becomes the same deterministic `CheckpointError` on every rank before state
+   gathering starts.
+3. Ready ranks enter one symmetric `gather_object` carrying both encoded RNG and
+   topology. Combining them removes the decode-between-gathers hazard.
+4. Rank zero alone validates/merges every bundle, decodes RNG, builds the two
+   tagged schemas, validates the complete v2 payload, serializes it, and performs
+   the atomic write.
+5. Rank zero broadcasts its sole writer outcome. Every rank either returns from
+   the writer on common success or raises the same error. Only common success may
+   reach the preemption barrier/log flush/exit 75 or an ordinary later barrier.
+
+Protocol collectives are deliberately outside local and writer exception
+handlers. Collective transport failure or process death therefore remains
+launcher-fatal rather than attempting another collective on a damaged group.
+
+| Injected boundary | Common result | Checkpoint/requeue result |
+| --- | --- | --- |
+| Rank-one payload preparation | Preparation error naming rank one on both ranks | No state gather, file, flush, or requeue exit |
+| Rank-one corrupt RNG / rank-zero decode | Merge error broadcast from rank zero | No file, flush, or requeue exit |
+| Rank-zero preemption save | Write error broadcast from rank zero | No valid file, flush, or requeue exit |
+| Rank-zero ordinary save | Write error broadcast from rank zero | No peer continues toward the terminal barrier |
+| Rank-one output invisibility | Missing rank/hostname list on both ranks | No rank enters training |
+
+Output creation/lock acquisition still belongs only to global rank zero. After
+its creation-status broadcast and barrier, every rank reports `(rank, hostname,
+visible)` through a common gather. Missing or malformed reports produce the same
+actionable list on every rank.
+
+Final Gloo GREEN for the happy path plus all five failures:
+
+```text
+rtk python -m pytest -q tests/integration/test_slurm_launcher.py
+6 passed in 72.15s
+```
+
+The happy case retains exactly one writer, tagged RNG/topology round trip,
+completed update one, synchronized flush, and exit 75 on both ranks.
+
+### Atomic RNG restore RED/GREEN
+
+Mutation sentinels capture Python, NumPy, and CPU Torch globals, then corrupt a
+later NumPy field, CPU Torch byte state, or CUDA byte state. The first invocation
+had a test-only missing `random` import (`3 failed`); after correcting that
+setup, behavior-level RED was:
+
+```text
+rtk python -m pytest -q tests/unit/test_slurm.py::test_rng_restore_validates_every_late_state_before_mutating_any_generator
+3 failed in 5.78s
+```
+
+The malformed NumPy value raised raw `ValueError` after Python installation;
+the malformed Torch bytes raised raw `RuntimeError` after Python and NumPy
+installation; and malformed CUDA bytes reached the global CUDA installer after
+all CPU generators changed.
+
+Restore now performs a complete validation phase with isolated instances:
+
+- `random.Random().setstate` validates Python state;
+- an independent `numpy.random.RandomState` validates the fully converted NumPy
+  tuple and key array;
+- an independent CPU `torch.Generator` validates cloned CPU bytes; and
+- one independent CUDA `torch.Generator` per locally visible device validates
+  cloned rank-local CUDA bytes.
+
+Only after every probe succeeds are Python, NumPy, CPU Torch, and CUDA global
+states installed in that order. Malformed payloads are normalized to
+`CheckpointError` and leave all earlier globals exact.
+
+```text
+rtk python -m pytest -q tests/unit/test_slurm.py::test_rng_restore_validates_every_late_state_before_mutating_any_generator
+3 passed in 6.09s
+
+rtk python -m pytest -q tests/unit/test_slurm.py tests/unit/test_checkpoint.py tests/unit/test_documentation.py tests/unit/test_repository_layout.py
+67 passed in 7.94s
+```
+
+An older CUDA-cardinality test used one-byte placeholder states. Its CUDA
+generator dependency was corrected to accept those fixtures so that the test
+continues to isolate its intended local-visible-device versus global-world-size
+contract; malformed-byte behavior is now covered separately.
+
+### Fix Round 1 final verification
+
+Task 6 optimizer transaction, terminal-engine, checkpoint, and exact local
+resume focus:
+
+```text
+rtk python -m pytest -q tests/unit/test_optim.py tests/unit/test_engine.py tests/integration/test_resume.py
+94 passed in 7.22s
+```
+
+Complete CPU regression, including ordinary non-SLURM paths and all six Gloo
+subprocess cases:
+
+```text
+rtk python -m pytest -q tests/unit tests/integration
+458 passed, 8 warnings in 100.94s
+```
+
+The warnings remain the existing multiworker `fork()` deprecations.
+
+Bounded two-GPU NCCL collective/topology/RNG validation:
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_probe.py --output-dir /tmp/a2v2-task9-fix1-nccl-probe.VlS7BI
+exit 0; both ranks pass/rank_rng_restore_exact/topology_ok=true
+```
+
+Bounded two-GPU exact resume:
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task9-fix1-nccl-resume.L4ZIgF
+exit 0; both ranks local_exact/all_ranks_exact/all_ranks_adagc_state/topology_ok=true
+```
+
+Both CUDA harnesses retained schemas `a2v2.rng.rank-local.v1` and
+`a2v2.topology.v1`. The AdaGC digest remains
+`6ad554301ec6f72fafa49579394ac4803ae90f438a679f94728102ef79afc012`.
+
+`rtk python -m compileall -q a2v2 tests` and `rtk git diff --check`
+both exited cleanly before the report append and are rerun on the final staged
+diff before commit.
+
+The real multi-node SLURM/shared-filesystem/scheduler-preemption gate remains
+unrun on this node. Fix Round 1 does not change that site-dependent concern. No
+job longer than the bounded local CPU/CUDA gates was launched.
+
+This appendix is included in the Fix Round 1 commit; its exact hash and clean
+post-commit status are recorded in the parent handoff.

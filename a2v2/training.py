@@ -184,45 +184,87 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
     missing = sorted(required - set(state))
     if missing:
         raise CheckpointError(f"RNG state is missing required keys: {missing}")
+
+    python_state = state["python"]
+    try:
+        python_probe = random.Random()
+        python_probe.setstate(python_state)  # type: ignore[arg-type]
+    except Exception as error:
+        raise CheckpointError(f"invalid python RNG state: {error}") from error
+
     numpy_state = state["numpy"]
     if not isinstance(numpy_state, Mapping):
-        raise CheckpointError("invalid NumPy RNG state")
+        raise CheckpointError("invalid numpy RNG state")
+    numpy_required = {
+        "algorithm",
+        "keys",
+        "position",
+        "has_gauss",
+        "cached_gaussian",
+    }
+    numpy_missing = sorted(numpy_required - set(numpy_state))
+    if numpy_missing:
+        raise CheckpointError(
+            f"invalid numpy RNG state; missing keys: {numpy_missing}"
+        )
     keys = numpy_state.get("keys")
     if not isinstance(keys, torch.Tensor):
-        raise CheckpointError("invalid NumPy RNG key array")
+        raise CheckpointError("invalid numpy RNG key array")
+    try:
+        validated_numpy_state = (
+            str(numpy_state["algorithm"]),
+            keys.cpu().numpy().astype(np.uint32, copy=True),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+        numpy_probe = np.random.RandomState()
+        numpy_probe.set_state(validated_numpy_state)
+    except Exception as error:
+        raise CheckpointError(f"invalid numpy RNG state: {error}") from error
+
     torch_state = state["torch"]
     if not isinstance(torch_state, torch.Tensor):
-        raise CheckpointError("invalid PyTorch RNG state")
+        raise CheckpointError("invalid torch RNG state")
+    try:
+        validated_torch_state = torch_state.cpu().clone()
+        torch_probe = torch.Generator(device="cpu")
+        torch_probe.set_state(validated_torch_state)
+    except Exception as error:
+        raise CheckpointError(f"invalid torch RNG state: {error}") from error
+
     cuda_states: list[Tensor] | None = None
     if torch.cuda.is_available() and "cuda" in state:
         raw_cuda_states = state["cuda"]
         if not isinstance(raw_cuda_states, (list, tuple)) or not all(
             isinstance(item, torch.Tensor) for item in raw_cuda_states
         ):
-            raise CheckpointError("invalid CUDA RNG state")
+            raise CheckpointError("invalid cuda RNG state")
         visible_devices = torch.cuda.device_count()
         if len(raw_cuda_states) != visible_devices:
             raise CheckpointError(
                 f"checkpoint has {len(raw_cuda_states)} CUDA RNG states but the "
                 f"local rank has {visible_devices} visible CUDA devices"
             )
-        cuda_states = [item.cpu() for item in raw_cuda_states]
+        cuda_states = [item.cpu().clone() for item in raw_cuda_states]
+        try:
+            for device_index, cuda_state in enumerate(cuda_states):
+                cuda_probe = torch.Generator(
+                    device=torch.device("cuda", device_index)
+                )
+                cuda_probe.set_state(cuda_state)
+        except Exception as error:
+            raise CheckpointError(f"invalid cuda RNG state: {error}") from error
     # Mathematics: restoring generator state places every pseudorandom stream
     # at the exact point immediately after the checkpointed transition.
     # Interpretation: the next mask, crop, layer drop, and shuffle matches the
     # uninterrupted run rather than merely sharing its initial seed.
-    random.setstate(state["python"])  # type: ignore[arg-type]
-    np.random.set_state((
-        str(numpy_state["algorithm"]),
-        keys.cpu().numpy().astype(np.uint32, copy=False),
-        int(numpy_state["position"]),
-        int(numpy_state["has_gauss"]),
-        float(numpy_state["cached_gaussian"]),
-    ))
+    random.setstate(python_state)  # type: ignore[arg-type]
+    np.random.set_state(validated_numpy_state)
     # A checkpoint loaded with map_location="cuda" moves every tensor,
     # including generator states, onto CUDA. Generator state setters require
     # CPU byte tensors even when restoring a CUDA generator.
-    torch.random.set_rng_state(torch_state.cpu())
+    torch.random.set_rng_state(validated_torch_state)
     if cuda_states is not None:
         torch.cuda.set_rng_state_all(cuda_states)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import random
 import signal
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -11,6 +12,7 @@ from pathlib import Path
 from threading import Event, Thread, current_thread
 
 import pytest
+import numpy as np
 import torch
 
 
@@ -730,6 +732,88 @@ def test_rank_local_rng_schema_round_trips_the_selected_global_rank(
     assert torch.equal(torch.rand(4), expected)
 
 
+def _global_rng_snapshot() -> tuple[object, tuple[object, ...], torch.Tensor]:
+    """Capture Python, NumPy, and CPU Torch generators for mutation assertions."""
+
+    return (
+        random.getstate(),
+        np.random.get_state(),
+        torch.random.get_rng_state().clone(),
+    )
+
+
+def _assert_global_rng_snapshot(
+    expected: tuple[object, tuple[object, ...], torch.Tensor],
+) -> None:
+    """Assert every CPU-global generator still matches a prior snapshot."""
+
+    expected_python, expected_numpy, expected_torch = expected
+    assert random.getstate() == expected_python
+    actual_numpy = np.random.get_state()
+    assert actual_numpy[0] == expected_numpy[0]
+    assert np.array_equal(actual_numpy[1], expected_numpy[1])
+    assert actual_numpy[2:] == expected_numpy[2:]
+    assert torch.equal(torch.random.get_rng_state(), expected_torch)
+
+
+@pytest.mark.parametrize("malformed_field", ["numpy", "torch", "cuda"])
+def test_rng_restore_validates_every_late_state_before_mutating_any_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_field: str,
+) -> None:
+    """Catch malformed late RNG fields leaving earlier global streams changed."""
+
+    import a2v2.training as training
+
+    random.seed(707)
+    np.random.seed(808)
+    torch.manual_seed(909)
+    state = deepcopy(training.capture_rng_state())
+    random.seed(1707)
+    np.random.seed(1808)
+    torch.manual_seed(1909)
+    before = _global_rng_snapshot()
+
+    if malformed_field == "numpy":
+        state["numpy"]["position"] = "not-an-integer"
+    elif malformed_field == "torch":
+        state["torch"] = torch.tensor([1], dtype=torch.uint8)
+    else:
+        state["cuda"] = [torch.tensor([1], dtype=torch.uint8)]
+        original_generator = torch.Generator
+
+        class InvalidCudaProbe:
+            """Model an isolated CUDA generator that rejects malformed bytes."""
+
+            def set_state(self, _: torch.Tensor) -> None:
+                """Reject the deliberately truncated CUDA generator state."""
+
+                raise RuntimeError("CUDA RNG state is wrong size")
+
+        def generator(*args: object, **kwargs: object) -> object:
+            """Keep CPU probes real and isolate the unavailable CUDA dependency."""
+
+            device = kwargs.get("device", args[0] if args else "cpu")
+            if str(device).startswith("cuda"):
+                return InvalidCudaProbe()
+            return original_generator(*args, **kwargs)
+
+        def unsafe_global_cuda_install(_: object) -> None:
+            """Expose any attempt to install before isolated validation."""
+
+            raise RuntimeError("global CUDA install received malformed state")
+
+        monkeypatch.setattr(torch, "Generator", generator)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(torch.cuda, "set_rng_state_all", unsafe_global_cuda_install)
+
+    with pytest.raises(training.CheckpointError, match=f"invalid {malformed_field}"):
+        training.restore_rng_state(state)
+
+    _assert_global_rng_snapshot(before)
+
+
 def test_cuda_rng_preflight_compares_local_states_to_visible_devices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -749,6 +833,22 @@ def test_cuda_rng_preflight_compares_local_states_to_visible_devices(
         "by_rank": [deepcopy(local_state) for _ in range(8)],
     }
     restored: list[list[torch.Tensor]] = []
+    original_generator = torch.Generator
+
+    class ValidCudaProbe:
+        """Accept bytes after this test has established local cardinality."""
+
+        def set_state(self, _: torch.Tensor) -> None:
+            """Model successful isolated CUDA state validation."""
+
+    def generator(*args: object, **kwargs: object) -> object:
+        """Keep the CPU probe real while replacing unavailable CUDA probes."""
+
+        device = kwargs.get("device", args[0] if args else "cpu")
+        if str(device).startswith("cuda"):
+            return ValidCudaProbe()
+        return original_generator(*args, **kwargs)
+
     monkeypatch.setattr(training.dist, "is_available", lambda: True)
     monkeypatch.setattr(training.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(training.dist, "get_world_size", lambda: 8)
@@ -756,6 +856,7 @@ def test_cuda_rng_preflight_compares_local_states_to_visible_devices(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
     monkeypatch.setattr(torch.cuda, "set_rng_state_all", restored.append)
+    monkeypatch.setattr(torch, "Generator", generator)
 
     training.restore_rng_state(ranked)
 

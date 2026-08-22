@@ -73,7 +73,6 @@ from .slurm import (
     TrainingPreempted,
     build_topology_state,
     coordinated_preemption_requested,
-    gather_rank_topologies,
     install_preemption_handlers,
     validate_resume_topology,
     validate_runtime_topology,
@@ -85,6 +84,7 @@ from .training import (
     FORMAT_VERSION,
     FrameCounts,
     GradientClipper,
+    RANK_LOCAL_RNG_SCHEMA,
     TrainingEngine,
     UpdateResult,
     average_precision,
@@ -92,11 +92,12 @@ from .training import (
     build_optimizer,
     build_weight_decay_scheduler,
     capture_rng_state,
-    gather_rank_rng_states,
+    deserialize_rng_state,
     load_checkpoint,
     resume_compatibility_fingerprint,
     save_checkpoint,
     sequence_classification_metrics,
+    serialize_rng_state,
 )
 
 
@@ -2083,38 +2084,144 @@ def _write_training_checkpoint(
     rank: int,
     group: dist.ProcessGroup | None,
 ) -> bool:
-    """Gather rank-local runtime state and let global rank zero write atomically."""
+    """Stage one symmetric distributed checkpoint with a common writer outcome."""
 
-    payload = engine.checkpoint_payload(stage=stage, config=config)
-    if world_size > 1:
-        local_rng_state = payload["rng_state"]
+    if world_size == 1:
+        payload = engine.checkpoint_payload(stage=stage, config=config)
+        payload["topology"] = build_topology_state((topology,))
+        if rank == 0:
+            save_checkpoint(path, payload)
+            return True
+        return False
+
+    payload: dict[str, Any] | None = None
+    local_bundle: dict[str, object] | None = None
+    local_error: Exception | None = None
+    preparation_error: str | None = None
+    try:
+        payload = engine.checkpoint_payload(stage=stage, config=config)
+        if not isinstance(payload, dict):
+            raise CheckpointError("local checkpoint payload is not a dictionary")
+        local_rng_state = payload.get("rng_state")
         if not isinstance(local_rng_state, Mapping):
             raise CheckpointError("local RNG checkpoint state is not a mapping")
-        gathered_rng = gather_rank_rng_states(
-            local_rng_state,
-            world_size=world_size,
-            rank=rank,
-            group=group,
+        encoded_rng = serialize_rng_state(local_rng_state)
+        if not isinstance(encoded_rng, bytes):
+            raise CheckpointError("serialized local RNG state is not bytes")
+        topology_mapping = topology.to_mapping()
+        json.dumps(topology_mapping, sort_keys=True)
+        local_bundle = {
+            "rng_state": encoded_rng,
+            "topology": topology_mapping,
+        }
+    except Exception as error:
+        local_error = error
+        preparation_error = (
+            f"distributed checkpoint preparation failed on rank {rank}: "
+            f"{type(error).__name__}: {error}"
         )
-        gathered_topology = gather_rank_topologies(
-            topology,
-            world_size=world_size,
-            rank=rank,
-            group=group,
+
+    readiness: list[object] = [None] * world_size
+    dist.all_gather_object(
+        readiness,
+        {"rank": rank, "error": preparation_error},
+        group=group,
+    )
+    preparation_failures: list[str] = []
+    for expected_rank, status in enumerate(readiness):
+        if not isinstance(status, Mapping):
+            preparation_failures.append(
+                f"distributed checkpoint preparation status for rank "
+                f"{expected_rank} is malformed"
+            )
+            continue
+        reported_rank = status.get("rank")
+        reported_error = status.get("error")
+        if reported_rank != expected_rank or (
+            reported_error is not None and not isinstance(reported_error, str)
+        ):
+            preparation_failures.append(
+                f"distributed checkpoint preparation status for rank "
+                f"{expected_rank} is malformed"
+            )
+        elif reported_error is not None:
+            preparation_failures.append(reported_error)
+    if preparation_failures:
+        raise CheckpointError(preparation_failures[0]) from local_error
+    if payload is None or local_bundle is None:
+        raise CheckpointError(
+            "distributed checkpoint preparation reported success without local state"
         )
-        if rank == 0:
-            if gathered_rng is None:
-                raise CheckpointError("rank zero received no distributed RNG state")
-            if gathered_topology is None:
-                raise CheckpointError("rank zero received no distributed topology state")
-            payload["rng_state"] = gathered_rng
-            payload["topology"] = gathered_topology
-    else:
-        payload["topology"] = build_topology_state((topology,))
+
+    gathered: list[object] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_bundle, gathered, dst=0, group=group)
+
+    writer_error: Exception | None = None
+    writer_outcome: str | None = None
     if rank == 0:
-        save_checkpoint(path, payload)
-        return True
-    return False
+        try:
+            if gathered is None or len(gathered) != world_size:
+                raise CheckpointError(
+                    "distributed checkpoint gather did not return one bundle per rank"
+                )
+            rng_states: list[dict[str, object]] = []
+            topology_records: list[RankTopology] = []
+            for gathered_rank, bundle in enumerate(gathered):
+                if not isinstance(bundle, Mapping) or set(bundle) != {
+                    "rng_state",
+                    "topology",
+                }:
+                    raise CheckpointError(
+                        f"distributed checkpoint bundle for rank {gathered_rank} "
+                        "is malformed"
+                    )
+                encoded_rng = bundle["rng_state"]
+                topology_mapping = bundle["topology"]
+                if not isinstance(encoded_rng, bytes):
+                    raise CheckpointError(
+                        f"distributed RNG payload for rank {gathered_rank} is not bytes"
+                    )
+                if not isinstance(topology_mapping, Mapping):
+                    raise CheckpointError(
+                        f"distributed topology for rank {gathered_rank} is malformed"
+                    )
+                rng_states.append(deserialize_rng_state(encoded_rng))
+                try:
+                    topology_records.append(RankTopology(**dict(topology_mapping)))
+                except TypeError as error:
+                    raise CheckpointError(
+                        f"distributed topology for rank {gathered_rank} is malformed"
+                    ) from error
+            payload["rng_state"] = {
+                "schema": RANK_LOCAL_RNG_SCHEMA,
+                "world_size": world_size,
+                "by_rank": rng_states,
+            }
+            payload["topology"] = build_topology_state(tuple(topology_records))
+        except Exception as error:
+            writer_error = error
+            writer_outcome = (
+                "distributed checkpoint merge failed on rank 0: "
+                f"{type(error).__name__}: {error}"
+            )
+        if writer_outcome is None:
+            try:
+                save_checkpoint(path, payload)
+            except Exception as error:
+                writer_error = error
+                writer_outcome = (
+                    "distributed checkpoint write failed on rank 0: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+    outcome: list[object] = [writer_outcome]
+    dist.broadcast_object_list(outcome, src=0, group=group)
+    received_outcome = outcome[0]
+    if received_outcome is not None:
+        if not isinstance(received_outcome, str):
+            raise CheckpointError("distributed checkpoint writer outcome is malformed")
+        raise CheckpointError(received_outcome) from writer_error
+    return rank == 0
 
 
 def _checkpoint_at_preemption_safe_point(
@@ -2135,26 +2242,9 @@ def _checkpoint_at_preemption_safe_point(
         group=group,
     ):
         return False
-    local_error: Exception | None = None
-    try:
-        write_checkpoint()
-    except Exception as error:
-        local_error = error
+    write_checkpoint()
     if dist.is_available() and dist.is_initialized():
-        success = torch.tensor(
-            int(local_error is None),
-            dtype=torch.int32,
-            device=collective_device,
-        )
-        dist.all_reduce(success, op=dist.ReduceOp.MIN, group=group)
-        if not bool(success.item()):
-            raise CheckpointError(
-                "preemption checkpoint failed on one or more ranks; refusing "
-                "requeue-friendly exit"
-            ) from local_error
         dist.barrier(group=group)
-    elif local_error is not None:
-        raise local_error
     flush_logs()
     raise TrainingPreempted(checkpoint_path, update=update)
 
@@ -2196,7 +2286,48 @@ def _prepare_output_directory(
         dist.barrier(group=group)
     elif error_message is not None:
         raise OutputLockError(error_message)
-    if not output_directory.is_dir():
+    visible = output_directory.is_dir()
+    if distributed.world_size > 1:
+        visibility: list[object] = [None] * distributed.world_size
+        dist.all_gather_object(
+            visibility,
+            {
+                "rank": distributed.rank,
+                "hostname": socket.gethostname(),
+                "visible": visible,
+            },
+            group=group,
+        )
+        missing: list[tuple[int, str]] = []
+        for expected_rank, status in enumerate(visibility):
+            if not isinstance(status, Mapping):
+                missing.append((expected_rank, "unknown-host"))
+                continue
+            status_rank = status.get("rank")
+            hostname = status.get("hostname")
+            status_visible = status.get("visible")
+            if (
+                status_rank != expected_rank
+                or not isinstance(hostname, str)
+                or type(status_visible) is not bool
+                or not status_visible
+            ):
+                missing.append(
+                    (
+                        expected_rank,
+                        hostname if isinstance(hostname, str) else "unknown-host",
+                    )
+                )
+        if missing:
+            details = ", ".join(
+                f"rank {missing_rank} ({hostname})"
+                for missing_rank, hostname in missing
+            )
+            raise OutputLockError(
+                f"shared output directory {output_directory} is not visible on "
+                f"{details}"
+            )
+    elif not visible:
         raise OutputLockError(
             f"rank {distributed.rank} cannot see shared output directory "
             f"{output_directory}"
