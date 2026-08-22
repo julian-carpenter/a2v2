@@ -62,14 +62,18 @@ from .model import (
 from .training import (
     CheckpointError,
     CosineUpdateScheduler,
+    FORMAT_VERSION,
     FrameCounts,
+    GradientClipper,
     TrainingEngine,
     UpdateResult,
     average_precision,
+    build_gradient_clipper,
     build_optimizer,
     capture_rng_state,
     gather_rank_rng_states,
     load_checkpoint,
+    resume_compatibility_fingerprint,
     save_checkpoint,
     sequence_classification_metrics,
 )
@@ -1392,7 +1396,7 @@ def convert_checkpoint(
         serialized_config["pretrained"] = config_to_dict(pretrained_config)
     teacher = model.teacher.model.state_dict() if isinstance(model, Animal2VecPretrainingModel) else None
     payload = {
-        "format_version": 1,
+        "format_version": FORMAT_VERSION,
         "stage": stage,
         "config": serialized_config,
         "model": model.state_dict(),
@@ -1400,6 +1404,12 @@ def convert_checkpoint(
         "optimizer": None,
         "scheduler": None,
         "scaler": None,
+        "gradient_clipper": None,
+        "weight_decay_scheduler": None,
+        "topology": None,
+        "resume_compatibility": resume_compatibility_fingerprint(
+            serialized_config["active"]  # type: ignore[arg-type]
+        ),
         "update": legacy_num_updates(checkpoint),
         "epoch": 0,
         "batch_in_epoch": 0,
@@ -1504,6 +1514,60 @@ def _ddp_bucket_cap_mb_list(config: Animal2VecConfig) -> list[int] | None:
 
 
 # Model, checkpoint, and dataset construction
+
+def _build_gradient_clipper_for_config(
+    model: nn.Module,
+    config: Animal2VecConfig,
+) -> GradientClipper:
+    """Construct the configured clipping strategy over canonical model names."""
+
+    optimization = config.optimization
+    return build_gradient_clipper(
+        model,
+        method=optimization.gradient_clip_method,
+        clip_norm=optimization.clip_norm,
+        adagc_beta=optimization.adagc_beta,
+        adagc_relative_clip=optimization.adagc_relative_clip,
+        adagc_warmup_updates=optimization.adagc_warmup_updates,
+    )
+
+
+def _validate_resume_compatibility(
+    config: Animal2VecConfig,
+    checkpoint: Mapping[str, object],
+) -> None:
+    """Fail closed when saved mathematical state differs from the active run."""
+
+    current = resume_compatibility_fingerprint(config_to_dict(config))
+    if current is None:
+        raise CheckpointError("could not fingerprint the active resume configuration")
+    saved = checkpoint.get("resume_compatibility")
+    if saved is None:
+        stored_config = checkpoint.get("config")
+        if not isinstance(stored_config, Mapping):
+            raise CheckpointError("checkpoint lacks a native config for resume compatibility")
+        stored_active = stored_config.get("active")
+        if not isinstance(stored_active, Mapping):
+            raise CheckpointError("checkpoint lacks an active config for resume compatibility")
+        try:
+            normalized_active = config_to_dict(
+                config_from_serialized_dict(stored_active)
+            )
+        except (ConfigError, KeyError, TypeError, ValueError) as error:
+            raise CheckpointError(
+                f"checkpoint active config is invalid for resume: {error}"
+            ) from error
+        saved = resume_compatibility_fingerprint(normalized_active)
+    if not isinstance(saved, Mapping):
+        raise CheckpointError("checkpoint resume compatibility state is malformed")
+    all_paths = sorted(set(current) | set(saved))
+    for path in all_paths:
+        if path not in saved or path not in current or saved[path] != current[path]:
+            raise CheckpointError(
+                f"resume configuration mismatch at {path}: "
+                f"checkpoint={saved.get(path)!r}, active={current.get(path)!r}"
+            )
+
 
 def _load_pretrained(
     checkpoint_path: Path,
@@ -1882,6 +1946,8 @@ def _run_training(
     np.random.seed(config.common.seed + rank)
     torch.manual_seed(config.common.seed + rank)
     resume_checkpoint = load_checkpoint(resume_path, map_location=device) if resume_path is not None else None
+    if resume_checkpoint is not None:
+        _validate_resume_compatibility(config, resume_checkpoint)
     model, pretrained_config = _make_model(
         config,
         pretrained_checkpoint=pretrained_checkpoint,
@@ -1890,6 +1956,7 @@ def _run_training(
     model.to(device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    gradient_clipper = _build_gradient_clipper_for_config(model, config)
     optimizer = build_optimizer(
         model,
         name=config.optimizer.name,
@@ -1928,6 +1995,7 @@ def _run_training(
         scheduler,
         clip_norm=config.optimization.clip_norm,
         device=device,
+        gradient_clipper=gradient_clipper,
         use_amp=config.common.fp16,
         amp_init_scale=config.common.fp16_init_scale,
         amp_min_scale=config.common.min_loss_scale,

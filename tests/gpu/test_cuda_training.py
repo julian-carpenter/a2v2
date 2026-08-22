@@ -25,7 +25,7 @@ from a2v2.training import (
     save_checkpoint,
 )
 from a2v2.training import TrainingEngine
-from a2v2.training import CosineUpdateScheduler, build_optimizer
+from a2v2.training import CosineUpdateScheduler, build_gradient_clipper, build_optimizer
 
 
 ROOT = Path(__file__).parents[2]
@@ -469,11 +469,21 @@ def test_transformer_activation_checkpointing_autocast_cuda_parity(
     assert torch.equal(checkpointed_rng, direct_rng)
 
 
+@pytest.mark.parametrize("gradient_clip_method", ("global", "adagc"))
 def test_amp_overflow_skips_update_and_reduces_scale(
     cuda_device: torch.device,
+    gradient_clip_method: str,
 ) -> None:
     """Check AMP overflow skips update and reduces scale."""
     model = torch.nn.Linear(1, 1, bias=False).to(cuda_device)
+    model.register_buffer("teacher_update", torch.zeros((), device=cuda_device))
+
+    def update_teacher(update: int) -> None:
+        """Record the real successful-update callback in module state."""
+
+        model.teacher_update.fill_(update)
+
+    model.update_teacher = update_teacher
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     scheduler = CosineUpdateScheduler(
         optimizer,
@@ -482,18 +492,26 @@ def test_amp_overflow_skips_update_and_reduces_scale(
         warmup_updates=0,
         max_updates=2,
     )
+    gradient_clipper = build_gradient_clipper(
+        model,
+        method=gradient_clip_method,
+        clip_norm=0.0,
+        adagc_warmup_updates=1,
+    )
     engine = TrainingEngine(
         model,
         optimizer,
         scheduler,
         clip_norm=0.0,
         device=cuda_device,
+        gradient_clipper=gradient_clipper,
         use_amp=True,
         amp_init_scale=128.0,
         amp_min_scale=1.0,
     )
     value = torch.ones(1, 1, device=cuda_device)
     weight_before = model.weight.detach().clone()
+    clipper_before = _clone_tree(engine.gradient_clipper.state_dict())
 
     overflow = engine.step(
         [value],
@@ -509,6 +527,8 @@ def test_amp_overflow_skips_update_and_reduces_scale(
     assert engine.scheduler.last_update == -1
     assert engine.scaler is not None and engine.scaler.get_scale() == 64.0
     assert torch.equal(model.weight, weight_before)
+    assert model.teacher_update.item() == 0.0
+    _assert_tree_equal(engine.gradient_clipper.state_dict(), clipper_before)
 
     recovered = engine.step(
         [value],
@@ -521,3 +541,6 @@ def test_amp_overflow_skips_update_and_reduces_scale(
     assert recovered.update == 1
     assert engine.update == 1
     assert not torch.equal(model.weight, weight_before)
+    assert model.teacher_update.item() == 1.0
+    if gradient_clip_method == "adagc":
+        assert engine.gradient_clipper.state_dict()["update"] == 1

@@ -33,7 +33,7 @@ from a2v2.training import (
     save_checkpoint,
 )
 from a2v2.training import TrainingEngine
-from a2v2.training import CosineUpdateScheduler, build_optimizer
+from a2v2.training import CosineUpdateScheduler, build_gradient_clipper, build_optimizer
 
 
 ROOT = Path(__file__).parents[2]
@@ -128,7 +128,7 @@ def _digest(value: Any) -> str:
             tensor = item.detach().cpu().contiguous()
             digest.update(str(tensor.dtype).encode("ascii"))
             digest.update(json.dumps(list(tensor.shape)).encode("ascii"))
-            digest.update(tensor.view(torch.uint8).numpy().tobytes())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
         elif isinstance(item, dict):
             for key in sorted(item, key=str):
                 update(key)
@@ -159,7 +159,12 @@ def _build(
             min_loss_scale=1e-6,
         ),
         distributed=replace(config.distributed, requested_world_size=world_size),
-        optimization=replace(config.optimization, max_update=4),
+        optimization=replace(
+            config.optimization,
+            max_update=4,
+            gradient_clip_method="adagc",
+            adagc_warmup_updates=1,
+        ),
     )
     model = Animal2VecPretrainingModel.from_config(config).to(device)
     optimizer = build_optimizer(
@@ -184,12 +189,21 @@ def _build(
         find_unused_parameters=True,
         bucket_cap_mb_list=[4096],
     )
+    gradient_clipper = build_gradient_clipper(
+        model,
+        method=config.optimization.gradient_clip_method,
+        clip_norm=config.optimization.clip_norm,
+        adagc_beta=config.optimization.adagc_beta,
+        adagc_relative_clip=config.optimization.adagc_relative_clip,
+        adagc_warmup_updates=config.optimization.adagc_warmup_updates,
+    )
     engine = TrainingEngine(
         wrapped,
         optimizer,
         scheduler,
         clip_norm=config.optimization.clip_norm,
         device=device,
+        gradient_clipper=gradient_clipper,
         use_amp=True,
         amp_init_scale=config.common.fp16_init_scale,
         amp_min_scale=config.common.min_loss_scale,
@@ -235,6 +249,7 @@ def _snapshot(model: Animal2VecPretrainingModel, engine: TrainingEngine, result:
         "model": model.state_dict(),
         "teacher": model.teacher.model.state_dict(),
         "optimizer": engine.optimizer.state_dict(),
+        "gradient_clipper": engine.gradient_clipper.state_dict(),
         "scheduler": engine.scheduler.state_dict(),
         "scaler": engine.scaler.state_dict() if engine.scaler is not None else None,
         "update": engine.update,
@@ -323,6 +338,16 @@ def main() -> int:
     actual = _snapshot(resumed_model, resumed_engine, actual_result)
     actual_digest = _digest(actual)
     difference = _first_difference(actual, expected)
+    adagc_state_digest = _digest(
+        _clone_tree(resumed_engine.gradient_clipper.state_dict())
+    )
+    rank_adagc_digests: list[object] = [None] * world_size
+    dist.all_gather_object(
+        rank_adagc_digests,
+        adagc_state_digest,
+        group=checkpoint_group,
+    )
+    all_ranks_adagc_state = len(set(rank_adagc_digests)) == 1
 
     local_ok = torch.tensor(int(difference is None), dtype=torch.int32, device=device)
     dist.all_reduce(local_ok, op=dist.ReduceOp.MIN)
@@ -338,6 +363,8 @@ def main() -> int:
         "actual_digest": actual_digest,
         "local_exact": difference is None,
         "all_ranks_exact": bool(local_ok.item()),
+        "adagc_state_digest": adagc_state_digest,
+        "all_ranks_adagc_state": all_ranks_adagc_state,
         "first_difference": difference,
         "amp_scale": resumed_engine.scaler.get_scale() if resumed_engine.scaler is not None else None,
         "checkpoint": str(checkpoint_path),
@@ -349,7 +376,11 @@ def main() -> int:
     print(json.dumps(report, sort_keys=True), flush=True)
     dist.barrier()
     dist.destroy_process_group()
-    if difference is not None or not report["all_ranks_exact"]:
+    if (
+        difference is not None
+        or not report["all_ranks_exact"]
+        or not report["all_ranks_adagc_state"]
+    ):
         raise RuntimeError(f"distributed resume diverged on rank {rank}: {difference}")
     return 0
 

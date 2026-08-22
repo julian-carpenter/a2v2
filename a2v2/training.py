@@ -32,12 +32,19 @@ import torch.distributed as dist
 # CHECKPOINT FORMAT AND RANDOM-STATE CAPTURE
 # =============================================================================
 
-FORMAT_VERSION = 1
-REQUIRED_KEYS = {
+FORMAT_VERSION = 2
+LEGACY_REQUIRED_KEYS = {
     "format_version", "stage", "config", "model", "teacher", "optimizer",
     "scheduler", "scaler", "update", "epoch", "batch_in_epoch", "rng_state",
     "sampler_state", "best_metric",
 }
+VERSION_2_STATE_KEYS = {
+    "gradient_clipper",
+    "weight_decay_scheduler",
+    "topology",
+    "resume_compatibility",
+}
+REQUIRED_KEYS = LEGACY_REQUIRED_KEYS | VERSION_2_STATE_KEYS
 
 
 class CheckpointError(ValueError):
@@ -173,15 +180,69 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
 def validate_checkpoint(payload: Mapping[str, object]) -> None:
     """Reject incomplete, unknown-version, or unknown-stage checkpoints."""
 
-    missing = sorted(REQUIRED_KEYS - set(payload))
+    version = payload.get("format_version")
+    if version not in {1, FORMAT_VERSION}:
+        raise CheckpointError(
+            f"unsupported checkpoint format {version}; expected 1 or {FORMAT_VERSION}"
+        )
+    required = LEGACY_REQUIRED_KEYS if version == 1 else REQUIRED_KEYS
+    missing = sorted(required - set(payload))
     if missing:
         raise CheckpointError(f"checkpoint is missing required keys: {missing}")
-    if payload["format_version"] != FORMAT_VERSION:
-        raise CheckpointError(
-            f"unsupported checkpoint format {payload['format_version']}; expected {FORMAT_VERSION}"
-        )
     if payload["stage"] not in {"pretrain", "finetune"}:
         raise CheckpointError(f"unknown checkpoint stage: {payload['stage']}")
+
+
+def normalize_checkpoint(payload: Mapping[str, object]) -> dict[str, Any]:
+    """Add v2 runtime slots to a validated v1 payload using legacy defaults."""
+
+    normalized = dict(payload)
+    if normalized["format_version"] == 1:
+        for key in VERSION_2_STATE_KEYS:
+            normalized.setdefault(key, None)
+    return normalized
+
+
+def resume_compatibility_fingerprint(
+    active_config: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Select mathematical and batching fields that must match on resume."""
+
+    fingerprint: dict[str, object] = {}
+
+    def add_leaf(path: str, value: object) -> None:
+        """Flatten nested config mappings while preserving sequence values."""
+
+        if isinstance(value, Mapping):
+            for key in sorted(value):
+                add_leaf(f"{path}.{key}", value[key])
+        else:
+            fingerprint[path] = value
+
+    try:
+        add_leaf("model", active_config["model"])
+        add_leaf("optimizer", active_config["optimizer"])
+        add_leaf("scheduler", active_config["scheduler"])
+        add_leaf("optimization", active_config["optimization"])
+        # The established CLI permits extending max_update on resume. It is a
+        # scheduler horizon override, not saved optimizer or clipping state.
+        fingerprint.pop("optimization.max_update", None)
+        common = active_config["common"]
+        dataset = active_config["dataset"]
+        distributed = active_config["distributed"]
+        if not all(isinstance(group, Mapping) for group in (common, dataset, distributed)):
+            return None
+        fingerprint["common.seed"] = common["seed"]  # type: ignore[index]
+        fingerprint["dataset.max_tokens"] = dataset["max_tokens"]  # type: ignore[index]
+        fingerprint["dataset.required_batch_size_multiple"] = dataset[
+            "required_batch_size_multiple"
+        ]  # type: ignore[index]
+        fingerprint["distributed.requested_world_size"] = distributed[
+            "requested_world_size"
+        ]  # type: ignore[index]
+    except (KeyError, TypeError):
+        return None
+    return fingerprint
 
 
 def save_checkpoint(path: str | Path, payload: Mapping[str, object]) -> None:
@@ -213,7 +274,320 @@ def load_checkpoint(
     if not isinstance(payload, dict):
         raise CheckpointError("checkpoint root must be a dictionary")
     validate_checkpoint(payload)
-    return payload
+    return normalize_checkpoint(payload)
+
+
+# =============================================================================
+# TRANSACTIONAL GRADIENT CLIPPING
+# =============================================================================
+
+@dataclass(frozen=True)
+class GradientClipCandidate:
+    """Gradient diagnostic plus tentative state for one optimizer attempt."""
+
+    gradient_norm: Tensor
+    finite: bool
+    clipped_tensors: int = 0
+    largest_scale: float = 1.0
+    source_update: int | None = None
+    norm_emas: Mapping[str, Tensor] | None = None
+
+
+class GradientClipper(Protocol):
+    """Clip gradients now and commit state only after an optimizer update."""
+
+    def clip(self) -> GradientClipCandidate:
+        """Return one pre-step diagnostic and tentative state transition."""
+
+        ...
+
+    def commit(self, candidate: GradientClipCandidate) -> None:
+        """Commit a candidate after the corresponding optimizer step."""
+
+        ...
+
+    def state_dict(self) -> dict[str, object] | None:
+        """Serialize strategy state or return None for stateless clipping."""
+
+        ...
+
+    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
+        """Restore and validate strategy state."""
+
+        ...
+
+
+def _dense_parameters(parameters: Iterable[nn.Parameter]) -> tuple[nn.Parameter, ...]:
+    """Materialize parameters and reject every non-strided gradient layout."""
+
+    materialized = tuple(parameters)
+    if any(
+        parameter.grad is not None and parameter.grad.layout != torch.strided
+        for parameter in materialized
+    ):
+        raise RuntimeError("gradient clipping does not support sparse gradients")
+    return materialized
+
+
+class GlobalGradientClipper:
+    """Preserve the legacy single-global-norm clipping operation exactly."""
+
+    def __init__(self, parameters: Iterable[nn.Parameter], *, clip_norm: float) -> None:
+        self.parameters = tuple(parameters)
+        self.clip_norm = clip_norm
+
+    @torch.no_grad()
+    def clip(self) -> GradientClipCandidate:
+        """Apply the archived global operation and return its diagnostic."""
+
+        parameters = _dense_parameters(self.parameters)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            parameters,
+            self.clip_norm if self.clip_norm > 0 else float("inf"),
+        )
+        return GradientClipCandidate(
+            gradient_norm=gradient_norm,
+            finite=bool(torch.isfinite(gradient_norm)),
+        )
+
+    def commit(self, candidate: GradientClipCandidate) -> None:
+        """Fixed clipping has no state to commit."""
+
+    def state_dict(self) -> None:
+        """Return no checkpoint state for the legacy fixed strategy."""
+
+        return None
+
+    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
+        """Reject state attached to a stateless fixed strategy."""
+
+        if state is not None:
+            raise CheckpointError("global gradient clipping does not accept clipper state")
+
+
+class NoGradientClipper(GlobalGradientClipper):
+    """Measure the legacy global diagnostic without bounding gradients."""
+
+    def __init__(self, parameters: Iterable[nn.Parameter]) -> None:
+        super().__init__(parameters, clip_norm=0.0)
+
+
+class AdaGradientClipper:
+    """Paper AdaGC with GlobalGC minimum initialization and tentative state."""
+
+    ALGORITHM_VERSION = 1
+
+    def __init__(
+        self,
+        named_parameters: Iterable[tuple[str, nn.Parameter]],
+        *,
+        clip_norm: float,
+        beta: float = 0.99,
+        relative_clip: float = 1.04,
+        warmup_updates: int = 100,
+    ) -> None:
+        self.named_parameters = tuple(
+            (name, parameter)
+            for name, parameter in named_parameters
+            if parameter.requires_grad
+        )
+        self.parameter_names = tuple(name for name, _ in self.named_parameters)
+        if len(set(self.parameter_names)) != len(self.parameter_names):
+            raise ValueError("AdaGC parameter names must be unique")
+        self.clip_norm = clip_norm
+        self.beta = beta
+        self.relative_clip = relative_clip
+        self.warmup_updates = warmup_updates
+        self.update = 0
+        # Positive infinity represents a named tensor with no observation yet.
+        self.norm_emas = {
+            name: torch.tensor(float("inf"), dtype=torch.float32)
+            for name in self.parameter_names
+        }
+
+    def _gradient_norms(self) -> tuple[list[tuple[str, nn.Parameter, Tensor]], Tensor]:
+        """Return dense per-tensor norms and their pre-clipping global L2 norm."""
+
+        _dense_parameters(parameter for _, parameter in self.named_parameters)
+        gradients = [
+            (name, parameter, torch.linalg.vector_norm(parameter.grad.detach(), ord=2))
+            for name, parameter in self.named_parameters
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return gradients, torch.tensor(0.0)
+        device = gradients[0][2].device
+        global_norm = torch.linalg.vector_norm(
+            torch.stack([norm.to(device) for _, _, norm in gradients]),
+            ord=2,
+        )
+        return gradients, global_norm
+
+    @torch.no_grad()
+    def clip(self) -> GradientClipCandidate:
+        """Mutate gradients while leaving the running norms tentative."""
+
+        gradients, pre_clip_global_norm = self._gradient_norms()
+        if not bool(torch.isfinite(pre_clip_global_norm)):
+            return GradientClipCandidate(
+                gradient_norm=pre_clip_global_norm,
+                finite=False,
+                source_update=self.update,
+            )
+
+        candidate_norms = {
+            name: value.clone()
+            for name, value in self.norm_emas.items()
+        }
+        clipped_tensors = 0
+        largest_scale = 0.0 if gradients else 1.0
+        if self.update < self.warmup_updates:
+            # The existing GlobalGC operation is retained during updates
+            # 0,...,T_start-1. State observes norms only after that operation.
+            pre_clip_global_norm = torch.nn.utils.clip_grad_norm_(
+                tuple(parameter for _, parameter in self.named_parameters),
+                self.clip_norm if self.clip_norm > 0 else float("inf"),
+            )
+            for name, parameter, original_norm in gradients:
+                clipped_norm = torch.linalg.vector_norm(parameter.grad.detach(), ord=2).float().cpu()
+                candidate_norms[name] = torch.minimum(candidate_norms[name], clipped_norm)
+                original = float(original_norm.float().cpu())
+                tensor_scale = min(float(clipped_norm) / original, 1.0) if original else 1.0
+                largest_scale = max(largest_scale, tensor_scale)
+                if float(clipped_norm) < float(original_norm.float().cpu()):
+                    clipped_tensors += 1
+        else:
+            for name, parameter, original_norm in gradients:
+                norm = original_norm.float().cpu()
+                previous = candidate_norms[name]
+                if float(norm) == 0.0 or bool(torch.isinf(previous)):
+                    scale = 1.0
+                else:
+                    scale = min(
+                        self.relative_clip * float(previous) / float(norm),
+                        1.0,
+                    )
+                parameter.grad.mul_(scale)
+                clipped_norm = torch.linalg.vector_norm(parameter.grad.detach(), ord=2).float().cpu()
+                if bool(torch.isinf(previous)):
+                    candidate_norms[name] = clipped_norm
+                else:
+                    candidate_norms[name] = (
+                        previous * self.beta + clipped_norm * (1.0 - self.beta)
+                    )
+                if scale < 1.0:
+                    clipped_tensors += 1
+                largest_scale = max(largest_scale, scale)
+
+        return GradientClipCandidate(
+            gradient_norm=pre_clip_global_norm,
+            finite=True,
+            clipped_tensors=clipped_tensors,
+            largest_scale=largest_scale,
+            source_update=self.update,
+            norm_emas=candidate_norms,
+        )
+
+    def commit(self, candidate: GradientClipCandidate) -> None:
+        """Commit exactly one finite candidate from the current update."""
+
+        if not candidate.finite or candidate.norm_emas is None:
+            raise CheckpointError("cannot commit non-finite AdaGC candidate state")
+        if candidate.source_update != self.update:
+            raise CheckpointError(
+                "cannot commit stale AdaGC candidate: "
+                f"candidate update {candidate.source_update}, clipper update {self.update}"
+            )
+        self.norm_emas = {
+            name: candidate.norm_emas[name].detach().cpu().to(torch.float32).clone()
+            for name in self.parameter_names
+        }
+        self.update += 1
+
+    def state_dict(self) -> dict[str, object]:
+        """Serialize ordered names and name-keyed CPU FP32 running norms."""
+
+        return {
+            "algorithm_version": self.ALGORITHM_VERSION,
+            "update": self.update,
+            "parameter_names": list(self.parameter_names),
+            "norm_emas": {
+                name: value.clone()
+                for name, value in self.norm_emas.items()
+            },
+        }
+
+    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
+        """Restore AdaGC state only when its schema and model names match."""
+
+        if not isinstance(state, Mapping):
+            raise CheckpointError("AdaGC checkpoint is missing clipper state")
+        if state.get("algorithm_version") != self.ALGORITHM_VERSION:
+            raise CheckpointError(
+                "unsupported AdaGC clipper algorithm version "
+                f"{state.get('algorithm_version')!r}; expected {self.ALGORITHM_VERSION}"
+            )
+        update = state.get("update")
+        if not isinstance(update, int) or update < 0:
+            raise CheckpointError("AdaGC clipper update must be a nonnegative integer")
+        names = state.get("parameter_names")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise CheckpointError("AdaGC clipper parameter names must be an ordered string list")
+        if tuple(names) != self.parameter_names:
+            raise CheckpointError(
+                "AdaGC clipper parameter names do not match the active model"
+            )
+        norms = state.get("norm_emas")
+        if not isinstance(norms, Mapping) or set(norms) != set(self.parameter_names):
+            raise CheckpointError(
+                "AdaGC clipper norm state must contain every active parameter name exactly once"
+            )
+        restored: dict[str, Tensor] = {}
+        for name in self.parameter_names:
+            value = norms[name]
+            if (
+                not isinstance(value, Tensor)
+                or value.shape != torch.Size([])
+                or value.dtype != torch.float32
+                or bool(torch.isnan(value))
+                or float(value) < 0.0
+            ):
+                raise CheckpointError(
+                    f"AdaGC norm for {name!r} must be a nonnegative float32 scalar"
+                )
+            # map_location may move every checkpoint tensor to CUDA. AdaGC
+            # always reclaims ownership of its scalars on CPU.
+            restored[name] = value.detach().cpu().clone()
+        self.update = update
+        self.norm_emas = restored
+
+
+def build_gradient_clipper(
+    model: nn.Module,
+    *,
+    method: str,
+    clip_norm: float,
+    adagc_beta: float = 0.99,
+    adagc_relative_clip: float = 1.04,
+    adagc_warmup_updates: int = 100,
+) -> GradientClipper:
+    """Build the configured clipping strategy over canonical model parameters."""
+
+    if method == "global":
+        return GlobalGradientClipper(model.parameters(), clip_norm=clip_norm)
+    if method == "none":
+        return NoGradientClipper(model.parameters())
+    if method == "adagc":
+        # named_parameters removes duplicate/tied objects by default. The first
+        # traversal name is the stable canonical checkpoint key.
+        return AdaGradientClipper(
+            model.named_parameters(),
+            clip_norm=clip_norm,
+            beta=adagc_beta,
+            relative_clip=adagc_relative_clip,
+            warmup_updates=adagc_warmup_updates,
+        )
+    raise ValueError(f"unsupported gradient clipping method: {method}")
 
 
 # =============================================================================
@@ -673,6 +1047,7 @@ class TrainingEngine:
         *,
         clip_norm: float,
         device: torch.device,
+        gradient_clipper: GradientClipper | None = None,
         use_amp: bool = False,
         amp_init_scale: float = 128.0,
         amp_min_scale: float = 0.0,
@@ -682,6 +1057,11 @@ class TrainingEngine:
         self.scheduler = scheduler
         self.clip_norm = clip_norm
         self.device = device
+        self.gradient_clipper = (
+            gradient_clipper
+            if gradient_clipper is not None
+            else GlobalGradientClipper(model.parameters(), clip_norm=clip_norm)
+        )
         self.use_amp = use_amp and device.type == "cuda"
         self.amp_min_scale = amp_min_scale
         self.scaler = (
@@ -789,13 +1169,12 @@ class TrainingEngine:
         for parameter in self.model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(multiplier)
-        # Mathematics: for threshold c>0, gradients scale by
-        # min(1,c/||g||_2); c<=0 maps to infinity and leaves them unchanged.
-        # Interpretation: clipping limits rare unstable updates while recording
-        # the pre-clipping norm for diagnostics.
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.clip_norm if self.clip_norm > 0 else float("inf")
-        )
+        # Mathematics: every strategy returns the pre-clipping global norm;
+        # its state transition remains tentative until optimizer.step succeeds.
+        # Interpretation: fixed clipping keeps the archived operation exactly,
+        # while AdaGC cannot advance on an AMP-overflow attempt.
+        clip_candidate = self.gradient_clipper.clip()
+        gradient_norm = clip_candidate.gradient_norm
         if not torch.isfinite(gradient_norm):
             if self.scaler is None:
                 raise FloatingPointError(f"non-finite gradients at update {self.update}")
@@ -831,6 +1210,7 @@ class TrainingEngine:
         # u<-u+1, learning rate lr(u), and teacher EMA at the same u.
         # Interpretation: scheduler and teacher clocks advance only after a
         # successful parameter update; AMP-skipped attempts leave them fixed.
+        self.gradient_clipper.commit(clip_candidate)
         self.update += 1
         learning_rate = self.scheduler.step_update(self.update)
         update_teacher = getattr(self.unwrapped_model, "update_teacher", None)
@@ -862,7 +1242,7 @@ class TrainingEngine:
         # Interpretation: model weights alone support inference, while optimizer,
         # counters, sampler cursor, scaler, RNGs, and best metric support resume.
         return {
-            "format_version": 1,
+            "format_version": FORMAT_VERSION,
             "stage": stage,
             "config": dict(config),
             "model": raw_model.state_dict(),
@@ -870,6 +1250,15 @@ class TrainingEngine:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+            "gradient_clipper": self.gradient_clipper.state_dict(),
+            # Tasks 7 and 9 fill these reserved v2 runtime slots.
+            "weight_decay_scheduler": None,
+            "topology": None,
+            "resume_compatibility": (
+                resume_compatibility_fingerprint(config["active"])
+                if isinstance(config.get("active"), Mapping)
+                else None
+            ),
             "update": self.update,
             "epoch": self.epoch,
             "batch_in_epoch": self.batch_in_epoch,
@@ -881,6 +1270,25 @@ class TrainingEngine:
     def restore(self, checkpoint: Mapping[str, Any]) -> None:
         """Restore model, optimizer, scheduler, counters, scaler, and RNGs."""
 
+        checkpoint_update = int(checkpoint["update"])
+        clipper_state = checkpoint.get("gradient_clipper")
+        if isinstance(self.gradient_clipper, AdaGradientClipper):
+            if clipper_state is None:
+                if checkpoint_update > 0:
+                    raise CheckpointError(
+                        "AdaGC cannot resume at update "
+                        f"{checkpoint_update} without clipper state"
+                    )
+            else:
+                self.gradient_clipper.load_state_dict(clipper_state)
+                if self.gradient_clipper.update != checkpoint_update:
+                    raise CheckpointError(
+                        "AdaGC clipper update "
+                        f"{self.gradient_clipper.update} does not match checkpoint update "
+                        f"{checkpoint_update}"
+                    )
+        else:
+            self.gradient_clipper.load_state_dict(clipper_state)
         # Mathematics: restore every mutable component before the next batch;
         # strict model loading enforces a bijection between saved and live keys.
         # Interpretation: a checkpoint created by a different architecture or
@@ -890,7 +1298,7 @@ class TrainingEngine:
         self.scheduler.load_state_dict(checkpoint["scheduler"])
         if self.scaler is not None and checkpoint["scaler"] is not None:
             self.scaler.load_state_dict(checkpoint["scaler"])
-        self.update = int(checkpoint["update"])
+        self.update = checkpoint_update
         self.epoch = int(checkpoint["epoch"])
         self.batch_in_epoch = int(checkpoint["batch_in_epoch"])
         self.sampler_state = checkpoint["sampler_state"]

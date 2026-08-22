@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+import a2v2.training as training
 from a2v2.workflows import _restore_and_release_checkpoint
 from a2v2.training import TrainingEngine
 from a2v2.training import CosineUpdateScheduler
@@ -96,3 +97,48 @@ def test_restore_releases_loaded_checkpoint_payload() -> None:
     assert checkpoint == {}
     assert restored.update == 1
     assert torch.equal(restored_model.weight, model.weight)
+
+
+def test_adagc_state_commits_only_after_optimizer_step_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch clipper clock changes when an optimizer attempt raises or is skipped."""
+
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = CosineUpdateScheduler(
+        optimizer,
+        max_lr=0.1,
+        min_lr=0.01,
+        warmup_updates=0,
+        max_updates=2,
+    )
+    clipper = training.build_gradient_clipper(
+        model,
+        method="adagc",
+        clip_norm=1.0,
+        adagc_warmup_updates=1,
+    )
+    engine = TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=1.0,
+        device=torch.device("cpu"),
+        gradient_clipper=clipper,
+    )
+
+    monkeypatch.setattr(
+        optimizer,
+        "step",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("step failed")),
+    )
+    with pytest.raises(RuntimeError, match="step failed"):
+        engine.step(
+            [torch.ones(1, 1)],
+            lambda value: Result(model(value).square().sum(), sample_size=1),
+        )
+
+    assert engine.update == 0
+    assert scheduler.last_update == -1
+    assert clipper.state_dict()["update"] == 0
