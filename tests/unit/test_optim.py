@@ -301,3 +301,80 @@ def test_adagc_state_is_name_keyed_exact_and_tied_parameters_are_tracked_once() 
     malformed["parameter_names"] = ["renamed"]
     with pytest.raises(training.CheckpointError, match="parameter names"):
         restored.load_state_dict(malformed)
+
+
+@pytest.mark.parametrize(
+    ("case", "mutate"),
+    (
+        ("missing-version", lambda state: state.pop("algorithm_version")),
+        ("extra-top-level", lambda state: state.__setitem__("extra", None)),
+        ("boolean-version", lambda state: state.__setitem__("algorithm_version", True)),
+        ("wrong-version", lambda state: state.__setitem__("algorithm_version", 2)),
+        ("missing-update", lambda state: state.pop("update")),
+        ("boolean-update", lambda state: state.__setitem__("update", True)),
+        ("negative-update", lambda state: state.__setitem__("update", -1)),
+        ("missing-names", lambda state: state.pop("parameter_names")),
+        ("names-not-list", lambda state: state.__setitem__("parameter_names", ("first", "second", "unused"))),
+        ("renamed-parameter", lambda state: state.__setitem__("parameter_names", ["renamed", "second", "unused"])),
+        ("missing-norms", lambda state: state.pop("norm_emas")),
+        ("missing-norm", lambda state: state["norm_emas"].pop("first")),
+        ("extra-norm", lambda state: state["norm_emas"].__setitem__("extra", torch.tensor(1.0))),
+        ("vector-norm", lambda state: state["norm_emas"].__setitem__("first", torch.tensor([1.0]))),
+        ("float64-norm", lambda state: state["norm_emas"].__setitem__("first", torch.tensor(1.0, dtype=torch.float64))),
+        ("nan-norm", lambda state: state["norm_emas"].__setitem__("first", torch.tensor(float("nan")))),
+        ("negative-infinite-norm", lambda state: state["norm_emas"].__setitem__("first", torch.tensor(float("-inf")))),
+    ),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_adagc_rejects_every_malformed_state_without_mutation(
+    case: str,
+    mutate: object,
+) -> None:
+    """Catch permissive schema parsing or partial state installation on reject."""
+
+    del case
+    model = GradientFixture()
+    model.first.grad = torch.tensor([3.0, 4.0])
+    model.second.grad = torch.tensor([1.0])
+    clipper = training.build_gradient_clipper(
+        model,
+        method="adagc",
+        clip_norm=2.5,
+        adagc_warmup_updates=100,
+    )
+    clipper.commit(clipper.clip())
+    before = clipper.state_dict()
+    malformed = deepcopy(before)
+    mutate(malformed)  # type: ignore[operator]
+
+    with pytest.raises(training.CheckpointError):
+        clipper.load_state_dict(malformed)
+
+    actual = clipper.state_dict()
+    assert actual["algorithm_version"] == before["algorithm_version"]
+    assert actual["update"] == before["update"]
+    assert actual["parameter_names"] == before["parameter_names"]
+    for name in before["parameter_names"]:
+        assert torch.equal(actual["norm_emas"][name], before["norm_emas"][name])
+
+
+def test_adagc_state_accepts_positive_infinity_only_as_unobserved_sentinel() -> None:
+    """Catch schema hardening that rejects the designed no-gradient sentinel."""
+
+    source_model = GradientFixture()
+    source = training.build_gradient_clipper(
+        source_model,
+        method="adagc",
+        clip_norm=2.5,
+    )
+    state = source.state_dict()
+    restored = training.build_gradient_clipper(
+        GradientFixture(),
+        method="adagc",
+        clip_norm=2.5,
+    )
+
+    restored.load_state_dict(state)
+
+    for value in restored.state_dict()["norm_emas"].values():
+        assert torch.isposinf(value)

@@ -51,6 +51,26 @@ class CheckpointError(ValueError):
     """Raised when a native checkpoint is unreadable or incompatible."""
 
 
+class DistributedOptimizerStepError(RuntimeError):
+    """Mark a distributed engine terminal after any rank's optimizer failure."""
+
+
+_DISTRIBUTED_OPTIMIZER_FAILURE = (
+    "optimizer step failed on one or more ranks; distributed training is terminal "
+    "and must recover from the last atomic checkpoint"
+)
+
+
+def _all_ranks_true(local_value: bool, device: torch.device) -> bool:
+    """Return one rank-consistent Boolean over the active process group."""
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return local_value
+    decision = torch.tensor(int(local_value), dtype=torch.int32, device=device)
+    dist.all_reduce(decision)
+    return int(decision.item()) == dist.get_world_size()
+
+
 def capture_rng_state() -> dict[str, object]:
     """Capture Python, NumPy, CPU PyTorch, and all CUDA generator states."""
 
@@ -180,6 +200,8 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
 def validate_checkpoint(payload: Mapping[str, object]) -> None:
     """Reject incomplete, unknown-version, or unknown-stage checkpoints."""
 
+    if "format_version" not in payload:
+        raise CheckpointError("checkpoint is missing required keys: ['format_version']")
     version = payload.get("format_version")
     if version not in {1, FORMAT_VERSION}:
         raise CheckpointError(
@@ -372,6 +394,14 @@ class NoGradientClipper(GlobalGradientClipper):
         super().__init__(parameters, clip_norm=0.0)
 
 
+@dataclass(frozen=True)
+class AdaGradientClipperState:
+    """Validated but not yet installed AdaGC checkpoint state."""
+
+    update: int
+    norm_emas: Mapping[str, Tensor]
+
+
 class AdaGradientClipper:
     """Paper AdaGC with GlobalGC minimum initialization and tentative state."""
 
@@ -517,27 +547,54 @@ class AdaGradientClipper:
             },
         }
 
-    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
-        """Restore AdaGC state only when its schema and model names match."""
+    def pristine_state(self) -> AdaGradientClipperState:
+        """Build explicit update-zero state for a checkpoint with no history."""
+
+        return AdaGradientClipperState(
+            update=0,
+            norm_emas={
+                name: torch.tensor(float("inf"), dtype=torch.float32)
+                for name in self.parameter_names
+            },
+        )
+
+    def validate_state_dict(
+        self,
+        state: Mapping[str, object] | None,
+    ) -> AdaGradientClipperState:
+        """Parse checkpoint state without mutating the live clipping history."""
 
         if not isinstance(state, Mapping):
             raise CheckpointError("AdaGC checkpoint is missing clipper state")
-        if state.get("algorithm_version") != self.ALGORITHM_VERSION:
+        expected_keys = {
+            "algorithm_version",
+            "update",
+            "parameter_names",
+            "norm_emas",
+        }
+        if set(state) != expected_keys:
+            missing = sorted(expected_keys - set(state))
+            extra = sorted(set(state) - expected_keys)
+            raise CheckpointError(
+                f"AdaGC clipper state keys are malformed; missing={missing}, extra={extra}"
+            )
+        algorithm_version = state["algorithm_version"]
+        if type(algorithm_version) is not int or algorithm_version != self.ALGORITHM_VERSION:
             raise CheckpointError(
                 "unsupported AdaGC clipper algorithm version "
-                f"{state.get('algorithm_version')!r}; expected {self.ALGORITHM_VERSION}"
+                f"{algorithm_version!r}; expected {self.ALGORITHM_VERSION}"
             )
-        update = state.get("update")
-        if not isinstance(update, int) or update < 0:
+        update = state["update"]
+        if type(update) is not int or update < 0:
             raise CheckpointError("AdaGC clipper update must be a nonnegative integer")
-        names = state.get("parameter_names")
+        names = state["parameter_names"]
         if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
             raise CheckpointError("AdaGC clipper parameter names must be an ordered string list")
         if tuple(names) != self.parameter_names:
             raise CheckpointError(
                 "AdaGC clipper parameter names do not match the active model"
             )
-        norms = state.get("norm_emas")
+        norms = state["norm_emas"]
         if not isinstance(norms, Mapping) or set(norms) != set(self.parameter_names):
             raise CheckpointError(
                 "AdaGC clipper norm state must contain every active parameter name exactly once"
@@ -549,8 +606,8 @@ class AdaGradientClipper:
                 not isinstance(value, Tensor)
                 or value.shape != torch.Size([])
                 or value.dtype != torch.float32
-                or bool(torch.isnan(value))
-                or float(value) < 0.0
+                or not (bool(torch.isfinite(value)) or bool(torch.isposinf(value)))
+                or (bool(torch.isfinite(value)) and float(value) < 0.0)
             ):
                 raise CheckpointError(
                     f"AdaGC norm for {name!r} must be a nonnegative float32 scalar"
@@ -558,8 +615,21 @@ class AdaGradientClipper:
             # map_location may move every checkpoint tensor to CUDA. AdaGC
             # always reclaims ownership of its scalars on CPU.
             restored[name] = value.detach().cpu().clone()
-        self.update = update
-        self.norm_emas = restored
+        return AdaGradientClipperState(update=update, norm_emas=restored)
+
+    def install_state(self, state: AdaGradientClipperState) -> None:
+        """Install one already-validated checkpoint candidate atomically."""
+
+        self.update = state.update
+        self.norm_emas = {
+            name: state.norm_emas[name].clone()
+            for name in self.parameter_names
+        }
+
+    def load_state_dict(self, state: Mapping[str, object] | None) -> None:
+        """Validate completely, then atomically install AdaGC checkpoint state."""
+
+        self.install_state(self.validate_state_dict(state))
 
 
 def build_gradient_clipper(
@@ -1073,6 +1143,7 @@ class TrainingEngine:
         self.batch_in_epoch = 0
         self.best_metric: float | None = None
         self.sampler_state: dict[str, object] | None = None
+        self._terminal_optimizer_failure: BaseException | None = None
 
     @property
     def unwrapped_model(self) -> nn.Module:
@@ -1087,6 +1158,10 @@ class TrainingEngine:
     ) -> UpdateResult:
         """Accumulate microbatches and perform one logical optimizer update."""
 
+        if self._terminal_optimizer_failure is not None:
+            raise DistributedOptimizerStepError(
+                _DISTRIBUTED_OPTIMIZER_FAILURE
+            ) from self._terminal_optimizer_failure
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         total_sample_size = 0
@@ -1103,8 +1178,10 @@ class TrainingEngine:
             amp_context = torch.autocast("cuda", dtype=torch.float16) if self.use_amp else nullcontext()
             with amp_context:
                 output = forward(microbatch)
-            if not torch.isfinite(output.loss):
-                raise FloatingPointError(f"non-finite loss at update {self.update}")
+            if not _all_ranks_true(bool(torch.isfinite(output.loss)), self.device):
+                raise FloatingPointError(
+                    f"non-finite loss on one or more ranks at update {self.update}"
+                )
             predictions = getattr(output, "predictions", None)
             diagnostic_targets = getattr(output, "targets", None)
             if predictions is not None:
@@ -1175,14 +1252,23 @@ class TrainingEngine:
         # while AdaGC cannot advance on an AMP-overflow attempt.
         clip_candidate = self.gradient_clipper.clip()
         gradient_norm = clip_candidate.gradient_norm
-        if not torch.isfinite(gradient_norm):
+        gradients_finite = _all_ranks_true(
+            clip_candidate.finite and bool(torch.isfinite(gradient_norm)),
+            self.device,
+        )
+        if not gradients_finite:
             if self.scaler is None:
-                raise FloatingPointError(f"non-finite gradients at update {self.update}")
-            # GradScaler records non-finite gradients during unscale_. Let it
-            # skip the optimizer step and reduce the scale without advancing
-            # scheduler, model-update, or EMA state.
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                raise FloatingPointError(
+                    f"non-finite gradients on one or more ranks at update {self.update}"
+                )
+            # A rank-local overflow must skip every optimizer. Apply the same
+            # public GradScaler backoff and reset its successful-growth clock
+            # without calling any rank's optimizer.
+            new_scale = self.scaler.get_scale() * self.scaler.get_backoff_factor()
+            self.scaler.update(new_scale=new_scale)
+            scaler_state = self.scaler.state_dict()
+            scaler_state["_growth_tracker"] = 0
+            self.scaler.load_state_dict(scaler_state)
             if self.scaler.get_scale() < self.amp_min_scale:
                 raise FloatingPointError(
                     f"AMP loss scale {self.scaler.get_scale()} is below minimum {self.amp_min_scale}"
@@ -1197,14 +1283,33 @@ class TrainingEngine:
                 pred_var=pred_var,
                 target_var=target_var,
             )
-        if self.scaler is None:
-            self.optimizer.step()
-        else:
-            self.scaler.step(self.optimizer)
+        local_step_error: Exception | None = None
+        try:
+            if self.scaler is None:
+                self.optimizer.step()
+            else:
+                self.scaler.step(self.optimizer)
+        except Exception as error:
+            local_step_error = error
+        if dist.is_available() and dist.is_initialized():
+            all_steps_succeeded = _all_ranks_true(
+                local_step_error is None,
+                self.device,
+            )
+            if not all_steps_succeeded:
+                terminal_error = DistributedOptimizerStepError(
+                    _DISTRIBUTED_OPTIMIZER_FAILURE
+                )
+                self._terminal_optimizer_failure = local_step_error or terminal_error
+                raise terminal_error from local_step_error
+        elif local_step_error is not None:
+            raise local_step_error
+        if self.scaler is not None:
             self.scaler.update()
             if self.scaler.get_scale() < self.amp_min_scale:
                 raise FloatingPointError(
-                    f"AMP loss scale {self.scaler.get_scale()} is below minimum {self.amp_min_scale}"
+                    f"AMP loss scale {self.scaler.get_scale()} is below minimum "
+                    f"{self.amp_min_scale}"
                 )
         # Mathematics: optimizer state transitions first, then update index
         # u<-u+1, learning rate lr(u), and teacher EMA at the same u.
@@ -1235,6 +1340,10 @@ class TrainingEngine:
     ) -> dict[str, object]:
         """Create a complete, versioned, exactly resumable checkpoint payload."""
 
+        if self._terminal_optimizer_failure is not None:
+            raise DistributedOptimizerStepError(
+                _DISTRIBUTED_OPTIMIZER_FAILURE
+            ) from self._terminal_optimizer_failure
         raw_model = self.unwrapped_model
         teacher = getattr(raw_model, "teacher", None)
         # Mathematics: this payload captures all state variables needed to make
@@ -1272,6 +1381,7 @@ class TrainingEngine:
 
         checkpoint_update = int(checkpoint["update"])
         clipper_state = checkpoint.get("gradient_clipper")
+        adagc_candidate: AdaGradientClipperState | None = None
         if isinstance(self.gradient_clipper, AdaGradientClipper):
             if clipper_state is None:
                 if checkpoint_update > 0:
@@ -1279,12 +1389,13 @@ class TrainingEngine:
                         "AdaGC cannot resume at update "
                         f"{checkpoint_update} without clipper state"
                     )
+                adagc_candidate = self.gradient_clipper.pristine_state()
             else:
-                self.gradient_clipper.load_state_dict(clipper_state)
-                if self.gradient_clipper.update != checkpoint_update:
+                adagc_candidate = self.gradient_clipper.validate_state_dict(clipper_state)
+                if adagc_candidate.update != checkpoint_update:
                     raise CheckpointError(
                         "AdaGC clipper update "
-                        f"{self.gradient_clipper.update} does not match checkpoint update "
+                        f"{adagc_candidate.update} does not match checkpoint update "
                         f"{checkpoint_update}"
                     )
         else:
@@ -1304,3 +1415,5 @@ class TrainingEngine:
         self.sampler_state = checkpoint["sampler_state"]
         self.best_metric = checkpoint["best_metric"]
         restore_rng_state(checkpoint["rng_state"])
+        if adagc_candidate is not None:
+            self.gradient_clipper.install_state(adagc_candidate)

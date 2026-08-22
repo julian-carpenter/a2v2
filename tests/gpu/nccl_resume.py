@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from a2v2.config import config_to_dict, load_config
@@ -261,11 +262,325 @@ def _snapshot(model: Animal2VecPretrainingModel, engine: TrainingEngine, result:
     })
 
 
+def _post_step_clocks(
+    model: nn.Module,
+    engine: TrainingEngine,
+    *,
+    include_scaler: bool = True,
+) -> dict[str, Any]:
+    """Capture only state that must never commit after a failed update."""
+
+    teacher = getattr(model, "teacher", None)
+    clocks = {
+        "gradient_clipper": engine.gradient_clipper.state_dict(),
+        "scheduler": engine.scheduler.state_dict(),
+        "teacher": teacher.model.state_dict() if teacher is not None else None,
+        "update": engine.update,
+    }
+    if include_scaler:
+        clocks["scaler"] = engine.scaler.state_dict() if engine.scaler is not None else None
+    return _clone_tree(clocks)
+
+
+def _write_failure_report(
+    output_dir: Path,
+    rank: int,
+    report: dict[str, Any],
+) -> None:
+    """Persist and print one rank's bounded failure-path evidence."""
+
+    (output_dir / f"rank-{rank}.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(json.dumps(report, sort_keys=True), flush=True)
+
+
+def _run_optimizer_failure(
+    *,
+    output_dir: Path,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    checkpoint_group: object,
+    failure_rank: int,
+) -> None:
+    """Inject one rank-local optimizer exception and require terminal agreement."""
+
+    config, model, wrapped, engine = _build(device, world_size)
+    before = _post_step_clocks(model, engine)
+    original_step = engine.optimizer.step
+    if rank == failure_rank:
+        def fail_step(*args: object, **kwargs: object) -> None:
+            """Raise before mutating optimizer or parameters on the selected rank."""
+
+            raise RuntimeError("injected rank-local optimizer failure")
+
+        engine.optimizer.step = fail_step  # type: ignore[method-assign]
+
+    caught: BaseException | None = None
+    try:
+        _step(wrapped, engine, device, rank)
+    except BaseException as error:
+        caught = error
+    finally:
+        engine.optimizer.step = original_step  # type: ignore[method-assign]
+    after = _post_step_clocks(model, engine)
+
+    checkpoint_blocked = False
+    try:
+        engine.checkpoint_payload(
+            stage="pretrain",
+            config={"active": config_to_dict(config)},
+        )
+    except BaseException as error:
+        checkpoint_blocked = type(error).__name__ == "DistributedOptimizerStepError"
+    future_step_blocked = False
+    try:
+        engine.step([], lambda _: (_ for _ in ()).throw(AssertionError("unused")))
+    except BaseException as error:
+        future_step_blocked = type(error).__name__ == "DistributedOptimizerStepError"
+
+    local_report = {
+        "rank": rank,
+        "error_type": type(caught).__name__ if caught is not None else None,
+        "error_message": str(caught) if caught is not None else None,
+        "local_cause": str(caught.__cause__) if caught is not None and caught.__cause__ else None,
+        "clocks_unchanged": _first_difference(after, before) is None,
+        "checkpoint_blocked": checkpoint_blocked,
+        "future_step_blocked": future_step_blocked,
+    }
+    rank_reports: list[object] = [None] * world_size
+    dist.all_gather_object(rank_reports, local_report, group=checkpoint_group)
+    reports = [item for item in rank_reports if isinstance(item, dict)]
+    common_errors = {
+        (item["error_type"], item["error_message"])
+        for item in reports
+    }
+    all_ok = (
+        len(reports) == world_size
+        and len(common_errors) == 1
+        and next(iter(common_errors))[0] == "DistributedOptimizerStepError"
+        and all(item["clocks_unchanged"] for item in reports)
+        and all(item["checkpoint_blocked"] for item in reports)
+        and all(item["future_step_blocked"] for item in reports)
+        and reports[failure_rank]["local_cause"] == "injected rank-local optimizer failure"
+    )
+    report = {
+        **local_report,
+        "failure_mode": "optimizer",
+        "failure_rank": failure_rank,
+        "all_ranks_terminal": all_ok,
+    }
+    _write_failure_report(output_dir, rank, report)
+    if not all_ok:
+        raise RuntimeError(f"distributed optimizer failure was not terminal: {rank_reports}")
+
+
+class _FiniteForwardInfiniteBackward(torch.autograd.Function):
+    """Keep a finite loss while injecting a rank-local nonfinite gradient."""
+
+    @staticmethod
+    def forward(ctx: object, value: torch.Tensor) -> torch.Tensor:
+        """Return the scalar loss unchanged."""
+
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx: object, gradient: torch.Tensor) -> tuple[torch.Tensor]:
+        """Replace the selected rank's loss derivative with positive infinity."""
+
+        return (torch.full_like(gradient, float("inf")),)
+
+
+def _run_amp_overflow(
+    *,
+    output_dir: Path,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    checkpoint_group: object,
+    failure_rank: int,
+) -> None:
+    """Require a rank-local overflow to skip the optimizer on every rank."""
+
+    model = nn.Linear(2, 1).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    scheduler = CosineUpdateScheduler(
+        optimizer,
+        max_lr=1e-2,
+        min_lr=1e-4,
+        warmup_updates=1,
+        max_updates=4,
+    )
+    clipper = build_gradient_clipper(
+        model,
+        method="adagc",
+        clip_norm=1.0,
+        adagc_warmup_updates=1,
+    )
+    engine = TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=1.0,
+        device=device,
+        gradient_clipper=clipper,
+        use_amp=True,
+        amp_init_scale=8.0,
+    )
+    before = _clone_tree({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "clocks": _post_step_clocks(model, engine, include_scaler=False),
+    })
+
+    def forward(value: torch.Tensor) -> object:
+        """Return one finite local loss, with an infinite backward only on one rank."""
+
+        loss = model(value).float().square().sum()
+        if rank == failure_rank:
+            loss = _FiniteForwardInfiniteBackward.apply(loss)
+        return type("Result", (), {"loss": loss, "sample_size": value.shape[0]})()
+
+    result = engine.step([torch.ones(2, 2, device=device)], forward)
+    after = _clone_tree({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "clocks": _post_step_clocks(model, engine, include_scaler=False),
+    })
+    local_report = {
+        "rank": rank,
+        "skipped": result.skipped,
+        "result_update": result.update,
+        "engine_update": engine.update,
+        "scale": engine.scaler.get_scale() if engine.scaler is not None else None,
+        "state_unchanged": _first_difference(after, before) is None,
+    }
+    rank_reports: list[object] = [None] * world_size
+    dist.all_gather_object(rank_reports, local_report, group=checkpoint_group)
+    reports = [item for item in rank_reports if isinstance(item, dict)]
+    all_ok = (
+        len(reports) == world_size
+        and all(item["skipped"] for item in reports)
+        and all(item["result_update"] == 0 for item in reports)
+        and all(item["engine_update"] == 0 for item in reports)
+        and all(item["scale"] == 4.0 for item in reports)
+        and all(item["state_unchanged"] for item in reports)
+    )
+    report = {
+        **local_report,
+        "failure_mode": "amp-overflow",
+        "failure_rank": failure_rank,
+        "all_ranks_skipped": all_ok,
+    }
+    _write_failure_report(output_dir, rank, report)
+    if not all_ok:
+        raise RuntimeError(f"distributed AMP overflow did not skip every rank: {rank_reports}")
+
+
+def _run_nonfinite_loss(
+    *,
+    output_dir: Path,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    checkpoint_group: object,
+    failure_rank: int,
+) -> None:
+    """Require one rank-local nonfinite loss to fail identically before backward."""
+
+    model = nn.Linear(2, 1).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    scheduler = CosineUpdateScheduler(
+        optimizer,
+        max_lr=1e-2,
+        min_lr=1e-4,
+        warmup_updates=1,
+        max_updates=4,
+    )
+    engine = TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=1.0,
+        device=device,
+    )
+    before = _clone_tree({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "clocks": _post_step_clocks(model, engine),
+    })
+
+    def forward(value: torch.Tensor) -> object:
+        """Return a nonfinite forward loss on only the selected rank."""
+
+        loss = model(value).float().square().sum()
+        if rank == failure_rank:
+            loss = loss * torch.tensor(float("inf"), device=device)
+        return type("Result", (), {"loss": loss, "sample_size": value.shape[0]})()
+
+    caught: BaseException | None = None
+    try:
+        engine.step([torch.ones(2, 2, device=device)], forward)
+    except BaseException as error:
+        caught = error
+        # The pre-fix rank-local branch exits before its peers' totals and
+        # decision collectives. Match those calls so RED reports divergence
+        # instead of hanging. The coordinated implementation never enters here.
+        if str(error) == "non-finite loss at update 0":
+            dist.all_reduce(torch.zeros(2, dtype=torch.float64, device=device))
+            dist.all_reduce(torch.zeros((), dtype=torch.int32, device=device))
+    after = _clone_tree({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "clocks": _post_step_clocks(model, engine),
+    })
+    local_report = {
+        "rank": rank,
+        "error_type": type(caught).__name__ if caught is not None else None,
+        "error_message": str(caught) if caught is not None else None,
+        "state_unchanged": _first_difference(after, before) is None,
+    }
+    rank_reports: list[object] = [None] * world_size
+    dist.all_gather_object(rank_reports, local_report, group=checkpoint_group)
+    reports = [item for item in rank_reports if isinstance(item, dict)]
+    common_errors = {
+        (item["error_type"], item["error_message"])
+        for item in reports
+    }
+    all_ok = (
+        len(reports) == world_size
+        and common_errors == {
+            (
+                "FloatingPointError",
+                "non-finite loss on one or more ranks at update 0",
+            )
+        }
+        and all(item["state_unchanged"] for item in reports)
+    )
+    report = {
+        **local_report,
+        "failure_mode": "nonfinite-loss",
+        "failure_rank": failure_rank,
+        "all_ranks_failed_identically": all_ok,
+    }
+    _write_failure_report(output_dir, rank, report)
+    if not all_ok:
+        raise RuntimeError(f"distributed nonfinite loss decision diverged: {rank_reports}")
+
+
 def main() -> int:
     """Run continuous and resumed branches and emit exactness evidence per rank."""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--failure-mode",
+        choices=("none", "optimizer", "amp-overflow", "nonfinite-loss"),
+        default="none",
+    )
+    parser.add_argument("--failure-rank", type=int, default=1)
     arguments = parser.parse_args()
 
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -285,6 +600,27 @@ def main() -> int:
     if rank == 0:
         arguments.output_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
+
+    if arguments.failure_mode != "none":
+        if not 0 <= arguments.failure_rank < world_size:
+            raise ValueError("--failure-rank must name an active distributed rank")
+        runners = {
+            "optimizer": _run_optimizer_failure,
+            "amp-overflow": _run_amp_overflow,
+            "nonfinite-loss": _run_nonfinite_loss,
+        }
+        runner = runners[arguments.failure_mode]
+        runner(
+            output_dir=arguments.output_dir,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+            checkpoint_group=checkpoint_group,
+            failure_rank=arguments.failure_rank,
+        )
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
 
     random.seed(4242)
     np.random.seed(4242)

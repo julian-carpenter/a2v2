@@ -1563,6 +1563,16 @@ def _validate_resume_compatibility(
     all_paths = sorted(set(current) | set(saved))
     for path in all_paths:
         if path not in saved or path not in current or saved[path] != current[path]:
+            legacy_update_zero_adagc = (
+                path == "optimization.gradient_clip_method"
+                and checkpoint.get("format_version") == 1
+                and type(checkpoint.get("update")) is int
+                and checkpoint.get("update") == 0
+                and saved.get(path) == "global"
+                and current.get(path) == "adagc"
+            )
+            if legacy_update_zero_adagc:
+                continue
             raise CheckpointError(
                 f"resume configuration mismatch at {path}: "
                 f"checkpoint={saved.get(path)!r}, active={current.get(path)!r}"

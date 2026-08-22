@@ -170,8 +170,8 @@ Atomic replacement and distributed rank-zero save behavior were not changed.
 
 The loader accepts v1, validates the complete legacy required-key set, and
 normalizes missing v2 slots to legacy defaults while retaining source format
-provenance. Parameterized v1 tests cover missing optimizer, update, and RNG
-entries. V2 validation rejects every missing new slot. Stateful AdaGC resume
+provenance. Parameterized v1 tests cover every missing legacy required key.
+V2 validation rejects every missing new slot. Stateful AdaGC resume
 fails closed if clipper state is absent after update zero, or if its algorithm
 version, update, parameter names, keys, scalar shape/dtype/value, or update clock
 is incompatible. Stateless global/none strategies reject unexpected state.
@@ -247,3 +247,179 @@ Both exited successfully without output.
   populate the reserved topology slot rather than creating another format
   boundary.
 - No unresolved Task 6 correctness blocker remains.
+
+## Fix Round 1
+
+### Status and design rationale
+
+Independent review identified three real gaps: step/skip decisions were local to
+each rank, workflow compatibility hid the designed v1/update-zero AdaGC
+exception, and restore installed clipper state before comparing clocks. The
+bounded correction touches the same two production files and three existing
+Task 6 test files. Frozen reproduction files remain unchanged.
+
+A rank-local optimizer exception may occur after other ranks have already
+mutated their model and optimizer. Snapshotting every model and optimizer tensor
+before every step would impose unacceptable steady-state memory and throughput
+cost. The implemented contract is therefore process-terminal:
+
+- every rank attempts its local optimizer step, then reduces a success bit
+  before any GradScaler, clipper, engine-update, scheduler, or teacher clock can
+  commit;
+- if any rank reports failure, every rank raises the same
+  `DistributedOptimizerStepError`, preserves the original exception as
+  `__cause__` on the failing rank, and marks its engine terminal;
+- terminal engines reject every later `step()` and `checkpoint_payload()` call,
+  so partially advanced model/optimizer state cannot become a new checkpoint;
+- recovery is from the last atomic checkpoint in a new process, not by silently
+  continuing a potentially divergent run.
+
+Loss finiteness and gradient finiteness/AMP skip decisions also reduce rank-wide.
+A rank-local AMP overflow skips every optimizer, applies the same scale backoff,
+and leaves model, optimizer, clipper, scheduler, teacher, and update state fixed.
+
+### Distributed transaction RED/GREEN
+
+The two-rank optimizer-failure mode was written first. Initial RED:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-red-opt.utdXpo --failure-mode optimizer --failure-rank 1
+exit 1
+rank 0: no error, clocks_unchanged=false, checkpoint/future step allowed
+rank 1: injected RuntimeError, clocks_unchanged=true
+```
+
+After adding the common terminal decision, the test was strengthened to include
+the GradScaler checkpoint clock. That produced a second RED: both ranks raised
+the terminal error, but rank 0 reported `clocks_unchanged=false` because its
+scaler updated before global success. Moving `GradScaler.update()` behind the
+collective produced final GREEN:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-red-opt.utdXpo --failure-mode optimizer --failure-rank 1
+exit 0
+both ranks: all_ranks_terminal/checkpoint_blocked/future_step_blocked/clocks_unchanged=true
+rank 1 local cause: injected rank-local optimizer failure
+```
+
+The rank-local AMP overflow test began RED with rank 0 committing update 1 at
+scale 8 while rank 1 skipped at update 0 and backed off to scale 4:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-red-amp.Vlh45k --failure-mode amp-overflow --failure-rank 1
+exit 1; all_ranks_skipped=false
+```
+
+Final GREEN:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-red-amp.Vlh45k --failure-mode amp-overflow --failure-rank 1
+exit 0; both ranks skipped=true, update=0, scale=4.0, state_unchanged=true
+```
+
+Loss finiteness received its own test-first cycle. The RED harness safely matched
+the missing collectives so it reported the bug rather than hanging: rank 1
+raised local nonfinite loss while rank 0 proceeded to the later global-gradient
+error. After the rank-wide pre-backward decision, both ranks failed identically:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-red-loss.eE12zu --failure-mode nonfinite-loss --failure-rank 1
+RED: exit 1; rank 0 nonfinite gradients, rank 1 nonfinite loss
+GREEN: exit 0; both ranks FloatingPointError at update 0, state_unchanged=true
+```
+
+### Schema, workflow, and atomic restore RED/GREEN
+
+The initial exhaustive schema/restore selection was:
+
+```text
+rtk python -m pytest -q tests/unit/test_optim.py::test_adagc_rejects_every_malformed_state_without_mutation tests/integration/test_resume.py -k 'malformed_state or missing_legacy or missing_required_state or clock_mismatch or allows_only_v1 or past_update_zero'
+7 failed, 31 passed, 7 deselected
+```
+
+The intended failures showed accepted extra/Boolean AdaGC fields, a missing
+`format_version` error that did not name the key, and the blocked workflow
+transition. Two restore cases initially had a missing test-only `deepcopy`
+import; after correcting that setup, the restore/workflow RED was:
+
+```text
+rtk python -m pytest -q tests/integration/test_resume.py -k 'past_update_zero or clock_mismatch or allows_only_v1'
+3 failed, 25 deselected in 6.90s
+```
+
+The failures proved that missing update-zero state retained live update 1,
+clock mismatch installed update 2 before rejecting checkpoint update 1, and
+workflow validation rejected `global -> adagc` before restore.
+
+Final GREEN for the combined schema/restore selection:
+
+```text
+rtk python -m pytest -q tests/unit/test_optim.py::test_adagc_rejects_every_malformed_state_without_mutation tests/integration/test_resume.py -k 'malformed_state or missing_legacy or missing_required_state or clock_mismatch or allows_only_v1 or past_update_zero'
+38 passed, 7 deselected in 7.29s
+```
+
+AdaGC now parses a strict, exact-key schema into a frozen candidate without
+touching live state. It rejects missing/extra keys, Boolean/wrong versions,
+Boolean/negative updates, wrong name order/type, missing/extra norm entries,
+non-scalar or non-FP32 values, NaN, and negative infinity. Positive infinity
+remains the explicit unobserved/no-gradient sentinel. Restore compares candidate
+and checkpoint clocks first, restores the other checkpoint components, and only
+then installs the candidate. Missing update-zero state installs explicit
+pristine update-zero/+infinity state; missing state after update zero still
+fails closed.
+
+The workflow exception is deliberately narrow: source format must be v1,
+checkpoint update must be the integer zero, saved method must be `global`, and
+active method must be `adagc`. Update greater than zero and every unrelated
+fingerprint mismatch remain rejected.
+
+### Fix Round 1 verification
+
+Focused CPU:
+
+```text
+rtk python -m pytest -q tests/unit/test_optim.py tests/unit/test_engine.py tests/integration/test_resume.py
+58 passed in 4.65s
+```
+
+Full CPU:
+
+```text
+rtk python -m pytest -q tests/unit tests/integration
+369 passed, 8 warnings in 33.25s
+```
+
+The warnings remain the existing multiprocessing `fork()` deprecations in the
+CLI integration tests.
+
+Bounded CUDA:
+
+```text
+rtk python -m pytest -q tests/gpu/test_cuda_training.py -k 'adagc or overflow'
+2 passed, 5 deselected in 5.52s
+```
+
+Successful two-rank exact resume:
+
+```text
+rtk python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task6-fix-nccl-success.hhpkpA
+exit 0; both ranks local_exact/all_ranks_exact/all_ranks_adagc_state=true
+```
+
+The clipper state digest remains
+`6ad554301ec6f72fafa49579394ac4803ae90f438a679f94728102ef79afc012`.
+`compileall` and `git diff --check` also exited successfully without output.
+
+### Fix Round 1 concerns and commit status
+
+- Terminal coordination covers ordinary Python optimizer exceptions that allow
+  every process to reach the success collective. A process death, CUDA context
+  loss, or collective failure remains the launcher/process group's fatal-error
+  domain; no in-process protocol can guarantee a final collective in that case.
+- A terminal failure deliberately does not roll back model/optimizer mutations
+  on ranks whose local step returned. The engine makes those mutations
+  uncheckpointable and unusable, and restart uses the last atomic checkpoint.
+- NCCL retains the harness's existing device-selection and unused-parameter
+  warnings; all exactness and failure-contract assertions pass.
+- This report and the scoped fix are included in the Fix Round 1 commit; its
+  exact hash is recorded in the handoff after commit creation.

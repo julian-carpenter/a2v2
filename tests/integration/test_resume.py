@@ -2,6 +2,7 @@
 restoration. The test covers model, teacher, optimizer, scheduler, counters, and random
 state together."""
 
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -218,6 +219,46 @@ def test_v1_checkpoint_upgrades_without_changing_inference_state(tmp_path: Path)
         assert torch.equal(loaded["model"][name], tensor)
 
 
+@pytest.mark.parametrize("missing_key", sorted(training.LEGACY_REQUIRED_KEYS))
+def test_v1_checkpoint_rejects_each_missing_legacy_required_key(
+    tmp_path: Path,
+    missing_key: str,
+) -> None:
+    """Catch a v1 validator that checks only a representative legacy subset."""
+
+    model, optimizer, scheduler = _components()
+    engine = TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=1.0,
+        device=torch.device("cpu"),
+    )
+    payload = engine.checkpoint_payload(stage="pretrain", config={"tiny": True})
+    payload["format_version"] = 1
+    for key in training.VERSION_2_STATE_KEYS:
+        payload.pop(key)
+    payload.pop(missing_key)
+
+    with pytest.raises(training.CheckpointError, match=missing_key):
+        save_checkpoint(tmp_path / f"missing-{missing_key}.pt", payload)
+
+
+@pytest.mark.parametrize("missing_key", sorted(training.VERSION_2_STATE_KEYS))
+def test_v2_checkpoint_rejects_each_missing_required_state_slot(
+    tmp_path: Path,
+    missing_key: str,
+) -> None:
+    """Catch optional treatment of any required v2 runtime slot."""
+
+    model, engine = _adagc_engine()
+    payload = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    payload.pop(missing_key)
+
+    with pytest.raises(training.CheckpointError, match=missing_key):
+        save_checkpoint(tmp_path / f"missing-{missing_key}.pt", payload)
+
+
 def test_new_checkpoint_save_uses_v2_reserved_state_slots(tmp_path: Path) -> None:
     """Catch new writers that silently retain format v1 or omit reserved state."""
 
@@ -242,19 +283,43 @@ def test_adagc_resume_past_update_zero_rejects_missing_state() -> None:
     """Catch a resumed AdaGC run that silently reinitializes historical norms."""
 
     model, engine = _adagc_engine()
+    pristine = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    _teacher_step(engine, model)
     checkpoint = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
-    checkpoint["update"] = 1
     checkpoint["gradient_clipper"] = None
+    before_reject = deepcopy(engine.gradient_clipper.state_dict())
 
     with pytest.raises(
         training.CheckpointError,
         match="AdaGC.*update 1.*clipper state",
     ):
         engine.restore(checkpoint)
+    _assert_tree_equal(engine.gradient_clipper.state_dict(), before_reject)
 
-    checkpoint["update"] = 0
-    engine.restore(checkpoint)
-    assert engine.gradient_clipper.state_dict()["update"] == 0
+    pristine["gradient_clipper"] = None
+    engine.restore(pristine)
+    expected_model, expected_engine = _adagc_engine()
+    del expected_model
+    _assert_tree_equal(
+        engine.gradient_clipper.state_dict(),
+        expected_engine.gradient_clipper.state_dict(),
+    )
+
+
+def test_adagc_restore_clock_mismatch_does_not_mutate_live_clipper() -> None:
+    """Catch validate-after-install behavior for a clipper/checkpoint clock mismatch."""
+
+    model, engine = _adagc_engine()
+    _teacher_step(engine, model)
+    checkpoint = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    checkpoint["gradient_clipper"] = deepcopy(checkpoint["gradient_clipper"])
+    checkpoint["gradient_clipper"]["update"] = 2
+    before = deepcopy(engine.gradient_clipper.state_dict())
+
+    with pytest.raises(training.CheckpointError, match="does not match checkpoint update"):
+        engine.restore(checkpoint)
+
+    _assert_tree_equal(engine.gradient_clipper.state_dict(), before)
 
 
 def test_adagc_resume_matches_every_next_state_exactly(tmp_path: Path) -> None:
@@ -388,3 +453,53 @@ def test_resume_compatibility_rejects_every_mathematical_state_mismatch() -> Non
     for path, active in mismatches.items():
         with pytest.raises(training.CheckpointError, match=path.replace(".", r"\.")):
             workflows._validate_resume_compatibility(active, checkpoint)
+
+
+def test_workflow_allows_only_v1_update_zero_global_to_adagc_transition(
+    tmp_path: Path,
+) -> None:
+    """Catch workflow compatibility hiding the designed missing-state exception."""
+
+    legacy_config = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    active_adagc = replace(
+        legacy_config,
+        optimization=replace(
+            legacy_config.optimization,
+            gradient_clip_method="adagc",
+        ),
+    )
+    model, optimizer, scheduler = _components()
+    engine = TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=legacy_config.optimization.clip_norm,
+        device=torch.device("cpu"),
+    )
+    legacy = engine.checkpoint_payload(
+        stage="pretrain",
+        config={"active": config_to_dict(legacy_config)},
+    )
+    legacy["format_version"] = 1
+    for key in training.VERSION_2_STATE_KEYS:
+        legacy.pop(key)
+    path = tmp_path / "legacy-update-zero.pt"
+    save_checkpoint(path, legacy)
+    loaded = load_checkpoint(path)
+
+    workflows._validate_resume_compatibility(active_adagc, loaded)
+
+    loaded_after_update = dict(loaded)
+    loaded_after_update["update"] = 1
+    with pytest.raises(
+        training.CheckpointError,
+        match=r"optimization\.gradient_clip_method",
+    ):
+        workflows._validate_resume_compatibility(active_adagc, loaded_after_update)
+
+    changed_seed = replace(
+        active_adagc,
+        common=replace(active_adagc.common, seed=active_adagc.common.seed + 1),
+    )
+    with pytest.raises(training.CheckpointError, match=r"common\.seed"):
+        workflows._validate_resume_compatibility(changed_seed, loaded)
