@@ -60,6 +60,41 @@ def test_stack_returns_one_target_per_executed_layer() -> None:
     assert all(layer.shape == output.shape for layer in layers)
 
 
+@pytest.mark.parametrize("checkpoint_activations", (False, True))
+def test_stack_passes_same_position_ids_to_every_block_and_recomputation(
+    checkpoint_activations: bool,
+) -> None:
+    """Preserve explicit frame coordinates through ordinary and checkpointed blocks."""
+
+    stack = TransformerStack(
+        8,
+        2,
+        depth=2,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        post_mlp_dropout=0.0,
+        checkpoint_activations=checkpoint_activations,
+    ).train()
+    position_ids = torch.tensor([[4, 1, 7, 2], [8, 3, 6, 0]])
+    observed: list[torch.Tensor] = []
+    handles = [
+        block.register_forward_pre_hook(
+            lambda _module, args: observed.append(args[3].detach().clone())
+        )
+        for block in stack.blocks
+    ]
+    value = torch.randn(2, 4, 8, requires_grad=True)
+
+    output, targets = stack(value, position_ids=position_ids)
+    (output.square().sum() + sum(target.square().sum() for target in targets)).backward()
+    for handle in handles:
+        handle.remove()
+
+    assert len(observed) >= len(stack.blocks)
+    assert all(torch.equal(actual, position_ids) for actual in observed)
+
+
 @pytest.mark.parametrize(
     ("enabled", "training", "with_grad", "expected_calls"),
     [

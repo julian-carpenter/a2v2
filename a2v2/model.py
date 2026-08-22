@@ -30,12 +30,15 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .config import (
     Animal2VecConfig,
     ConvLayerSpec,
     DecoderConfig,
+    resolve_attention_backend,
+    resolve_position_encoding,
 )
 from .data import (
     conv_output_length,
@@ -485,6 +488,53 @@ def alibi_bias(
     return alibi_slopes(num_heads, device=device).to(dtype).view(-1, 1, 1) * distance.to(dtype)
 
 
+def apply_rotary_position_embedding(
+    query: Tensor,
+    key: Tensor,
+    position_ids: Tensor,
+    *,
+    theta: float,
+) -> tuple[Tensor, Tensor]:
+    """Rotate packed-projection Q/K pairs at explicit scalar frame IDs."""
+
+    head_dimension = query.shape[-1]
+    if head_dimension % 2:
+        raise ValueError("RoPE attention head dimension must be even")
+    if query.shape != key.shape:
+        raise ValueError("RoPE query and key tensors must have matching shapes")
+    if position_ids.shape != (query.shape[0], query.shape[-2]):
+        raise ValueError("position_ids must have shape [batch, frames]")
+
+    # Mathematics: each adjacent coordinate pair is rotated by
+    # p * theta^(-2i/d), with p taken from the original frame coordinate.
+    # Interpretation: shuffled student tokens retain the teacher frame phase
+    # instead of being renumbered on their shortened sequence axis.
+    frequencies = torch.arange(
+        0,
+        head_dimension,
+        2,
+        device=query.device,
+        dtype=torch.float32,
+    )
+    frequencies = theta ** (-frequencies / head_dimension)
+    angles = position_ids.to(device=query.device, dtype=torch.float32).unsqueeze(-1) * frequencies
+    cosine = angles.cos().unsqueeze(1)
+    sine = angles.sin().unsqueeze(1)
+
+    def rotate(value: Tensor) -> Tensor:
+        """Apply the FP32 two-coordinate rotations and restore input dtype."""
+
+        pairs = value.float().reshape(*value.shape[:-1], head_dimension // 2, 2)
+        first, second = pairs.unbind(-1)
+        rotated = torch.stack(
+            (first * cosine - second * sine, first * sine + second * cosine),
+            dim=-1,
+        )
+        return rotated.flatten(-2).to(value.dtype)
+
+    return rotate(query), rotate(key)
+
+
 class MultiheadAttention(nn.Module):
     """Self-attention with state layout matching Animal2Vec's AltAttention."""
 
@@ -498,6 +548,9 @@ class MultiheadAttention(nn.Module):
         attention_dropout: float = 0.0,
         projection_dropout: float = 0.0,
         cosine_attention: bool = False,
+        position_encoding: str = "none",
+        rope_theta: float = 10_000.0,
+        attention_backend: str = "manual",
     ) -> None:
         super().__init__()
         if embed_dim % num_heads:
@@ -511,6 +564,17 @@ class MultiheadAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(projection_dropout)
         self.cosine_attention = cosine_attention
+        if position_encoding not in {"alibi", "rope", "none"}:
+            raise ValueError("position_encoding must be alibi, rope, or none")
+        if position_encoding == "rope" and self.head_dim % 2:
+            raise ValueError("RoPE attention head dimension must be even")
+        if attention_backend not in {"manual", "sdpa", "flash"}:
+            raise ValueError("attention_backend must be manual, sdpa, or flash")
+        if position_encoding == "alibi" and attention_backend != "manual":
+            raise ValueError("ALiBi attention requires the manual backend")
+        self.position_encoding = position_encoding
+        self.rope_theta = rope_theta
+        self.attention_backend = attention_backend
         if cosine_attention:
             self.logit_scale = nn.Parameter(torch.log(torch.full((num_heads, 1, 1), 10.0)))
 
@@ -519,6 +583,7 @@ class MultiheadAttention(nn.Module):
         value: Tensor,
         padding_mask: Tensor | None = None,
         alibi: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> Tensor:
         """Apply self-attention to a sequence of audio-frame embeddings.
 
@@ -546,35 +611,88 @@ class MultiheadAttention(nn.Module):
         # checkpoint layout while exposing one tensor per attention role.
         qkv = self.qkv(value).reshape(batch, length, 3, self.num_heads, self.head_dim)
         query, key, projected_value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        input_dtype = query.dtype
-        if self.cosine_attention:
-            scores = F.normalize(query, dim=-1) @ F.normalize(key, dim=-1).transpose(-2, -1)
-            maximum = torch.log(torch.tensor(100.0, device=value.device))
-            scores = scores * self.logit_scale.clamp(max=maximum).exp()
+        if self.position_encoding == "rope":
+            if position_ids is None:
+                raise ValueError("RoPE attention requires explicit position_ids")
+            query, key = apply_rotary_position_embedding(
+                query,
+                key,
+                position_ids,
+                theta=self.rope_theta,
+            )
+        if self.attention_backend == "manual":
+            input_dtype = query.dtype
+            if self.cosine_attention:
+                scores = F.normalize(query, dim=-1) @ F.normalize(key, dim=-1).transpose(-2, -1)
+                maximum = torch.log(torch.tensor(100.0, device=value.device))
+                scores = scores * self.logit_scale.clamp(max=maximum).exp()
+            else:
+                # Mathematics: s_{bhij} = q_{bhi}·k_{bhj}/sqrt(d_h), unless an
+                # explicit qk_scale overrides the standard factor.
+                # Interpretation: scaling prevents dot-product variance from
+                # growing with head width and saturating the softmax.
+                scores = (query * self.scale) @ key.transpose(-2, -1)
+            if alibi is not None:
+                if alibi.ndim == 3:
+                    alibi = alibi.unsqueeze(0)
+                # Mathematics: positional log-prior B_{hij} adds to content logits
+                # before normalization.
+                # Interpretation: attention combines learned acoustic similarity
+                # with a fixed or scaled preference for temporal proximity.
+                scores = scores.to(alibi.dtype) + alibi
+            if padding_mask is not None and padding_mask.any():
+                # Mathematics: padded keys receive -∞, hence exp(-∞)=0 in softmax.
+                # Interpretation: real frames cannot attend to batch padding.
+                scores = scores.masked_fill(padding_mask[:, None, None, :].bool(), float("-inf"))
+            # Mathematics: a_{bhij} = exp(s_{bhij})/sum_j exp(s_{bhij}) and
+            # z_{bhi} = sum_j a_{bhij} v_{bhj}.
+            # Interpretation: float32 normalization protects long sequences from
+            # half-precision overflow while weighted values retain the model dtype.
+            weights = scores.softmax(dim=-1, dtype=torch.float32).to(input_dtype)
+            attended = self.attn_drop(weights) @ projected_value
         else:
-            # Mathematics: s_{bhij} = q_{bhi}·k_{bhj}/sqrt(d_h), unless an
-            # explicit qk_scale overrides the standard factor.
-            # Interpretation: scaling prevents dot-product variance from
-            # growing with head width and saturating the softmax.
-            scores = (query * self.scale) @ key.transpose(-2, -1)
-        if alibi is not None:
-            if alibi.ndim == 3:
-                alibi = alibi.unsqueeze(0)
-            # Mathematics: positional log-prior B_{hij} adds to content logits
-            # before normalization.
-            # Interpretation: attention combines learned acoustic similarity
-            # with a fixed or scaled preference for temporal proximity.
-            scores = scores.to(alibi.dtype) + alibi
-        if padding_mask is not None and padding_mask.any():
-            # Mathematics: padded keys receive -∞, hence exp(-∞)=0 in softmax.
-            # Interpretation: real frames cannot attend to batch padding.
-            scores = scores.masked_fill(padding_mask[:, None, None, :].bool(), float("-inf"))
-        # Mathematics: a_{bhij} = exp(s_{bhij})/sum_j exp(s_{bhij}) and
-        # z_{bhi} = sum_j a_{bhij} v_{bhj}.
-        # Interpretation: float32 normalization protects long sequences from
-        # half-precision overflow while weighted values retain the model dtype.
-        weights = scores.softmax(dim=-1, dtype=torch.float32).to(input_dtype)
-        attended = (self.attn_drop(weights) @ projected_value).transpose(1, 2)
+            if alibi is not None:
+                raise ValueError("ALiBi attention requires the manual backend")
+            if self.cosine_attention:
+                raise ValueError("cosine attention requires the manual backend")
+            allowed_keys = None
+            if padding_mask is not None:
+                # Mathematics: SDPA boolean masks use True=allowed, the inverse
+                # of the encoder's True=padding key mask.
+                # Interpretation: only keys are excluded; padded query rows are
+                # retained exactly as in the legacy attention path.
+                allowed_keys = ~padding_mask[:, None, None, :].bool()
+            dropout_probability = self.attn_drop.p if self.training else 0.0
+
+            def fused_attention() -> Tensor:
+                """Call SDPA with the configured scale and key-only mask."""
+
+                return F.scaled_dot_product_attention(
+                    query,
+                    key,
+                    projected_value,
+                    attn_mask=allowed_keys,
+                    dropout_p=dropout_probability,
+                    scale=self.scale,
+                )
+
+            if self.attention_backend == "flash":
+                details = (
+                    "strict FlashAttention failed "
+                    f"(backend=flash, dtype={query.dtype}, device={query.device}, "
+                    f"head_dimension={self.head_dim}, length={length}, "
+                    f"padding={padding_mask is not None})"
+                )
+                if query.device.type != "cuda":
+                    raise RuntimeError(f"{details}: a CUDA tensor is required")
+                try:
+                    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                        attended = fused_attention()
+                except RuntimeError as error:
+                    raise RuntimeError(f"{details}: {error}") from error
+            else:
+                attended = fused_attention()
+        attended = attended.transpose(1, 2)
         attended = attended.reshape(batch, length, dimension)
         return self.proj_drop(self.proj(attended))
 
@@ -1309,6 +1427,9 @@ class TransformerBlock(nn.Module):
         norm_affine: bool = True,
         layer_norm_first: bool = False,
         ffn_targets: bool = True,
+        position_encoding: str = "none",
+        rope_theta: float = 10_000.0,
+        attention_backend: str = "manual",
     ) -> None:
         super().__init__()
         self.layer_norm_first = layer_norm_first
@@ -1320,6 +1441,9 @@ class TransformerBlock(nn.Module):
             qkv_bias=True,
             attention_dropout=attention_dropout,
             projection_dropout=dropout,
+            position_encoding=position_encoding,
+            rope_theta=rope_theta,
+            attention_backend=attention_backend,
         )
         self.drop_path = DropPath(drop_path) if drop_path else nn.Identity()
         self.norm2 = nn.LayerNorm(dimension, eps=norm_eps, elementwise_affine=norm_affine)
@@ -1331,6 +1455,7 @@ class TransformerBlock(nn.Module):
         value: Tensor,
         padding_mask: Tensor | None = None,
         alibi: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Apply attention and feed-forward residual paths.
 
@@ -1346,7 +1471,9 @@ class TransformerBlock(nn.Module):
             # Interpretation: target extraction depends on the intermediate
             # chosen by the official block, so a textbook rewrite would alter
             # teacher regression even if final tensor shapes matched.
-            value = value + self.drop_path(self.attn(self.norm1(value), padding_mask, alibi))
+            value = value + self.drop_path(
+                self.attn(self.norm1(value), padding_mask, alibi, position_ids)
+            )
             residual = value = self.mlp(self.norm2(value))
             target = value
             value = residual + self.drop_path(self.post_mlp_dropout(value))
@@ -1357,7 +1484,9 @@ class TransformerBlock(nn.Module):
             # x_out=Norm2(x'+Drop(MLP(x'))).
             # Interpretation: this is the paper baseline's alternate residual
             # convention selected by layer_norm_first.
-            value = value + self.drop_path(self.attn(value, padding_mask, alibi))
+            value = value + self.drop_path(
+                self.attn(value, padding_mask, alibi, position_ids)
+            )
             residual = value = self.norm1(value)
             value = self.mlp(value)
             target = value
@@ -1395,6 +1524,9 @@ class TransformerStack(nn.Module):
         norm_before: bool = False,
         norm_after: bool | None = None,
         checkpoint_activations: bool = False,
+        position_encoding: str = "none",
+        rope_theta: float = 10_000.0,
+        attention_backend: str = "manual",
     ) -> None:
         super().__init__()
         self.checkpoint_activations = checkpoint_activations
@@ -1415,6 +1547,9 @@ class TransformerStack(nn.Module):
                 norm_affine=norm_affine,
                 layer_norm_first=layer_norm_first,
                 ffn_targets=ffn_targets,
+                position_encoding=position_encoding,
+                rope_theta=rope_theta,
+                attention_backend=attention_backend,
             )
             for index in range(depth)
         ])
@@ -1433,6 +1568,7 @@ class TransformerStack(nn.Module):
         padding_mask: Tensor | None = None,
         alibi: Tensor | None = None,
         alibi_scale: Tensor | None = None,
+        position_ids: Tensor | None = None,
     ) -> tuple[Tensor, list[Tensor]]:
         """Run all non-dropped blocks and collect their teacher-target tensors."""
 
@@ -1466,11 +1602,12 @@ class TransformerStack(nn.Module):
                     value,
                     padding_mask,
                     layer_bias,
+                    position_ids,
                     use_reentrant=False,
                     preserve_rng_state=True,
                 )
             else:
-                value, target = block(value, padding_mask, layer_bias)
+                value, target = block(value, padding_mask, layer_bias, position_ids)
             layer_outputs.append(target)
         if self.norm is not None and self.norm_after:
             value = self.norm(value)
@@ -1693,11 +1830,17 @@ class AudioEncoder(nn.Module):
         learned_alibi_scale: bool = True,
         learned_alibi_scale_per_head: bool = True,
         checkpoint_activations: bool = False,
+        position_encoding: str | None = None,
+        rope_theta: float = 10_000.0,
+        attention_backend: str = "manual",
     ) -> None:
         super().__init__()
         self.layers = tuple(layers)
         self.num_heads = num_heads
-        self.use_alibi = use_alibi
+        self.position_encoding = (
+            "alibi" if use_alibi else "none"
+        ) if position_encoding is None else position_encoding
+        self.use_alibi = self.position_encoding == "alibi"
         self.local_encoder = ConvFeatureEncoder(
             layers,
             sample_rate=sample_rate,
@@ -1723,6 +1866,9 @@ class AudioEncoder(nn.Module):
             norm_affine=norm_affine,
             layer_norm_first=layer_norm_first,
             ffn_targets=not end_of_block_targets,
+            position_encoding=self.position_encoding,
+            rope_theta=rope_theta,
+            attention_backend=attention_backend,
         )
         self.prenet = TransformerStack(
             depth=prenet_depth,
@@ -1797,6 +1943,9 @@ class AudioEncoder(nn.Module):
             learned_alibi_scale=audio.learned_alibi_scale,
             learned_alibi_scale_per_head=audio.learned_alibi_scale_per_head,
             checkpoint_activations=model.checkpoint_activations,
+            position_encoding=resolve_position_encoding(model),
+            rope_theta=model.rope_theta,
+            attention_backend=resolve_attention_backend(model),
         )
 
     @staticmethod
@@ -1881,6 +2030,10 @@ class AudioEncoder(nn.Module):
             )
         positions = self.positional_encoder(positional_input)
         batch, time, _ = projected.shape
+        position_ids = None
+        if self.position_encoding == "rope":
+            position_ids = torch.arange(time, device=projected.device).unsqueeze(0)
+            position_ids = position_ids.expand(batch, -1)
         bias = None
         if self.use_alibi:
             # Mathematics: expand B∈R^{H×T×T} along batch to B batches; expand
@@ -1898,6 +2051,8 @@ class AudioEncoder(nn.Module):
             if mask_info.x_unmasked is None:
                 raise ValueError("mask_info must include gathered features")
             keep = mask_info.ids_keep[..., 0]
+            if position_ids is not None:
+                position_ids = torch.gather(position_ids, 1, keep)
             # Mathematics: x_keep = gather(x,I_keep) and p_keep =
             # gather(P(mask_zero(x)),I_keep), so transformer input is x_keep+p_keep.
             # Interpretation: the student processes only observed frames and
@@ -1922,8 +2077,18 @@ class AudioEncoder(nn.Module):
         # Prenet(value; padding,bias); padding,bias), retaining every layer target.
         # Interpretation: both optional context blocks and the main stack remain
         # visible to teacher-target selection and fine-tuning.
-        value, prenet_layers = self.prenet(value, contextual_padding, bias)
-        value, layer_outputs = self.transformer(value, contextual_padding, bias)
+        value, prenet_layers = self.prenet(
+            value,
+            contextual_padding,
+            bias,
+            position_ids=position_ids,
+        )
+        value, layer_outputs = self.transformer(
+            value,
+            contextual_padding,
+            bias,
+            position_ids=position_ids,
+        )
         return ContextOutput(
             x=value,
             padding_mask=contextual_padding,

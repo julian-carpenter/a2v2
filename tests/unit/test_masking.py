@@ -1,13 +1,22 @@
 """Test deterministic Data2Vec span masks and their restoration indices. The suite covers
 padding, dropout, spacing, short spans, clone independence, and reproducibility."""
 
+from pathlib import Path
+
+import pytest
 import torch
 
+from a2v2.config import load_config
 from a2v2.model import (
+    AudioEncoder,
+    MaskInfo,
     compute_mask_indices,
     make_mask_info,
     masks_for_cloned_batch,
 )
+
+
+ROOT = Path(__file__).parents[2]
 
 
 def test_span_masks_are_deterministic_and_equalized() -> None:
@@ -82,6 +91,59 @@ def test_mask_info_gathers_kept_features_and_can_restore_order() -> None:
     restored = torch.gather(shuffled, 1, info.ids_restore)
     assert torch.equal(restored[~mask], features[~mask])
     assert torch.all(restored[mask] == -1)
+
+
+def test_masked_encoder_gathers_original_shuffled_position_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep teacher frame coordinates instead of renumbering student tokens."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        ("model.position_encoding=rope", "model.attention_backend=manual"),
+    )
+    encoder = AudioEncoder.from_config(config).eval()
+    projected = torch.randn(1, 4, config.model.embed_dim)
+    keep = torch.tensor([[3, 0, 2]])
+    ids_keep = keep.unsqueeze(-1).expand(-1, -1, projected.shape[-1])
+    mask_info = MaskInfo(
+        x_unmasked=torch.gather(projected, 1, ids_keep),
+        mask=torch.tensor([[False, True, False, False]]),
+        ids_restore=torch.arange(4).view(1, 4, 1).expand_as(projected).long(),
+        ids_keep=ids_keep,
+    )
+    observed: list[torch.Tensor | None] = []
+
+    def capture_positions(stack: torch.nn.Module) -> None:
+        """Record IDs at each encoder stack boundary without replacing its work."""
+
+        original = stack.forward
+
+        def forward(
+            value: torch.Tensor,
+            padding_mask: torch.Tensor | None = None,
+            alibi: torch.Tensor | None = None,
+            alibi_scale: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            """Capture one stack boundary and preserve the original execution."""
+
+            observed.append(None if position_ids is None else position_ids.detach().clone())
+            if position_ids is None:
+                return original(value, padding_mask, alibi, alibi_scale)
+            return original(value, padding_mask, alibi, alibi_scale, position_ids)
+
+        monkeypatch.setattr(stack, "forward", forward)
+
+    capture_positions(encoder.prenet)
+    capture_positions(encoder.transformer)
+
+    encoder.encode_projected(projected, mask_info=mask_info)
+
+    expected = torch.tensor([[3, 0, 2]])
+    assert len(observed) == 2
+    assert all(position_ids is not None for position_ids in observed)
+    assert all(torch.equal(position_ids, expected) for position_ids in observed)
 
 
 def test_cloned_batches_receive_distinct_reproducible_masks() -> None:

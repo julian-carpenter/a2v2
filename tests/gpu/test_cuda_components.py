@@ -164,6 +164,96 @@ def test_alibi_attention_fp16_autocast_is_finite(cuda_device: torch.device) -> N
     assert value.grad is not None and torch.isfinite(value.grad).all()
 
 
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("position_encoding", ("none", "rope"))
+def test_strict_flash_matches_manual_forward_backward(
+    cuda_device: torch.device,
+    dtype: torch.dtype,
+    position_encoding: str,
+) -> None:
+    """Exercise only FlashAttention and compare its half-precision gradients."""
+
+    manual = MultiheadAttention(
+        64,
+        4,
+        qkv_bias=True,
+        qk_scale=0.19,
+        attention_dropout=0.0,
+        projection_dropout=0.0,
+        position_encoding=position_encoding,
+        attention_backend="manual",
+    ).to(cuda_device, dtype=dtype).eval()
+    flash = deepcopy(manual)
+    flash.attention_backend = "flash"
+    manual_value = torch.randn(2, 128, 64, device=cuda_device, dtype=dtype, requires_grad=True)
+    flash_value = manual_value.detach().clone().requires_grad_(True)
+    position_ids = None
+    if position_encoding == "rope":
+        position_ids = torch.arange(128, device=cuda_device).roll(17).expand(2, -1)
+
+    manual_output = manual(manual_value, position_ids=position_ids)
+    flash_output = flash(flash_value, position_ids=position_ids)
+    manual_output.float().square().mean().backward()
+    flash_output.float().square().mean().backward()
+
+    tolerance = 3e-3 if dtype == torch.float16 else 3e-2
+    _report_error(f"flash.output.{dtype}.{position_encoding}", flash_output, manual_output)
+    _report_error(f"flash.input_grad.{dtype}.{position_encoding}", flash_value.grad, manual_value.grad)
+    torch.testing.assert_close(flash_output, manual_output, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(flash_value.grad, manual_value.grad, rtol=tolerance, atol=tolerance)
+    for (actual_name, actual), (expected_name, expected) in zip(
+        flash.named_parameters(),
+        manual.named_parameters(),
+        strict=True,
+    ):
+        assert actual_name == expected_name
+        assert actual.grad is not None
+        assert expected.grad is not None
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=tolerance, atol=tolerance)
+
+
+def test_strict_flash_uses_less_peak_memory_than_manual_dense_attention(
+    cuda_device: torch.device,
+) -> None:
+    """Avoid materializing dense scores for a representative long sequence."""
+
+    layer = MultiheadAttention(
+        128,
+        8,
+        qkv_bias=True,
+        attention_dropout=0.0,
+        projection_dropout=0.0,
+        attention_backend="manual",
+    ).to(cuda_device, dtype=torch.float16).eval()
+
+    def peak_allocated(backend: str) -> int:
+        """Measure incremental allocated memory for one forward/backward graph."""
+
+        layer.attention_backend = backend
+        layer.zero_grad(set_to_none=True)
+        value = torch.randn(
+            1,
+            2_048,
+            128,
+            device=cuda_device,
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        torch.cuda.synchronize(cuda_device)
+        baseline = torch.cuda.memory_allocated(cuda_device)
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        output = layer(value)
+        output.float().square().mean().backward()
+        torch.cuda.synchronize(cuda_device)
+        return torch.cuda.max_memory_allocated(cuda_device) - baseline
+
+    manual_peak = peak_allocated("manual")
+    flash_peak = peak_allocated("flash")
+
+    print(json.dumps({"manual_peak_bytes": manual_peak, "flash_peak_bytes": flash_peak}))
+    assert flash_peak < manual_peak
+
+
 def test_decoder_block_keeps_archived_fp32_layer_norm_output_under_autocast(
     cuda_device: torch.device,
 ) -> None:
