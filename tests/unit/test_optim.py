@@ -2,8 +2,12 @@
 suite protects weight-decay exemptions, epsilon placement, warmup indexing, and
 scheduler resume."""
 
+import importlib
 import math
 from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+import tomllib
 
 import pytest
 import torch
@@ -104,6 +108,190 @@ def test_legacy_adam_matches_fairseq_epsilon_placement() -> None:
     assert model.weight.item() == pytest.approx(expected)
 
 
+def test_native_optimizers_do_not_import_bitsandbytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch eager optional imports on the native optimizer paths."""
+
+    real_import = importlib.import_module
+
+    def unexpected_import(name: str, *args: object, **kwargs: object) -> object:
+        """Delegate every import except the optional package under test."""
+
+        if name == "bitsandbytes":
+            pytest.fail("native optimizer unexpectedly imported bitsandbytes")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", unexpected_import)
+    model = GroupFixture()
+
+    optimizer = build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-3,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+    )
+
+    assert type(optimizer) is training.FairseqCompatibleAdam
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0]
+
+
+def test_bitsandbytes_optimizer_rejects_cpu_before_optional_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch unsupported CPU construction or dependency probing before platform checks."""
+
+    real_import = importlib.import_module
+
+    def unexpected_import(name: str, *args: object, **kwargs: object) -> object:
+        """Fail if CPU validation reaches optional-package import."""
+
+        if name == "bitsandbytes":
+            pytest.fail("CPU rejection unexpectedly imported bitsandbytes")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", unexpected_import)
+
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            min_8bit_size=1024,
+            device=torch.device("cpu"),
+        )
+
+
+def test_bitsandbytes_optimizer_missing_extra_error_is_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a raw import error that does not identify the install extra."""
+
+    def missing(name: str) -> object:
+        """Simulate only the selected optional package being unavailable."""
+
+        assert name == "bitsandbytes"
+        raise ModuleNotFoundError("No module named 'bitsandbytes'")
+
+    monkeypatch.setattr(importlib, "import_module", missing)
+
+    with pytest.raises(RuntimeError, match=r"a2v2\[bnb\]"):
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            min_8bit_size=1024,
+            device=torch.device("cuda"),
+        )
+
+
+def test_bitsandbytes_optimizer_rejects_nonpositive_minimum_before_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch an invalid tensor-size threshold reaching the optional package."""
+
+    real_import = importlib.import_module
+
+    def unexpected_import(name: str, *args: object, **kwargs: object) -> object:
+        """Fail if threshold validation reaches optional-package import."""
+
+        if name == "bitsandbytes":
+            pytest.fail("invalid min_8bit_size unexpectedly imported bitsandbytes")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", unexpected_import)
+
+    with pytest.raises(ValueError, match="min_8bit_size must be positive"):
+        build_optimizer(
+            GroupFixture(),
+            name="adam8bit",
+            learning_rate=1e-3,
+            betas=(0.9, 0.98),
+            eps=1e-8,
+            weight_decay=0.1,
+            min_8bit_size=0,
+            device=torch.device("cuda"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_class_name"),
+    (("adam8bit", "FakeAdam8bit"), ("adamw8bit", "FakeAdamW8bit")),
+)
+def test_bitsandbytes_optimizer_selection_forwards_groups_and_adam_hyperparameters(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    expected_class_name: str,
+) -> None:
+    """Catch wrong 8-bit class selection, grouping, or omitted Adam arguments."""
+
+    class FakeOptimizer:
+        """Record constructor inputs at the optional-library boundary."""
+
+        def __init__(self, groups: list[dict[str, object]], **kwargs: object) -> None:
+            self.param_groups = groups
+            self.kwargs = kwargs
+
+    class FakeAdam8bit(FakeOptimizer):
+        """Stand in for bitsandbytes.optim.Adam8bit."""
+
+    class FakeAdamW8bit(FakeOptimizer):
+        """Stand in for bitsandbytes.optim.AdamW8bit."""
+
+    fake_module = SimpleNamespace(
+        __version__="0.49.1",
+        optim=SimpleNamespace(
+            Adam8bit=FakeAdam8bit,
+            AdamW8bit=FakeAdamW8bit,
+        ),
+    )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda imported: fake_module if imported == "bitsandbytes" else None,
+    )
+    model = GroupFixture()
+
+    optimizer = build_optimizer(
+        model,
+        name=name,
+        learning_rate=3e-4,
+        betas=(0.8, 0.95),
+        eps=2e-8,
+        weight_decay=0.12,
+        min_8bit_size=2048,
+        device=torch.device("cuda"),
+    )
+
+    assert type(optimizer).__name__ == expected_class_name
+    assert optimizer.kwargs == {
+        "lr": 3e-4,
+        "betas": (0.8, 0.95),
+        "eps": 2e-8,
+        "min_8bit_size": 2048,
+    }
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.12, 0.0]
+    assert optimizer._a2v2_bitsandbytes_version == "0.49.1"
+
+
+def test_bitsandbytes_extra_uses_the_pinned_compatible_range() -> None:
+    """Catch packaging that omits or broadens the validated optional dependency."""
+
+    metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert metadata["project"]["optional-dependencies"]["bnb"] == [
+        "bitsandbytes>=0.49,<0.50"
+    ]
+
+
 def test_cosine_scheduler_matches_fairseq_update_indexing() -> None:
     """Check cosine scheduler matches fairseq update indexing."""
     parameter = nn.Parameter(torch.ones(()))
@@ -134,6 +322,141 @@ def test_scheduler_state_round_trip() -> None:
     scheduler.load_state_dict(state)
     assert scheduler.last_update == 3
     assert optimizer.param_groups[0]["lr"] == pytest.approx(scheduler.lr_at_update(3))
+
+
+def test_constant_weight_decay_schedule_preserves_legacy_optimizer_state_exactly() -> None:
+    """Catch default scheduling that adds group metadata or checkpoint state."""
+
+    model = GroupFixture()
+    optimizer = build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-3,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+    )
+    before = deepcopy(optimizer.state_dict())
+
+    scheduler = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="constant",
+        weight_decay_end=None,
+        max_updates=4,
+    )
+
+    assert scheduler is None
+    assert optimizer.state_dict() == before
+    assert type(optimizer) is training.FairseqCompatibleAdam
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0]
+    assert [id(parameter) for parameter in optimizer.param_groups[0]["params"]] == [
+        id(model.linear.weight)
+    ]
+    assert [id(parameter) for parameter in optimizer.param_groups[1]["params"]] == [
+        id(model.alibi_scale),
+        id(model.linear.bias),
+        id(model.norm.weight),
+        id(model.norm.bias),
+        id(model.activation.p_swish_alpha),
+        id(model.activation.p_swish_beta),
+    ]
+
+
+def test_cosine_weight_decay_applies_start_midpoint_end_clamp_and_zero_group() -> None:
+    """Catch a wrong cosine clock, endpoint, clamp, or decayed exemption group."""
+
+    model = GroupFixture()
+    optimizer = build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-3,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.2,
+    )
+    scheduler = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="cosine",
+        weight_decay_end=0.02,
+        max_updates=4,
+    )
+
+    assert scheduler is not None
+    assert scheduler.last_update == 0
+    assert [group["initial_weight_decay"] for group in optimizer.param_groups] == [0.2, 0.0]
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.2, 0.0]
+    assert scheduler.step_update(2) == pytest.approx(0.11)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.11, 0.0])
+    assert scheduler.step_update(4) == pytest.approx(0.02)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.02, 0.0])
+    assert scheduler.step_update(9) == pytest.approx(0.02)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.02, 0.0])
+
+
+def test_cosine_weight_decay_omitted_end_defaults_to_current_fixed_decay() -> None:
+    """Catch an omitted endpoint that silently changes the established decay."""
+
+    model = GroupFixture()
+    optimizer = build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-3,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.2,
+    )
+    scheduler = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="cosine",
+        weight_decay_end=None,
+        max_updates=4,
+    )
+
+    assert scheduler is not None
+    assert scheduler.step_update(4) == pytest.approx(0.2)
+    assert [group["weight_decay"] for group in optimizer.param_groups] == pytest.approx([0.2, 0.0])
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        {},
+        {"last_update": 0, "extra": None},
+        {"last_update": True},
+        {"last_update": -1},
+        {"last_update": 1.5},
+    ),
+)
+def test_cosine_weight_decay_rejects_malformed_state_without_mutation(
+    malformed: dict[str, object],
+) -> None:
+    """Catch permissive state parsing or validate-after-install restoration."""
+
+    model = GroupFixture()
+    optimizer = build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-3,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.2,
+    )
+    scheduler = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="cosine",
+        weight_decay_end=0.02,
+        max_updates=4,
+    )
+    assert scheduler is not None
+    scheduler.step_update(2)
+    before_state = scheduler.state_dict()
+    before_decay = [group["weight_decay"] for group in optimizer.param_groups]
+
+    with pytest.raises(training.CheckpointError, match="weight-decay scheduler"):
+        scheduler.load_state_dict(malformed)
+
+    assert scheduler.state_dict() == before_state
+    assert [group["weight_decay"] for group in optimizer.param_groups] == before_decay
 
 
 def test_gradient_clipper_factory_preserves_global_and_none_behavior() -> None:

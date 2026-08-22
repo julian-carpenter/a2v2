@@ -13,6 +13,7 @@ and reduction rules before conceptual comments connect them to reproducibility.
 
 from __future__ import annotations
 
+import importlib
 import io
 import math
 import os
@@ -753,6 +754,8 @@ def build_optimizer(
     betas: tuple[float, float],
     eps: float,
     weight_decay: float,
+    min_8bit_size: int = 4096,
+    device: torch.device | str | None = None,
 ) -> torch.optim.Optimizer:
     """Build optimizer groups with biases and normalization scales un-decayed."""
 
@@ -785,6 +788,46 @@ def build_optimizer(
         optimizer_class = FairseqCompatibleAdam
     elif normalized_name == "adamw":
         optimizer_class = torch.optim.AdamW
+    elif normalized_name in {"adam8bit", "adamw8bit"}:
+        if isinstance(min_8bit_size, bool) or min_8bit_size <= 0:
+            raise ValueError("min_8bit_size must be positive for 8-bit optimizers")
+        selected_device = torch.device(device) if device is not None else next(
+            (
+                parameter.device
+                for group in groups
+                for parameter in group["params"]
+            ),
+            torch.device("cpu"),
+        )
+        if selected_device.type != "cuda":
+            raise RuntimeError(
+                f"optimizer {normalized_name} requires a CUDA device; "
+                "use adam or adamw on CPU"
+            )
+        try:
+            bitsandbytes = importlib.import_module("bitsandbytes")
+        except (ImportError, OSError) as error:
+            raise RuntimeError(
+                f"optimizer {normalized_name} requires bitsandbytes; "
+                "install the optional dependency with pip install 'a2v2[bnb]'"
+            ) from error
+        optimizer_class = getattr(
+            bitsandbytes.optim,
+            "Adam8bit" if normalized_name == "adam8bit" else "AdamW8bit",
+        )
+        optimizer = optimizer_class(
+            groups,
+            lr=learning_rate,
+            betas=betas,
+            eps=eps,
+            min_8bit_size=min_8bit_size,
+        )
+        setattr(
+            optimizer,
+            "_a2v2_bitsandbytes_version",
+            str(getattr(bitsandbytes, "__version__", "unknown")),
+        )
+        return optimizer
     else:
         raise ValueError(f"unsupported optimizer: {name}")
     return optimizer_class(groups, lr=learning_rate, betas=betas, eps=eps)
@@ -878,6 +921,134 @@ class CosineUpdateScheduler:
 
         self.last_update = int(state["last_update"])
         self._set_lr(self.lr_at_update(self.last_update))
+
+
+class CosineWeightDecayScheduler:
+    """Cosine decay on the engine's successful-update clock."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        weight_decay_end: float | None,
+        max_updates: int,
+    ) -> None:
+        if max_updates <= 0:
+            raise ValueError("weight-decay schedule max_updates must be positive")
+        self.optimizer = optimizer
+        self.weight_decay_end = weight_decay_end
+        self.max_updates = max_updates
+        self.initial_weight_decays = tuple(
+            float(group.get("weight_decay", 0.0))
+            for group in optimizer.param_groups
+        )
+        for group, initial in zip(
+            self.optimizer.param_groups,
+            self.initial_weight_decays,
+            strict=True,
+        ):
+            group["initial_weight_decay"] = initial
+        self.last_update = 0
+        self._set_weight_decay(0)
+
+    def _decay_at_update(self, initial: float, update: int) -> float:
+        """Calculate one group's decay while preserving exempt zero groups."""
+
+        if initial == 0.0:
+            return 0.0
+        end = initial if self.weight_decay_end is None else self.weight_decay_end
+        position = min(update, self.max_updates) / self.max_updates
+        return end + 0.5 * (initial - end) * (
+            1 + math.cos(math.pi * position)
+        )
+
+    def _set_weight_decay(self, update: int) -> float:
+        """Apply one update's decay to every optimizer parameter group."""
+
+        live = 0.0
+        for group, initial in zip(
+            self.optimizer.param_groups,
+            self.initial_weight_decays,
+            strict=True,
+        ):
+            decay = self._decay_at_update(initial, update)
+            group["initial_weight_decay"] = initial
+            group["weight_decay"] = decay
+            if initial != 0.0 and live == 0.0:
+                live = decay
+        return live
+
+    def step_update(self, update: int) -> float:
+        """Apply and record decay for a nonnegative absolute update."""
+
+        if isinstance(update, bool) or not isinstance(update, int) or update < 0:
+            raise ValueError("weight-decay scheduler update must be a nonnegative integer")
+        live = self._set_weight_decay(update)
+        self.last_update = update
+        return live
+
+    def state_dict(self) -> dict[str, int]:
+        """Serialize the last applied successful-update index."""
+
+        return {"last_update": self.last_update}
+
+    def validate_state_dict(self, state: Mapping[str, object]) -> int:
+        """Validate scheduler state without mutating optimizer groups."""
+
+        if set(state) != {"last_update"}:
+            raise CheckpointError(
+                "weight-decay scheduler state must contain exactly last_update"
+            )
+        last_update = state["last_update"]
+        if (
+            isinstance(last_update, bool)
+            or not isinstance(last_update, int)
+            or last_update < 0
+        ):
+            raise CheckpointError(
+                "weight-decay scheduler last_update must be a nonnegative integer"
+            )
+        return last_update
+
+    def install_state(self, last_update: int) -> None:
+        """Install one already-validated scheduler clock."""
+
+        self.step_update(last_update)
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        """Validate completely, then install decay state atomically."""
+
+        self.install_state(self.validate_state_dict(state))
+
+
+def build_weight_decay_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    schedule: str,
+    weight_decay_end: float | None,
+    max_updates: int,
+) -> CosineWeightDecayScheduler | None:
+    """Build opt-in decay scheduling without touching the legacy default."""
+
+    if schedule == "constant":
+        return None
+    if schedule == "cosine":
+        return CosineWeightDecayScheduler(
+            optimizer,
+            weight_decay_end=weight_decay_end,
+            max_updates=max_updates,
+        )
+    raise ValueError(f"unsupported weight-decay schedule: {schedule}")
+
+
+def _live_weight_decay(optimizer: torch.optim.Optimizer) -> float:
+    """Return the first nonzero group's live decay, or zero when all are exempt."""
+
+    for group in optimizer.param_groups:
+        decay = float(group.get("weight_decay", 0.0))
+        if decay != 0.0:
+            return decay
+    return 0.0
 
 
 # =============================================================================
@@ -1099,6 +1270,7 @@ class UpdateResult:
     skipped: bool
     pred_var: float | None = None
     target_var: float | None = None
+    weight_decay: float = 0.0
 
 
 class TrainingEngine:
@@ -1118,6 +1290,7 @@ class TrainingEngine:
         clip_norm: float,
         device: torch.device,
         gradient_clipper: GradientClipper | None = None,
+        weight_decay_scheduler: CosineWeightDecayScheduler | None = None,
         use_amp: bool = False,
         amp_init_scale: float = 128.0,
         amp_min_scale: float = 0.0,
@@ -1132,6 +1305,7 @@ class TrainingEngine:
             if gradient_clipper is not None
             else GlobalGradientClipper(model.parameters(), clip_norm=clip_norm)
         )
+        self.weight_decay_scheduler = weight_decay_scheduler
         self.use_amp = use_amp and device.type == "cuda"
         self.amp_min_scale = amp_min_scale
         self.scaler = (
@@ -1282,6 +1456,7 @@ class TrainingEngine:
                 skipped=True,
                 pred_var=pred_var,
                 target_var=target_var,
+                weight_decay=_live_weight_decay(self.optimizer),
             )
         local_step_error: Exception | None = None
         try:
@@ -1318,6 +1493,11 @@ class TrainingEngine:
         self.gradient_clipper.commit(clip_candidate)
         self.update += 1
         learning_rate = self.scheduler.step_update(self.update)
+        weight_decay = (
+            self.weight_decay_scheduler.step_update(self.update)
+            if self.weight_decay_scheduler is not None
+            else _live_weight_decay(self.optimizer)
+        )
         update_teacher = getattr(self.unwrapped_model, "update_teacher", None)
         if callable(update_teacher):
             update_teacher(self.update)
@@ -1330,6 +1510,7 @@ class TrainingEngine:
             skipped=False,
             pred_var=pred_var,
             target_var=target_var,
+            weight_decay=weight_decay,
         )
 
     def checkpoint_payload(
@@ -1360,8 +1541,12 @@ class TrainingEngine:
             "scheduler": self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "gradient_clipper": self.gradient_clipper.state_dict(),
-            # Tasks 7 and 9 fill these reserved v2 runtime slots.
-            "weight_decay_scheduler": None,
+            "weight_decay_scheduler": (
+                self.weight_decay_scheduler.state_dict()
+                if self.weight_decay_scheduler is not None
+                else None
+            ),
+            # Task 9 fills the remaining reserved v2 runtime slot.
             "topology": None,
             "resume_compatibility": (
                 resume_compatibility_fingerprint(config["active"])
@@ -1381,7 +1566,9 @@ class TrainingEngine:
 
         checkpoint_update = int(checkpoint["update"])
         clipper_state = checkpoint.get("gradient_clipper")
+        weight_decay_state = checkpoint.get("weight_decay_scheduler")
         adagc_candidate: AdaGradientClipperState | None = None
+        weight_decay_candidate: int | None = None
         if isinstance(self.gradient_clipper, AdaGradientClipper):
             if clipper_state is None:
                 if checkpoint_update > 0:
@@ -1400,6 +1587,30 @@ class TrainingEngine:
                     )
         else:
             self.gradient_clipper.load_state_dict(clipper_state)
+        if self.weight_decay_scheduler is None:
+            if weight_decay_state is not None:
+                raise CheckpointError(
+                    "constant weight-decay schedule cannot restore scheduler state"
+                )
+        elif weight_decay_state is None:
+            if checkpoint_update > 0:
+                raise CheckpointError(
+                    "weight-decay scheduler cannot resume at update "
+                    f"{checkpoint_update} without state"
+                )
+            weight_decay_candidate = 0
+        elif not isinstance(weight_decay_state, Mapping):
+            raise CheckpointError("weight-decay scheduler state must be a mapping")
+        else:
+            weight_decay_candidate = self.weight_decay_scheduler.validate_state_dict(
+                weight_decay_state
+            )
+            if weight_decay_candidate != checkpoint_update:
+                raise CheckpointError(
+                    "weight-decay scheduler update "
+                    f"{weight_decay_candidate} does not match checkpoint update "
+                    f"{checkpoint_update}"
+                )
         # Mathematics: restore every mutable component before the next batch;
         # strict model loading enforces a bijection between saved and live keys.
         # Interpretation: a checkpoint created by a different architecture or
@@ -1417,3 +1628,5 @@ class TrainingEngine:
         restore_rng_state(checkpoint["rng_state"])
         if adagc_candidate is not None:
             self.gradient_clipper.install_state(adagc_candidate)
+        if weight_decay_candidate is not None:
+            self.weight_decay_scheduler.install_state(weight_decay_candidate)

@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import torch
 
+import a2v2.training as training
 from a2v2.config import config_to_dict, load_config
 from a2v2.model import Animal2VecFineTuningModel
 from a2v2.model import Animal2VecPretrainingModel, TransformerStack, alibi_bias
@@ -484,7 +485,7 @@ def test_amp_overflow_skips_update_and_reduces_scale(
         model.teacher_update.fill_(update)
 
     model.update_teacher = update_teacher
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, weight_decay=0.2)
     scheduler = CosineUpdateScheduler(
         optimizer,
         max_lr=0.1,
@@ -498,6 +499,12 @@ def test_amp_overflow_skips_update_and_reduces_scale(
         clip_norm=0.0,
         adagc_warmup_updates=1,
     )
+    weight_decay_scheduler = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="cosine",
+        weight_decay_end=0.02,
+        max_updates=2,
+    )
     engine = TrainingEngine(
         model,
         optimizer,
@@ -505,6 +512,7 @@ def test_amp_overflow_skips_update_and_reduces_scale(
         clip_norm=0.0,
         device=cuda_device,
         gradient_clipper=gradient_clipper,
+        weight_decay_scheduler=weight_decay_scheduler,
         use_amp=True,
         amp_init_scale=128.0,
         amp_min_scale=1.0,
@@ -525,6 +533,9 @@ def test_amp_overflow_skips_update_and_reduces_scale(
     assert overflow.update == 0
     assert engine.update == 0
     assert engine.scheduler.last_update == -1
+    assert weight_decay_scheduler is not None
+    assert weight_decay_scheduler.state_dict() == {"last_update": 0}
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.2)
     assert engine.scaler is not None and engine.scaler.get_scale() == 64.0
     assert torch.equal(model.weight, weight_before)
     assert model.teacher_update.item() == 0.0
@@ -540,7 +551,72 @@ def test_amp_overflow_skips_update_and_reduces_scale(
     assert not recovered.skipped
     assert recovered.update == 1
     assert engine.update == 1
+    assert recovered.weight_decay == pytest.approx(0.11)
+    assert weight_decay_scheduler.state_dict() == {"last_update": 1}
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.11)
     assert not torch.equal(model.weight, weight_before)
     assert model.teacher_update.item() == 1.0
     if gradient_clip_method == "adagc":
         assert engine.gradient_clipper.state_dict()["update"] == 1
+
+
+@pytest.mark.parametrize("optimizer_name", ("adam8bit", "adamw8bit"))
+def test_bitsandbytes_optimizer_cuda_state_resume(
+    cuda_device: torch.device,
+    tmp_path: Path,
+    optimizer_name: str,
+) -> None:
+    """Require both 8-bit optimizers to continue through normal state interfaces."""
+
+    bitsandbytes = pytest.importorskip(
+        "bitsandbytes",
+        reason="bitsandbytes extra is not installed; install a2v2[bnb] to run this CUDA gate",
+    )
+    torch.manual_seed(811)
+    model = torch.nn.Linear(128, 128, bias=False, device=cuda_device)
+    optimizer = build_optimizer(
+        model,
+        name=optimizer_name,
+        learning_rate=3e-4,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+        min_8bit_size=1,
+        device=cuda_device,
+    )
+    model.weight.grad = torch.randn_like(model.weight)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    path = tmp_path / f"{optimizer_name}.pt"
+    torch.save(
+        {"model": model.state_dict(), "optimizer": optimizer.state_dict()},
+        path,
+    )
+
+    resumed_model = torch.nn.Linear(128, 128, bias=False, device=cuda_device)
+    resumed_optimizer = build_optimizer(
+        resumed_model,
+        name=optimizer_name,
+        learning_rate=3e-4,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+        min_8bit_size=1,
+        device=cuda_device,
+    )
+    checkpoint = torch.load(path, map_location=cuda_device, weights_only=False)
+    resumed_model.load_state_dict(checkpoint["model"], strict=True)
+    resumed_optimizer.load_state_dict(checkpoint["optimizer"])
+    next_gradient = torch.randn_like(model.weight)
+    model.weight.grad = next_gradient.clone()
+    resumed_model.weight.grad = next_gradient.clone()
+
+    optimizer.step()
+    resumed_optimizer.step()
+
+    assert getattr(optimizer, "_a2v2_bitsandbytes_version") == bitsandbytes.__version__
+    assert torch.equal(resumed_model.weight, model.weight)
+    _assert_tree_equal(
+        _clone_tree(resumed_optimizer.state_dict()),
+        _clone_tree(optimizer.state_dict()),
+    )

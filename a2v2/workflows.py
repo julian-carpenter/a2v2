@@ -62,6 +62,7 @@ from .model import (
 from .training import (
     CheckpointError,
     CosineUpdateScheduler,
+    CosineWeightDecayScheduler,
     FORMAT_VERSION,
     FrameCounts,
     GradientClipper,
@@ -70,6 +71,7 @@ from .training import (
     average_precision,
     build_gradient_clipper,
     build_optimizer,
+    build_weight_decay_scheduler,
     capture_rng_state,
     gather_rank_rng_states,
     load_checkpoint,
@@ -149,6 +151,7 @@ class TensorBoardLogger:
             "train/sample_size": result.sample_size,
             "train/gradient_norm": result.gradient_norm,
             "train/learning_rate": result.learning_rate,
+            "train/weight_decay": result.weight_decay,
             "train/skipped": float(result.skipped),
         }
         if amp_scale is not None:
@@ -1532,6 +1535,29 @@ def _build_gradient_clipper_for_config(
     )
 
 
+def _build_weight_decay_scheduler_for_config(
+    optimizer: torch.optim.Optimizer,
+    config: Animal2VecConfig,
+) -> CosineWeightDecayScheduler | None:
+    """Construct opt-in decay scheduling on the configured training horizon."""
+
+    return build_weight_decay_scheduler(
+        optimizer,
+        schedule=config.optimizer.weight_decay_schedule,
+        weight_decay_end=config.optimizer.weight_decay_end,
+        max_updates=config.optimization.max_update,
+    )
+
+
+def _optimizer_run_metadata(
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, object]:
+    """Expose the optional optimizer library version selected for this run."""
+
+    version = getattr(optimizer, "_a2v2_bitsandbytes_version", None)
+    return {"bitsandbytes_version": str(version)} if version is not None else {}
+
+
 def _validate_resume_compatibility(
     config: Animal2VecConfig,
     checkpoint: Mapping[str, object],
@@ -1974,6 +2000,8 @@ def _run_training(
         betas=config.optimizer.betas,
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        min_8bit_size=config.optimizer.min_8bit_size,
+        device=device,
     )
     # Mathematics: scheduler horizon remains config.max_update even when
     # stop_at_update requests an earlier diagnostic termination.
@@ -1986,6 +2014,10 @@ def _run_training(
         warmup_updates=config.scheduler.warmup_updates,
         warmup_init_lr=config.scheduler.warmup_init_lr,
         max_updates=config.optimization.max_update,
+    )
+    weight_decay_scheduler = _build_weight_decay_scheduler_for_config(
+        optimizer,
+        config,
     )
     wrapped: nn.Module = model
     if world_size > 1:
@@ -2006,6 +2038,7 @@ def _run_training(
         clip_norm=config.optimization.clip_norm,
         device=device,
         gradient_clipper=gradient_clipper,
+        weight_decay_scheduler=weight_decay_scheduler,
         use_amp=config.common.fp16,
         amp_init_scale=config.common.fp16_init_scale,
         amp_min_scale=config.common.min_loss_scale,
@@ -2151,6 +2184,7 @@ def _run_training(
                 "sample_size": result.sample_size,
                 "gradient_norm": result.gradient_norm,
                 "learning_rate": result.learning_rate,
+                "weight_decay": result.weight_decay,
                 "skipped": result.skipped,
                 "amp_scale": engine.scaler.get_scale() if engine.scaler is not None else None,
             }
@@ -2277,6 +2311,7 @@ def _run_training(
         "elapsed_seconds": time.perf_counter() - started_at,
         "amp_scale": engine.scaler.get_scale() if engine.scaler is not None else None,
     }
+    summary.update(_optimizer_run_metadata(optimizer))
     if (
         last_result is not None
         and last_result.pred_var is not None

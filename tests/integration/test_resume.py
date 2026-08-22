@@ -131,6 +131,41 @@ def _adagc_engine() -> tuple[TeacherFixture, TrainingEngine]:
     )
 
 
+def _decay_engine() -> tuple[nn.Linear, TrainingEngine]:
+    """Build a tiny engine with an update-zero cosine decay schedule."""
+
+    model = nn.Linear(2, 1)
+    optimizer = training.build_optimizer(
+        model,
+        name="adam",
+        learning_rate=1e-2,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.2,
+    )
+    scheduler = CosineUpdateScheduler(
+        optimizer,
+        max_lr=1e-2,
+        min_lr=1e-4,
+        warmup_updates=1,
+        max_updates=4,
+    )
+    decay = training.build_weight_decay_scheduler(
+        optimizer,
+        schedule="cosine",
+        weight_decay_end=0.02,
+        max_updates=4,
+    )
+    return model, TrainingEngine(
+        model,
+        optimizer,
+        scheduler,
+        clip_norm=1.0,
+        device=torch.device("cpu"),
+        weight_decay_scheduler=decay,
+    )
+
+
 def _teacher_step(engine: TrainingEngine, model: TeacherFixture) -> None:
     """Consume RNG and execute one tiny teacher-backed training update."""
 
@@ -279,6 +314,105 @@ def test_new_checkpoint_save_uses_v2_reserved_state_slots(tmp_path: Path) -> Non
     assert "resume_compatibility" in raw
 
 
+def test_cosine_weight_decay_resume_matches_every_next_state_exactly(
+    tmp_path: Path,
+) -> None:
+    """Catch resume drift in decay, model, optimizer, scheduler, or RNG state."""
+
+    torch.manual_seed(79)
+    model, engine = _decay_engine()
+    first = engine.step(
+        [torch.randn(2, 2)],
+        lambda value: Result(model(value).square().sum(), value.shape[0]),
+    )
+    expected_first_decay = 0.02 + 0.5 * (0.2 - 0.02) * (
+        1 + torch.cos(torch.tensor(torch.pi / 4)).item()
+    )
+    assert first.weight_decay == pytest.approx(expected_first_decay)
+    path = tmp_path / "decay-resume.pt"
+    save_checkpoint(
+        path,
+        engine.checkpoint_payload(stage="pretrain", config={"active": {}}),
+    )
+
+    engine.step(
+        [torch.randn(2, 2)],
+        lambda value: Result(model(value).square().sum(), value.shape[0]),
+    )
+    assert engine.weight_decay_scheduler is not None
+    expected = {
+        "model": model.state_dict(),
+        "optimizer": engine.optimizer.state_dict(),
+        "scheduler": engine.scheduler.state_dict(),
+        "weight_decay_scheduler": engine.weight_decay_scheduler.state_dict(),
+        "update": engine.update,
+        "rng": capture_rng_state(),
+    }
+
+    resumed_model, resumed_engine = _decay_engine()
+    resumed_engine.restore(load_checkpoint(path))
+    resumed_engine.step(
+        [torch.randn(2, 2)],
+        lambda value: Result(
+            resumed_model(value).square().sum(),
+            value.shape[0],
+        ),
+    )
+    assert resumed_engine.weight_decay_scheduler is not None
+    actual = {
+        "model": resumed_model.state_dict(),
+        "optimizer": resumed_engine.optimizer.state_dict(),
+        "scheduler": resumed_engine.scheduler.state_dict(),
+        "weight_decay_scheduler": resumed_engine.weight_decay_scheduler.state_dict(),
+        "update": resumed_engine.update,
+        "rng": capture_rng_state(),
+    }
+
+    _assert_tree_equal(actual, expected)
+
+
+def test_cosine_weight_decay_resume_rejects_missing_past_update_zero_state() -> None:
+    """Catch silent reinitialization of a stateful decay clock after update zero."""
+
+    model, engine = _decay_engine()
+    pristine = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    _step(engine, model)
+    checkpoint = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    checkpoint["weight_decay_scheduler"] = None
+    assert engine.weight_decay_scheduler is not None
+    before = deepcopy(engine.weight_decay_scheduler.state_dict())
+
+    with pytest.raises(
+        training.CheckpointError,
+        match="weight-decay scheduler.*update 1.*state",
+    ):
+        engine.restore(checkpoint)
+
+    assert engine.weight_decay_scheduler.state_dict() == before
+    pristine["weight_decay_scheduler"] = None
+    engine.restore(pristine)
+    assert engine.weight_decay_scheduler.state_dict() == {"last_update": 0}
+    assert [group["weight_decay"] for group in engine.optimizer.param_groups] == pytest.approx([0.2, 0.0])
+
+
+def test_cosine_weight_decay_clock_mismatch_does_not_mutate_live_state() -> None:
+    """Catch installing decay state before comparing its checkpoint clock."""
+
+    model, engine = _decay_engine()
+    _step(engine, model)
+    checkpoint = engine.checkpoint_payload(stage="pretrain", config={"active": {}})
+    checkpoint["weight_decay_scheduler"] = {"last_update": 2}
+    assert engine.weight_decay_scheduler is not None
+    before_state = deepcopy(engine.weight_decay_scheduler.state_dict())
+    before_decay = [group["weight_decay"] for group in engine.optimizer.param_groups]
+
+    with pytest.raises(training.CheckpointError, match="does not match checkpoint update"):
+        engine.restore(checkpoint)
+
+    assert engine.weight_decay_scheduler.state_dict() == before_state
+    assert [group["weight_decay"] for group in engine.optimizer.param_groups] == before_decay
+
+
 def test_adagc_resume_past_update_zero_rejects_missing_state() -> None:
     """Catch a resumed AdaGC run that silently reinitializes historical norms."""
 
@@ -374,9 +508,15 @@ def test_training_workflow_wires_adagc_and_persists_resume_fingerprint(
             gradient_clip_method="adagc",
             adagc_warmup_updates=1,
         ),
+        optimizer=replace(
+            config.optimizer,
+            weight_decay=0.2,
+            weight_decay_schedule="cosine",
+            weight_decay_end=0.02,
+        ),
     )
     model = nn.Linear(2, 1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, weight_decay=0.2)
     scheduler = CosineUpdateScheduler(
         optimizer,
         max_lr=0.1,
@@ -385,6 +525,7 @@ def test_training_workflow_wires_adagc_and_persists_resume_fingerprint(
         max_updates=2,
     )
     clipper = workflows._build_gradient_clipper_for_config(model, config)
+    decay = workflows._build_weight_decay_scheduler_for_config(optimizer, config)
     engine = TrainingEngine(
         model,
         optimizer,
@@ -392,6 +533,7 @@ def test_training_workflow_wires_adagc_and_persists_resume_fingerprint(
         clip_norm=config.optimization.clip_norm,
         device=torch.device("cpu"),
         gradient_clipper=clipper,
+        weight_decay_scheduler=decay,
     )
     engine.step(
         [torch.ones(1, 2)],
@@ -403,8 +545,25 @@ def test_training_workflow_wires_adagc_and_persists_resume_fingerprint(
     )
 
     assert checkpoint["gradient_clipper"]["update"] == 1
+    assert checkpoint["weight_decay_scheduler"] == {"last_update": 1}
+    assert decay is not None
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.11)
     assert checkpoint["resume_compatibility"]["optimization.gradient_clip_method"] == "adagc"
     assert checkpoint["resume_compatibility"]["common.seed"] == config.common.seed
+
+
+def test_optimizer_run_metadata_records_only_selected_bitsandbytes_version() -> None:
+    """Catch run summaries that hide the selected optional library version."""
+
+    model = nn.Linear(2, 1)
+    native = torch.optim.Adam(model.parameters(), lr=1e-3)
+    fake_bnb = torch.optim.Adam(model.parameters(), lr=1e-3)
+    fake_bnb._a2v2_bitsandbytes_version = "0.49.1"
+
+    assert workflows._optimizer_run_metadata(native) == {}
+    assert workflows._optimizer_run_metadata(fake_bnb) == {
+        "bitsandbytes_version": "0.49.1"
+    }
 
 
 def test_resume_compatibility_rejects_every_mathematical_state_mismatch() -> None:

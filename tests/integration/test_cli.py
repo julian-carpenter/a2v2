@@ -310,6 +310,9 @@ def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Pat
         "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
         "--override", f"task.data={manifests}",
         "--override", f"checkpoint.save_dir={output_dir}",
+        "--override", "optimizer.weight_decay=0.2",
+        "--override", "optimizer.weight_decay_schedule=cosine",
+        "--override", "optimizer.weight_decay_end=0.02",
         "--stop-at-update", "1",
         "--device", "cpu",
     ]
@@ -318,14 +321,18 @@ def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Pat
     checkpoint = load_checkpoint(output_dir / "checkpoint_last.pt")
     assert checkpoint["update"] == 1
     assert checkpoint["scheduler"]["last_update"] == 1
+    assert checkpoint["weight_decay_scheduler"] == {"last_update": 1}
     assert checkpoint["config"]["active"]["optimization"]["max_update"] == 2
     assert checkpoint["epoch"] == 1
     records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     summary = next(record["training_summary"] for record in records if "training_summary" in record)
+    update_record = next(record for record in records if "loss" in record)
+    assert update_record["weight_decay"] == pytest.approx(0.11)
     assert summary["rank"] == 0
     assert summary["world_size"] == 1
     assert summary["terminal_update"] == 1
     assert summary["configured_max_update"] == 2
+    assert "train/weight_decay" in _tensorboard_tags(output_dir / "tensorboard")["scalars"]
 
 
 def test_cli_logs_pretraining_variance_diagnostics_only_for_pretraining(
