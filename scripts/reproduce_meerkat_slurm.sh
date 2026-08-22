@@ -30,6 +30,7 @@ if expected_world > 1:
     if not isinstance(topology, Mapping) or int(topology.get("world_size", -1)) != expected_world:
         raise SystemExit(f"checkpoint {path} topology world size does not equal {expected_world}")
 print(f"validated {expected_stage} checkpoint: {path}")'
+readonly SLURM_HELPER_CODE='from a2v2.slurm import main; raise SystemExit(main())'
 readonly LOCK_RECOVERY_CODE='import sys
 from a2v2.slurm import recover_output_lock
 owner = recover_output_lock(sys.argv[1], expected_fingerprint=sys.argv[2])
@@ -148,11 +149,13 @@ recover_lock() {
 
 
 ACTIVE_STEP_PID=""
-PREEMPTION_FORWARDED=false
+PREEMPTION_REQUESTED=false
+LAST_VALIDATED_MARKER=""
+LAST_VALIDATED_CHECKPOINT=""
 
 
 forward_usr1() {
-    PREEMPTION_FORWARDED=true
+    PREEMPTION_REQUESTED=true
     if [[ -n "${ACTIVE_STEP_PID}" ]] && kill -0 "${ACTIVE_STEP_PID}" 2>/dev/null; then
         kill -USR1 "${ACTIVE_STEP_PID}"
     fi
@@ -189,7 +192,11 @@ wait_for_step() {
 checkpoint_signature() {
     local checkpoint="$1"
     if [[ -e "${checkpoint}" ]]; then
-        stat --format='%d:%i:%s:%Y' -- "${checkpoint}"
+        local digest
+        digest="$(sha256sum -- "${checkpoint}")" \
+            || die "cannot fingerprint checkpoint before launch: ${checkpoint}"
+        digest="${digest%% *}"
+        printf 'sha256:%s\n' "${digest}"
     else
         printf 'missing\n'
     fi
@@ -331,10 +338,15 @@ WORLD_SIZE=$((NODES * GPUS_PER_NODE))
 if [[ -n "${RDZV_ENDPOINT}" ]]; then
     [[ -z "${MASTER_ADDR}" && -z "${MASTER_PORT}" ]] \
         || die "--rdzv-endpoint cannot be combined with --master-addr or --master-port"
-    [[ "${RDZV_ENDPOINT}" =~ ^(\\[[^]]+\\]|[^:[:space:]]+):([0-9]+)$ ]] \
-        || die "--rdzv-endpoint must use HOST:PORT syntax"
-    MASTER_ADDR="${RDZV_ENDPOINT%:*}"
-    MASTER_PORT="${BASH_REMATCH[2]}"
+    if [[ "${RDZV_ENDPOINT}" =~ ^\[[^]]+\]:([0-9]+)$ ]]; then
+        MASTER_ADDR="${RDZV_ENDPOINT%:*}"
+        MASTER_PORT="${BASH_REMATCH[1]}"
+    elif [[ "${RDZV_ENDPOINT}" =~ ^[^:[:space:]]+:([0-9]+)$ ]]; then
+        MASTER_ADDR="${RDZV_ENDPOINT%:*}"
+        MASTER_PORT="${BASH_REMATCH[1]}"
+    else
+        die "--rdzv-endpoint must use HOST:PORT syntax (bracket IPv6 literals)"
+    fi
 else
     if [[ -z "${MASTER_ADDR}" ]]; then
         if [[ "${DRY_RUN}" == true ]]; then
@@ -364,6 +376,7 @@ require_positive_integer "rendezvous port" "${MASTER_PORT}"
 RUN_ID="${RUN_ID_OVERRIDE:-${JOB_ID}-meerkat-f${FOLD}-${FRACTION}}"
 [[ -n "${RUN_ID}" ]] || die "--run-id must be nonempty"
 PYTHON_BIN="${A2V2_PYTHON:-python}"
+CONTRACT_PYTHON="${A2V2_CONTRACT_PYTHON:-${PYTHON_BIN}}"
 SRUN_BIN="${A2V2_SRUN:-srun}"
 TRAIN_ENTRY="${A2V2_TRAIN_ENTRY:-a2v2-train}"
 PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-408000}"
@@ -390,6 +403,23 @@ VALID_SUBSET="valid_${FOLD}"
 PRETRAIN_MANIFEST="${MANIFEST_DIR}/pretrain.tsv"
 TRAIN_MANIFEST="${MANIFEST_DIR}/${TRAIN_SUBSET}.tsv"
 VALID_MANIFEST="${MANIFEST_DIR}/${VALID_SUBSET}.tsv"
+PRETRAIN_OVERRIDES=(
+    "task.data=${MANIFEST_DIR}"
+    "checkpoint.save_dir=${OUTPUT_DIR}/pretrain"
+    "distributed_training.distributed_world_size=${WORLD_SIZE}"
+    "dataset.max_tokens=${PRETRAIN_MAX_TOKENS}"
+    "optimization.update_freq=[${PRETRAIN_UPDATE_FREQ}]"
+)
+FINETUNE_OVERRIDES=(
+    "task.data=${MANIFEST_DIR}"
+    "dataset.train_subset=${TRAIN_SUBSET}"
+    "dataset.valid_subset=${VALID_SUBSET}"
+    "checkpoint.save_dir=${OUTPUT_DIR}/finetune"
+    "distributed_training.distributed_world_size=${WORLD_SIZE}"
+    "dataset.max_tokens=${FINETUNE_MAX_TOKENS}"
+    "optimization.update_freq=[${FINETUNE_UPDATE_FREQ}]"
+    "model.checkpoint_activations=true"
+)
 REQUIRED_MANIFESTS=()
 case "${PHASE}" in
     all) REQUIRED_MANIFESTS=("${PRETRAIN_MANIFEST}" "${TRAIN_MANIFEST}" "${VALID_MANIFEST}") ;;
@@ -407,12 +437,12 @@ else
     PRETRAIN_DIR="${OUTPUT_DIR}/pretrain"
     PRETRAIN_CHECKPOINT="${PRETRAIN_DIR}/checkpoint_last.pt"
 fi
+PRETRAIN_OVERRIDES[1]="checkpoint.save_dir=${PRETRAIN_DIR}"
 FINETUNE_DIR="${OUTPUT_DIR}/finetune"
 EVALUATION_DIR="${OUTPUT_DIR}/final-evaluation"
 [[ "${PRETRAIN_DIR}" != "${FINETUNE_DIR}" ]] \
     || die "pretraining and fine-tuning output directories must be distinct: ${PRETRAIN_DIR}"
 FINETUNE_LAST_CHECKPOINT="${FINETUNE_DIR}/checkpoint_last.pt"
-FINETUNE_BEST_CHECKPOINT="${FINETUNE_DIR}/checkpoint_best.pt"
 FINAL_REPORT="${EVALUATION_DIR}/final-evaluation-report.json"
 EVALUATION_TENSORBOARD_DIR="${EVALUATION_DIR}/tensorboard"
 
@@ -426,18 +456,46 @@ if [[ "${DRY_RUN}" == false ]]; then
     mkdir -p "${PRETRAIN_DIR}" "${FINETUNE_DIR}" "${EVALUATION_DIR}"
 fi
 
+LAUNCH_CONTRACT_COMMAND=(
+    env
+    "PYTHONPATH=${REPOSITORY_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    "${CONTRACT_PYTHON}"
+    -c "${SLURM_HELPER_CODE}"
+    launcher-contracts
+    --job-id "${JOB_ID}"
+    --nodes "${NODES}"
+    --processes-per-node "${GPUS_PER_NODE}"
+    --rendezvous-endpoint "${RDZV_ENDPOINT}"
+    --pretrain-output-directory "${PRETRAIN_DIR}"
+    --finetune-output-directory "${FINETUNE_DIR}"
+    --pretrain-config "${PRETRAIN_CONFIG}"
+    --finetune-config "${FINETUNE_CONFIG}"
+    --pretrain-manifest-entry "pretrain.tsv=${PRETRAIN_MANIFEST}"
+    --finetune-manifest-entry "${TRAIN_SUBSET}.tsv=${TRAIN_MANIFEST}"
+    --finetune-manifest-entry "${VALID_SUBSET}.tsv=${VALID_MANIFEST}"
+)
+for override in "${PRETRAIN_OVERRIDES[@]}"; do
+    LAUNCH_CONTRACT_COMMAND+=(--pretrain-override "${override}")
+done
+for override in "${FINETUNE_OVERRIDES[@]}"; do
+    LAUNCH_CONTRACT_COMMAND+=(--finetune-override "${override}")
+done
 if [[ "${DRY_RUN}" == true ]]; then
-    MANIFEST_FINGERPRINT="dry-run-unverified"
-else
-    MANIFEST_DIGEST_INPUT=""
-    for manifest in "${REQUIRED_MANIFESTS[@]}"; do
-        digest="$(sha256sum -- "${manifest}")"
-        digest="${digest%% *}"
-        MANIFEST_DIGEST_INPUT+="$(basename -- "${manifest}"):${digest};"
-    done
-    MANIFEST_FINGERPRINT="$(printf '%s' "${MANIFEST_DIGEST_INPUT}" | sha256sum)"
-    MANIFEST_FINGERPRINT="sha256:${MANIFEST_FINGERPRINT%% *}"
+    LAUNCH_CONTRACT_COMMAND+=(--allow-missing-manifests)
 fi
+LAUNCH_CONTRACT_OUTPUT="$("${LAUNCH_CONTRACT_COMMAND[@]}")" \
+    || die "could not construct canonical phase RunContracts"
+mapfile -t LAUNCH_CONTRACT_FIELDS <<< "${LAUNCH_CONTRACT_OUTPUT}"
+[[ ${#LAUNCH_CONTRACT_FIELDS[@]} -eq 8 ]] \
+    || die "canonical phase RunContract helper returned an incomplete record"
+PRETRAIN_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[0]}"
+PRETRAIN_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[1]}"
+PRETRAIN_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[2]}"
+PRETRAIN_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[3]}"
+FINETUNE_MANIFEST_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[4]}"
+FINETUNE_CONTRACT_JSON="${LAUNCH_CONTRACT_FIELDS[5]}"
+FINETUNE_CONTRACT_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[6]}"
+FINETUNE_CONFIG_FINGERPRINT="${LAUNCH_CONTRACT_FIELDS[7]}"
 
 for recovery in "${RECOVERY_REQUESTS[@]}"; do
     recovery_phase="${recovery%%:*}"
@@ -468,6 +526,25 @@ training_srun_command() {
     local pretrained_checkpoint="$6"
     shift 6
     local training_arguments=("$@")
+    local manifest_fingerprint
+    local run_contract_json
+    local contract_fingerprint
+    local config_fingerprint
+    case "${phase}" in
+        pretrain)
+            manifest_fingerprint="${PRETRAIN_MANIFEST_FINGERPRINT}"
+            run_contract_json="${PRETRAIN_CONTRACT_JSON}"
+            contract_fingerprint="${PRETRAIN_CONTRACT_FINGERPRINT}"
+            config_fingerprint="${PRETRAIN_CONFIG_FINGERPRINT}"
+            ;;
+        finetune)
+            manifest_fingerprint="${FINETUNE_MANIFEST_FINGERPRINT}"
+            run_contract_json="${FINETUNE_CONTRACT_JSON}"
+            contract_fingerprint="${FINETUNE_CONTRACT_FINGERPRINT}"
+            config_fingerprint="${FINETUNE_CONFIG_FINGERPRINT}"
+            ;;
+        *) die "training phase has no canonical contract: ${phase}" ;;
+    esac
     local command=(
         "${SRUN_BIN}"
         "--nodes=${NODES}"
@@ -486,7 +563,10 @@ training_srun_command() {
         --master-port "${MASTER_PORT}"
         --run-id "${run_id}"
         --manifest-dir "${MANIFEST_DIR}"
-        --manifest-fingerprint "${MANIFEST_FINGERPRINT}"
+        --manifest-fingerprint "${manifest_fingerprint}"
+        --run-contract-json "${run_contract_json}"
+        --contract-fingerprint "${contract_fingerprint}"
+        --config-fingerprint "${config_fingerprint}"
         --output-dir "${output_directory}"
         --config "${config}"
     )
@@ -498,6 +578,93 @@ training_srun_command() {
     fi
     command+=(-- "${training_arguments[@]}")
     printf '%s\0' "${command[@]}"
+}
+
+
+completion_record_command() {
+    local action="$1"
+    local phase="$2"
+    local checkpoint="$3"
+    local contract_json
+    local contract_fingerprint
+    local config_fingerprint
+    case "${phase}" in
+        pretrain)
+            contract_json="${PRETRAIN_CONTRACT_JSON}"
+            contract_fingerprint="${PRETRAIN_CONTRACT_FINGERPRINT}"
+            config_fingerprint="${PRETRAIN_CONFIG_FINGERPRINT}"
+            ;;
+        finetune)
+            contract_json="${FINETUNE_CONTRACT_JSON}"
+            contract_fingerprint="${FINETUNE_CONTRACT_FINGERPRINT}"
+            config_fingerprint="${FINETUNE_CONFIG_FINGERPRINT}"
+            ;;
+        *) die "completion record has no canonical contract: ${phase}" ;;
+    esac
+    local command=(
+        env
+        "PYTHONPATH=${REPOSITORY_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+        "${CONTRACT_PYTHON}"
+        -c "${SLURM_HELPER_CODE}"
+        "${action}-completion"
+        --marker "${checkpoint}.stage-complete"
+        --run-contract "${contract_json}"
+        --contract-fingerprint "${contract_fingerprint}"
+        --config-fingerprint "${config_fingerprint}"
+        --checkpoint "${checkpoint}"
+    )
+    printf '%s\0' "${command[@]}"
+}
+
+
+write_completion_record() {
+    local phase="$1"
+    local checkpoint="$2"
+    local command=()
+    while IFS= read -r -d '' argument; do
+        command+=("${argument}")
+    done < <(completion_record_command write "${phase}" "${checkpoint}")
+    "${command[@]}" \
+        || die "could not atomically publish ${phase} completion marker"
+    LAST_VALIDATED_MARKER="${checkpoint}.stage-complete"
+    LAST_VALIDATED_CHECKPOINT="${checkpoint}"
+    LAST_VALIDATED_PHASE="${phase}"
+}
+
+
+validate_completion_record() {
+    local phase="$1"
+    local checkpoint="$2"
+    local command=()
+    while IFS= read -r -d '' argument; do
+        command+=("${argument}")
+    done < <(completion_record_command validate "${phase}" "${checkpoint}")
+    if [[ "${DRY_RUN}" == true ]]; then
+        print_command "${command[@]}"
+    else
+        [[ -f "${checkpoint}.stage-complete" ]] \
+            || die "required ${phase} completion marker is missing: ${checkpoint}.stage-complete"
+        validate_checkpoint "${checkpoint}" "${phase}" "${WORLD_SIZE}"
+        VALIDATED_COMPLETION_OUTPUT="$("${command[@]}")" \
+            || die "${phase} completion marker is malformed, mismatched, or stale; repair or remove it explicitly"
+        [[ "${VALIDATED_COMPLETION_OUTPUT}" == "$(realpath -m -- "${checkpoint}")" ]] \
+            || die "${phase} completion marker selected an unexpected checkpoint"
+    fi
+    LAST_VALIDATED_MARKER="${checkpoint}.stage-complete"
+    LAST_VALIDATED_CHECKPOINT="${checkpoint}"
+    LAST_VALIDATED_PHASE="${phase}"
+}
+
+
+preemption_boundary() {
+    [[ "${PREEMPTION_REQUESTED}" == true ]] || return 0
+    if [[ -n "${LAST_VALIDATED_MARKER}" ]]; then
+        validate_completion_record \
+            "${LAST_VALIDATED_PHASE}" \
+            "${LAST_VALIDATED_CHECKPOINT}"
+    fi
+    printf 'SIGUSR1 is latched at a safe phase boundary; exiting 75 without launching further work\n' >&2
+    return 75
 }
 
 
@@ -515,16 +682,15 @@ run_training_phase() {
         print_command "${command[@]}"
         return 0
     fi
+    preemption_boundary || return $?
 
     local status
-    PREEMPTION_FORWARDED=false
     if wait_for_step "${command[@]}"; then
         status=0
     else
         status=$?
     fi
-    if (( status != 0 )) \
-        && { (( status == 75 )) || [[ "${PREEMPTION_FORWARDED}" == true ]]; }
+    if (( status == 75 )) || [[ "${PREEMPTION_REQUESTED}" == true ]]
     then
         local current_checkpoint_signature
         current_checkpoint_signature="$(checkpoint_signature "${checkpoint}")"
@@ -533,11 +699,14 @@ run_training_phase() {
         if ! validate_checkpoint "${checkpoint}" "${phase}" "${WORLD_SIZE}"; then
             die "${phase} checkpoint validation failed; refusing requeue-friendly exit 75"
         fi
+        if (( status == 0 )); then
+            write_completion_record "${phase}" "${checkpoint}"
+        fi
         return 75
     fi
     (( status == 0 )) || return "${status}"
     validate_checkpoint "${checkpoint}" "${phase}" "${WORLD_SIZE}"
-    printf '%s\n' "${RUN_ID}/${phase}" > "${checkpoint}.stage-complete"
+    write_completion_record "${phase}" "${checkpoint}"
 }
 
 
@@ -606,14 +775,9 @@ run_finetuning() {
 
 run_evaluation() {
     local checkpoint
-    if [[ -f "${FINETUNE_BEST_CHECKPOINT}" || "${DRY_RUN}" == true ]]; then
-        checkpoint="${FINETUNE_BEST_CHECKPOINT}"
-    else
-        checkpoint="${FINETUNE_LAST_CHECKPOINT}"
-    fi
-    if [[ "${DRY_RUN}" == false ]]; then
-        validate_checkpoint "${checkpoint}" finetune "${WORLD_SIZE}"
-    fi
+    checkpoint="${FINETUNE_LAST_CHECKPOINT}"
+    validate_completion_record finetune "${checkpoint}"
+    preemption_boundary || return $?
     local command=(
         "${SRUN_BIN}"
         --nodes=1
@@ -658,29 +822,44 @@ run_or_propagate() {
 }
 
 
+reuse_or_run_stage() {
+    local phase="$1"
+    local checkpoint="$2"
+    local runner="$3"
+    if [[ "${DRY_RUN}" == false ]] \
+        && { [[ -e "${checkpoint}.stage-complete" ]] \
+            || [[ -L "${checkpoint}.stage-complete" ]]; }
+    then
+        validate_completion_record "${phase}" "${checkpoint}"
+    else
+        run_or_propagate "${runner}"
+    fi
+}
+
+
 case "${PHASE}" in
     pretrain)
-        run_or_propagate run_pretraining
+        preemption_boundary || exit $?
+        reuse_or_run_stage pretrain "${PRETRAIN_CHECKPOINT}" run_pretraining
+        preemption_boundary || exit $?
         ;;
     finetune)
-        run_or_propagate run_finetuning
+        preemption_boundary || exit $?
+        reuse_or_run_stage finetune "${FINETUNE_LAST_CHECKPOINT}" run_finetuning
+        preemption_boundary || exit $?
         ;;
     evaluate)
+        preemption_boundary || exit $?
         run_or_propagate run_evaluation
+        preemption_boundary || exit $?
         ;;
     all)
-        if [[ "${DRY_RUN}" == false \
-            && -f "${PRETRAIN_CHECKPOINT}.stage-complete" ]]; then
-            validate_checkpoint "${PRETRAIN_CHECKPOINT}" pretrain "${WORLD_SIZE}"
-        else
-            run_or_propagate run_pretraining
-        fi
-        if [[ "${DRY_RUN}" == false \
-            && -f "${FINETUNE_LAST_CHECKPOINT}.stage-complete" ]]; then
-            validate_checkpoint "${FINETUNE_LAST_CHECKPOINT}" finetune "${WORLD_SIZE}"
-        else
-            run_or_propagate run_finetuning
-        fi
+        preemption_boundary || exit $?
+        reuse_or_run_stage pretrain "${PRETRAIN_CHECKPOINT}" run_pretraining
+        preemption_boundary || exit $?
+        reuse_or_run_stage finetune "${FINETUNE_LAST_CHECKPOINT}" run_finetuning
+        preemption_boundary || exit $?
         run_or_propagate run_evaluation
+        preemption_boundary || exit $?
         ;;
 esac

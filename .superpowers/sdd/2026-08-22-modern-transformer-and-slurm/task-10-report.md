@@ -274,3 +274,164 @@ was started.
 - Checkpoint validation loads the native checkpoint on the batch host with CPU
   mapping. The target submit node must have the repository environment and
   enough memory for that pre-requeue safety check.
+
+## Fix Round 1
+
+### Review findings and strict RED/GREEN evidence
+
+Independent review correctly identified three trust-boundary defects in the
+first implementation: existence-only completion markers, a Bash newline hash
+that was not Task 9's canonical `RunContract`, and a preemption flag cleared
+immediately before each step.
+
+Marker/runtime-contract tests were added before their APIs. The first RED was:
+
+```text
+0 passed, 9 failed
+ImportError: missing CompletionMarkerError, write_stage_completion,
+validate_stage_completion, and config_fingerprint
+```
+
+The marker round-trip, partial/mismatch/stale checkpoint, interrupted atomic
+write, and per-rank mismatch cases then passed:
+
+```text
+9 passed
+```
+
+A separate training-path test failed RED because model construction was
+reached before exported contract validation. After wiring validation directly
+into _`run_training`, before model construction and output locking:
+
+```text
+10 passed
+```
+
+The first runtime-manifest mutation test also failed RED because a changed
+shared manifest was accepted:
+
+```text
+0 passed, 1 failed
+Failed: DID NOT RAISE TopologyError
+```
+
+Every worker now recomputes its phase's shared-manifest identity. The runtime
+config, manifest, and rank mismatch slice passed:
+
+```text
+4 passed
+```
+
+The first combined signal run exposed four heavyweight canonical-helper
+processes before `srun`, causing two deterministic prelaunch tests to time out.
+Both stage contracts are now produced in one canonical Python invocation, and
+nodes do not recompute an outer-supplied bundle. The final marker/signal slice,
+covering prelaunch, handoff, active-success, raw 75, normalized nonzero,
+checkpoint failure, and missing checkpoint, passed:
+
+```text
+8 passed
+```
+
+### Atomic completed-stage record
+
+The marker schema is `a2v2.stage-completion.v1`. Its exact JSON fields are:
+
+- `schema`;
+- the complete canonical `run_contract`;
+- `run_contract_fingerprint`;
+- the fully resolved `config_fingerprint`;
+- `checkpoint`, containing absolute `path`, `size_bytes`, and SHA-256.
+
+The stage, world size, output directory, rendezvous, and phase-specific
+manifest identity are therefore bound through the embedded `RunContract`.
+Writing uses a same-directory candidate, complete JSON plus newline, file
+`fsync`, atomic `os.replace`, and directory `fsync`. An injected
+replacement failure preserves the old marker and cleans the candidate.
+
+Every standalone or `all` stage treats any existing marker as authoritative
+state that must parse and validate. Wrong schema/keys, partial JSON, a
+different contract/config, an unexpected checkpoint path, or changed
+checkpoint bytes fails closed and asks for explicit removal or repair. A valid
+record is reusable. Completion records are published only after the Task 9
+checkpoint stage/world validation succeeds.
+
+Final evaluation requires the active fine-tuning completion record and uses
+its validated `checkpoint_last.pt`. It no longer prefers an unrelated
+pre-existing `checkpoint_best.pt`; the mocked stale-best test verifies the
+exact evaluation command.
+
+### Canonical launcher/runtime contract
+
+`python -m a2v2.slurm launcher-contracts` now uses Task 9's
+`RunContract.to_mapping()` and `RunContract.fingerprint()` canonical JSON.
+One call produces independent pretraining and fine-tuning identities. Each
+manifest digest includes its logical name, absolute path, and file SHA-256.
+Dry-run represents a missing manifest explicitly as null, so it remains
+deterministic without data.
+
+Each stage config fingerprint hashes `config_to_dict(load_config(...,
+overrides))`, using the exact ordered overrides later passed to training.
+Consequently `--phase all`, `--phase pretrain`, and `--phase finetune`
+produce the same identity for the same selected stage. Integration tests
+compare the node export to Python `RunContract.fingerprint()` and compare
+`all` against both standalone selections.
+
+The node exports the complete JSON, canonical fingerprint, config fingerprint,
+and manifest fingerprint. On every worker _`run_training` checks complete
+presence, parses the exact RunContract keys, recomputes the RunContract and
+resolved-config fingerprints, recomputes the active manifests, and compares
+phase, world size, output directory, rendezvous, node/process counts, and
+scheduler job. This occurs before model construction or output-lock
+acquisition. Rank-zero and rank-one mismatch tests both fail early.
+
+Both launchers now accept an explicit bracketed IPv6 endpoint such as
+`[2001:db8::1]:23451`, matching Task 9's parser.
+
+### Latched preemption state machine
+
+`PREEMPTION_REQUESTED` is monotonic and is never cleared. `SIGUSR1`
+received during hashing, validation, recovery, checkpoint handoff, an active
+step, or final marker publication therefore remains visible at the next safe
+boundary.
+
+Before and after every selected stage, a latched request exits 75 without
+launching more work. If an already-completed stage exists, its marker and
+checkpoint are revalidated first. During an active training step, the signal
+is forwarded to synchronous `srun`; even status 0 requires checkpoint bytes
+to differ from the pre-step SHA-256 and requires stage/world validation before
+exit 75. A successful step publishes its completion record before that exit.
+Raw 75 and scheduler-normalized nonzero behavior remain supported. The
+launcher still never calls `scontrol requeue`.
+
+### Fix Round 1 verification and status
+
+Focused gates:
+
+```text
+tests/unit/test_slurm.py: 54 passed
+tests/integration/test_slurm_launcher.py: 31 passed
+tests/integration/test_reproduction_driver.py: 37 passed
+marker/signal final slice: 8 passed
+```
+
+The first fresh full CPU run reached `494 passed, 1 failed, 8 warnings`; the
+sole failure was the repository documentation gate naming two missing nested
+test-helper docstrings. After adding those docstrings, the exact documentation
+gate passed. The second fresh full CPU run completed cleanly:
+
+```text
+495 passed
+```
+
+Bash syntax and `git diff --check` pass. The frozen local driver remains:
+
+```text
+SHA256 485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18
+```
+
+No `sbatch`, real multi-node step, CUDA training, auto-requeue, or
+long-running job was started. The real-site gate and the site-specific
+concerns listed above remain unrun/unchanged. Fix Round 1 is committed as the
+single commit reported in the parent handoff; the report intentionally does
+not embed a self-referential commit hash.

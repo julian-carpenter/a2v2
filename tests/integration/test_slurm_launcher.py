@@ -63,7 +63,12 @@ def _launcher_inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     for name in ("pretrain.tsv", "train_0.tsv", "valid_0.tsv"):
         (manifest_directory / name).touch()
     output_directory.mkdir()
-    config_path.touch()
+    config_path.write_text(
+        (ROOT / "configs/MeerKAT/a2v_large_pretrain_best.yaml").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
     return manifest_directory, output_directory, config_path
 
 
@@ -86,6 +91,7 @@ def _slurm_environment(
         "CUDA_VISIBLE_DEVICES": ",".join(
             str(index) for index in range(gpus_per_node)
         ),
+        "A2V2_CONTRACT_PYTHON": sys.executable,
     }
 
 
@@ -652,6 +658,104 @@ def test_node_dry_run_preserves_an_explicit_endpoint_and_uses_unique_phase_ids(
     ] == ["--rdzv-id=4815-pretrain", "--rdzv-id=4815-finetune"]
 
 
+def test_node_launcher_uses_python_canonical_contract_and_bracketed_ipv6(
+    tmp_path: Path,
+) -> None:
+    """Catch shell-only hashing or rejection of Task 9 bracketed IPv6 syntax."""
+
+    from a2v2.config import config_to_dict, load_config
+    from a2v2.slurm import RunContract, config_fingerprint
+
+    manifests, output, config = _launcher_inputs(tmp_path)
+    overrides = [
+        f"task.data={manifests}",
+        f"checkpoint.save_dir={output}",
+        "distributed_training.distributed_world_size=8",
+    ]
+    arguments = [
+        "a2v2-train",
+        "--config",
+        str(config),
+    ]
+    for override in overrides:
+        arguments.extend(("--override", override))
+    completed = _run_shell(
+        NODE_LAUNCHER,
+        "pretrain",
+        "--dry-run",
+        "--job-id", "4815",
+        "--nodes", "2",
+        "--node-rank", "1",
+        "--gpus-per-node", "4",
+        "--rdzv-endpoint", "[2001:db8::1]:23451",
+        "--run-id", "research/pretrain",
+        "--manifest-dir", str(manifests),
+        "--manifest-fingerprint", "sha256:manifest",
+        "--output-dir", str(output),
+        "--config", str(config),
+        "--",
+        *arguments,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = _rendered_commands(completed.stdout)[0]
+    exported = {
+        item.partition("=")[0]: item.partition("=")[2]
+        for item in command
+        if item.startswith("A2V2_")
+    }
+    contract = RunContract.from_mapping(
+        json.loads(exported["A2V2_SLURM_RUN_CONTRACT"])
+    )
+    assert contract.rendezvous_endpoint == "[2001:db8::1]:23451"
+    assert exported["A2V2_SLURM_CONTRACT_FINGERPRINT"] == contract.fingerprint()
+    assert exported["A2V2_SLURM_CONFIG_FINGERPRINT"] == config_fingerprint(
+        config_to_dict(load_config(config, overrides))
+    )
+
+
+def test_all_and_standalone_launches_share_each_phase_contract_identity(
+    tmp_path: Path,
+) -> None:
+    """Catch overall phase selection leaking into a stage manifest contract."""
+
+    common = (
+        str(tmp_path / "missing manifests"),
+        str(tmp_path / "output"),
+        "--dry-run",
+        "--nodes", "2",
+        "--gpus-per-node", "4",
+        "--job-id", "4815",
+        "--master-addr", "node01",
+        "--run-id", "stable-run",
+    )
+
+    def contracts(phase: str) -> dict[str, tuple[str, str]]:
+        """Return contract and manifest fingerprints rendered for one selection."""
+
+        completed = _run_shell(
+            SLURM_DRIVER,
+            *common,
+            "--phase", phase,
+        )
+        assert completed.returncode == 0, completed.stderr
+        result: dict[str, tuple[str, str]] = {}
+        for command in _rendered_commands(completed.stdout):
+            if str(NODE_LAUNCHER) not in command:
+                continue
+            stage = command[command.index(str(NODE_LAUNCHER)) + 1]
+            result[stage] = (
+                _option_value(command, "--contract-fingerprint"),
+                _option_value(command, "--manifest-fingerprint"),
+            )
+        return result
+
+    all_contracts = contracts("all")
+    assert all_contracts["pretrain"] == contracts("pretrain")["pretrain"]
+    assert all_contracts["finetune"] == contracts("finetune")["finetune"]
+    assert all_contracts["pretrain"] != all_contracts["finetune"]
+
+
 def test_node_launcher_fails_before_torchrun_on_output_lock_contention(
     tmp_path: Path,
 ) -> None:
@@ -984,6 +1088,112 @@ printf '\n' >> "${A2V2_SCHEDULER_TRACE}"
     assert _option_value(srun_command, "--master-addr") == "node01"
 
 
+def test_evaluation_reuses_validated_finetune_marker_and_ignores_stale_best(
+    tmp_path: Path,
+) -> None:
+    """Catch arbitrary checkpoint_best selection or trust in a stale/partial marker."""
+
+    manifests, output, _ = _launcher_inputs(tmp_path)
+    (output / "pretrain").mkdir()
+    (output / "pretrain/checkpoint_last.pt").write_bytes(b"pretrained")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    trace = tmp_path / "srun.trace"
+    _write_executable(
+        fake_bin / "scontrol",
+        "#!/usr/bin/env bash\nprintf 'node01\n'\n",
+    )
+    _write_executable(
+        fake_bin / "python",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        fake_bin / "srun",
+        """#!/usr/bin/env bash
+printf 'srun:' >> "${A2V2_SRUN_TRACE}"
+printf ' %q' "$@" >> "${A2V2_SRUN_TRACE}"
+printf '\n' >> "${A2V2_SRUN_TRACE}"
+output=''
+arguments=("$@")
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+    if [[ "${arguments[index]}" == '--output-dir' ]]; then
+        output="${arguments[index + 1]}"
+    fi
+done
+if [[ -n "${output}" ]]; then
+    mkdir -p "${output}"
+    printf 'fine checkpoint\n' > "${output}/checkpoint_last.pt"
+fi
+""",
+    )
+    environment = {
+        **_slurm_environment(nodes=1, gpus_per_node=1),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_PYTHON": str(fake_bin / "python"),
+        "A2V2_SRUN_TRACE": str(trace),
+    }
+
+    trained = _run_shell(
+        SLURM_DRIVER,
+        str(manifests),
+        str(output),
+        "--phase", "finetune",
+        environment=environment,
+    )
+    assert trained.returncode == 0, trained.stderr
+    marker = output / "finetune/checkpoint_last.pt.stage-complete"
+    assert json.loads(marker.read_text(encoding="utf-8"))["schema"] == (
+        "a2v2.stage-completion.v1"
+    )
+    stale_best = output / "finetune/checkpoint_best.pt"
+    stale_best.write_bytes(b"stale best from another run")
+
+    trace.write_text("", encoding="utf-8")
+    evaluated = _run_shell(
+        SLURM_DRIVER,
+        str(manifests),
+        str(output),
+        "--phase", "evaluate",
+        environment=environment,
+    )
+    assert evaluated.returncode == 0, evaluated.stderr
+    evaluation_command = shlex.split(
+        trace.read_text(encoding="utf-8").strip().removeprefix("srun:")
+    )
+    assert _option_value(evaluation_command, "--checkpoint") == str(
+        output / "finetune/checkpoint_last.pt"
+    )
+    assert str(stale_best) not in evaluation_command
+
+    trace.write_text("", encoding="utf-8")
+    mismatched_environment = {
+        **environment,
+        "A2V2_FINETUNE_MAX_TOKENS": "123",
+    }
+    mismatched = _run_shell(
+        SLURM_DRIVER,
+        str(manifests),
+        str(output),
+        "--phase", "evaluate",
+        environment=mismatched_environment,
+    )
+    assert mismatched.returncode == 2
+    assert "malformed, mismatched, or stale" in mismatched.stderr
+    assert trace.read_text(encoding="utf-8") == ""
+
+    marker.write_text('{"schema":', encoding="utf-8")
+    partial = _run_shell(
+        SLURM_DRIVER,
+        str(manifests),
+        str(output),
+        "--phase", "evaluate",
+        environment=environment,
+    )
+    assert partial.returncode == 2
+    assert "malformed, mismatched, or stale" in partial.stderr
+    assert trace.read_text(encoding="utf-8") == ""
+
+
 def test_slurm_driver_rejects_a_heterogeneous_gpu_allocation_before_srun(
     tmp_path: Path,
 ) -> None:
@@ -1020,7 +1230,13 @@ def test_slurm_driver_rejects_a_heterogeneous_gpu_allocation_before_srun(
 
 @pytest.mark.parametrize(
     ("step_exit", "validation_exit", "write_checkpoint", "expected_exit"),
-    [(75, 0, True, 75), (1, 0, True, 75), (75, 1, True, 2), (1, 0, False, 2)],
+    [
+        (0, 0, True, 75),
+        (75, 0, True, 75),
+        (1, 0, True, 75),
+        (75, 1, True, 2),
+        (1, 0, False, 2),
+    ],
 )
 def test_sigusr1_is_forwarded_and_exit_75_requires_checkpoint_validation(
     tmp_path: Path,
@@ -1112,6 +1328,155 @@ exit "${A2V2_VALIDATION_EXIT}"
         assert "refusing requeue-friendly exit 75" in stderr
     if not write_checkpoint:
         assert "did not publish a new checkpoint" in stderr
+
+
+def test_sigusr1_before_launch_is_latched_until_safe_boundary(
+    tmp_path: Path,
+) -> None:
+    """Catch a request received during hashing being cleared before srun."""
+
+    manifests, output, _ = _launcher_inputs(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    ready = tmp_path / "contract.ready"
+    release = tmp_path / "contract.release"
+    once = tmp_path / "contract.once"
+    srun_trace = tmp_path / "srun.trace"
+    real_python = shlex.quote(sys.executable)
+    _write_executable(
+        fake_bin / "contract-python",
+        f"""#!/usr/bin/env bash
+set -eu
+if [[ ! -e "${{A2V2_ONCE}}" ]]; then
+    touch "${{A2V2_ONCE}}"
+    touch "${{A2V2_READY}}"
+    while [[ ! -e "${{A2V2_RELEASE}}" ]]; do sleep 0.02; done
+fi
+exec {real_python} "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "srun",
+        "#!/usr/bin/env bash\ntouch \"${A2V2_SRUN_TRACE}\"\n",
+    )
+    environment = {
+        **_slurm_environment(nodes=1, gpus_per_node=1),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_CONTRACT_PYTHON": str(fake_bin / "contract-python"),
+        "A2V2_ONCE": str(once),
+        "A2V2_READY": str(ready),
+        "A2V2_RELEASE": str(release),
+        "A2V2_SRUN_TRACE": str(srun_trace),
+    }
+    process = subprocess.Popen(
+        [
+            "bash",
+            str(SLURM_DRIVER),
+            str(manifests),
+            str(output),
+            "--phase", "pretrain",
+            "--master-addr", "node01",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists(), process.communicate(timeout=2)
+
+    os.kill(process.pid, signal.SIGUSR1)
+    release.touch()
+    stdout, stderr = process.communicate(timeout=20)
+
+    assert process.returncode == 75, stdout + stderr
+    assert "safe phase boundary" in stderr
+    assert not srun_trace.exists()
+
+
+def test_sigusr1_during_phase_handoff_keeps_completed_marker_and_stops(
+    tmp_path: Path,
+) -> None:
+    """Catch a handoff signal being discarded before the next training phase."""
+
+    manifests, output, _ = _launcher_inputs(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    ready = tmp_path / "marker.ready"
+    release = tmp_path / "marker.release"
+    srun_trace = tmp_path / "srun.trace"
+    real_python = shlex.quote(sys.executable)
+    _write_executable(
+        fake_bin / "contract-python",
+        f"""#!/usr/bin/env bash
+set -eu
+if [[ " $* " == *" write-completion "* ]]; then
+    {real_python} "$@"
+    touch "${{A2V2_READY}}"
+    while [[ ! -e "${{A2V2_RELEASE}}" ]]; do sleep 0.02; done
+    exit 0
+fi
+exec {real_python} "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "python",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        fake_bin / "srun",
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${A2V2_SRUN_TRACE}"
+output=''
+while (($#)); do
+    if [[ "$1" == '--output-dir' ]]; then output="$2"; shift 2; else shift; fi
+done
+mkdir -p "$output"
+printf 'checkpoint\n' > "$output/checkpoint_last.pt"
+""",
+    )
+    environment = {
+        **_slurm_environment(nodes=1, gpus_per_node=1),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "A2V2_PYTHON": str(fake_bin / "python"),
+        "A2V2_CONTRACT_PYTHON": str(fake_bin / "contract-python"),
+        "A2V2_READY": str(ready),
+        "A2V2_RELEASE": str(release),
+        "A2V2_SRUN_TRACE": str(srun_trace),
+    }
+    process = subprocess.Popen(
+        [
+            "bash",
+            str(SLURM_DRIVER),
+            str(manifests),
+            str(output),
+            "--phase", "all",
+            "--master-addr", "node01",
+        ],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 15
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists(), process.communicate(timeout=2)
+
+    os.kill(process.pid, signal.SIGUSR1)
+    release.touch()
+    stdout, stderr = process.communicate(timeout=20)
+
+    assert process.returncode == 75, stdout + stderr
+    assert (output / "pretrain/checkpoint_last.pt.stage-complete").is_file()
+    launches = srun_trace.read_text(encoding="utf-8").splitlines()
+    assert len(launches) == 1
+    assert " pretrain " in f" {launches[0]} "
+    assert " finetune " not in f" {launches[0]} "
 
 
 def test_explicit_output_lock_recovery_is_fingerprinted_and_rendered_first(

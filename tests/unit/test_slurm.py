@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import random
 import signal
 from concurrent.futures import ThreadPoolExecutor
@@ -188,6 +189,330 @@ def test_run_contract_fingerprint_is_canonical_and_diff_names_fields(
         "manifest_fingerprint": ("sha256:abc", "sha256:def"),
         "world_size": (8, 4),
     }
+
+
+def _completion_contract(tmp_path: Path, *, phase: str = "pretrain") -> object:
+    """Build one stage-specific canonical contract for marker tests."""
+
+    from a2v2.slurm import RunContract
+
+    return RunContract(
+        job_id="4815",
+        phase=phase,
+        node_count=2,
+        processes_per_node=4,
+        world_size=8,
+        rendezvous_endpoint="gpu07:29400",
+        rendezvous_id=f"4815-{phase}",
+        output_directory=str(tmp_path / phase),
+        manifest_fingerprint=f"sha256:{phase}-manifest",
+    )
+
+
+def test_stage_completion_round_trip_binds_exact_contract_and_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Catch existence-only markers or checkpoint paths without byte identity."""
+
+    from a2v2.slurm import (
+        COMPLETION_MARKER_SCHEMA,
+        checkpoint_identity,
+        validate_stage_completion,
+        write_stage_completion,
+    )
+
+    contract = _completion_contract(tmp_path)
+    checkpoint = tmp_path / "pretrain" / "checkpoint_last.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint-one")
+    marker = checkpoint.with_suffix(checkpoint.suffix + ".stage-complete")
+
+    write_stage_completion(
+        marker,
+        contract=contract,
+        config_fingerprint="config-fingerprint",
+        checkpoint_path=checkpoint,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["schema"] == COMPLETION_MARKER_SCHEMA
+    assert payload["run_contract"] == contract.to_mapping()
+    assert payload["run_contract_fingerprint"] == contract.fingerprint()
+    assert payload["config_fingerprint"] == "config-fingerprint"
+    assert payload["checkpoint"] == checkpoint_identity(checkpoint).to_mapping()
+    assert validate_stage_completion(
+        marker,
+        expected_contract=contract,
+        expected_config_fingerprint="config-fingerprint",
+        expected_checkpoint_path=checkpoint,
+    ) == checkpoint.resolve()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("partial", "contract", "config", "checkpoint-path", "checkpoint-bytes"),
+)
+def test_stage_completion_rejects_partial_mismatched_or_stale_state(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Require explicit action for every untrusted completed-stage record."""
+
+    from a2v2.slurm import (
+        CompletionMarkerError,
+        RunContract,
+        validate_stage_completion,
+        write_stage_completion,
+    )
+
+    contract = _completion_contract(tmp_path)
+    checkpoint = tmp_path / "pretrain" / "checkpoint_last.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint-one")
+    marker = checkpoint.with_suffix(checkpoint.suffix + ".stage-complete")
+    write_stage_completion(
+        marker,
+        contract=contract,
+        config_fingerprint="config-fingerprint",
+        checkpoint_path=checkpoint,
+    )
+    expected = contract
+    config_fingerprint = "config-fingerprint"
+    expected_checkpoint = checkpoint
+    if mutation == "partial":
+        marker.write_text('{"schema":', encoding="utf-8")
+    elif mutation == "contract":
+        expected = RunContract.from_mapping({
+            **contract.to_mapping(),
+            "manifest_fingerprint": "sha256:new-manifest",
+        })
+    elif mutation == "config":
+        config_fingerprint = "new-config-fingerprint"
+    elif mutation == "checkpoint-path":
+        expected_checkpoint = tmp_path / "different.pt"
+    else:
+        checkpoint.write_bytes(b"checkpoint-two")
+
+    with pytest.raises(CompletionMarkerError):
+        validate_stage_completion(
+            marker,
+            expected_contract=expected,
+            expected_config_fingerprint=config_fingerprint,
+            expected_checkpoint_path=expected_checkpoint,
+        )
+
+
+def test_stage_completion_atomic_write_interruption_preserves_old_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch truncate-in-place updates that leave a trusted partial marker."""
+
+    from a2v2.slurm import write_stage_completion
+
+    contract = _completion_contract(tmp_path)
+    checkpoint = tmp_path / "pretrain" / "checkpoint_last.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint-one")
+    marker = checkpoint.with_suffix(checkpoint.suffix + ".stage-complete")
+    marker.write_bytes(b"old-complete-record\n")
+
+    def interrupted_replace(_source: object, _destination: object) -> None:
+        """Simulate power loss after a durable candidate but before replacement."""
+
+        raise OSError("injected interruption before atomic replace")
+
+    monkeypatch.setattr(os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="injected interruption"):
+        write_stage_completion(
+            marker,
+            contract=contract,
+            config_fingerprint="config-fingerprint",
+            checkpoint_path=checkpoint,
+        )
+
+    assert marker.read_bytes() == b"old-complete-record\n"
+    assert not tuple(marker.parent.glob("." + marker.name + ".*.candidate"))
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+def test_launcher_contract_mismatch_fails_early_on_every_rank(
+    tmp_path: Path,
+    rank: int,
+) -> None:
+    """Catch rank-zero-only or advisory validation of exported launch state."""
+
+    from a2v2.slurm import (
+        DistributedEnvironment,
+        SlurmEnvironment,
+        TopologyError,
+        config_fingerprint,
+        validate_launcher_contract,
+    )
+
+    contract = _completion_contract(tmp_path)
+    config = {
+        "stage": "pretrain",
+        "checkpoint": {"save_dir": str(tmp_path / "pretrain")},
+    }
+    environment = {
+        **_slurm_environment(),
+        "SLURM_JOB_NUM_NODES": "1",
+        "SLURM_NODEID": "0",
+        "SLURM_GPUS_ON_NODE": "2",
+        "RANK": str(rank),
+        "LOCAL_RANK": str(rank),
+        "WORLD_SIZE": "2",
+        "LOCAL_WORLD_SIZE": "2",
+        "A2V2_RUN_ID": "4815/pretrain",
+        "A2V2_SLURM_PHASE": "pretrain",
+        "A2V2_SLURM_WORLD_SIZE": "8",
+        "A2V2_SLURM_RDZV_ENDPOINT": "gpu07:29400",
+        "A2V2_SLURM_RDZV_ID": "4815-pretrain",
+        "A2V2_SLURM_MANIFEST_FINGERPRINT": contract.manifest_fingerprint,
+        "A2V2_SLURM_RUN_CONTRACT": json.dumps(contract.to_mapping()),
+        "A2V2_SLURM_CONTRACT_FINGERPRINT": "0" * 64,
+        "A2V2_SLURM_CONFIG_FINGERPRINT": config_fingerprint(config),
+    }
+
+    with pytest.raises(TopologyError, match="fingerprint"):
+        validate_launcher_contract(
+            environment,
+            config=config,
+            slurm=SlurmEnvironment.from_mapping(environment),
+            distributed=DistributedEnvironment.from_mapping(environment),
+        )
+
+
+def test_training_consumes_launcher_contract_before_model_or_output_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a validated helper that the real training path never invokes."""
+
+    from dataclasses import replace
+
+    import a2v2.workflows as workflows
+    from a2v2.config import config_to_dict, load_config
+    from a2v2.slurm import RunContract, TopologyError, config_fingerprint
+
+    config = load_config(
+        Path(__file__).resolve().parents[2]
+        / "configs/MeerKAT/a2v_large_pretrain_best.yaml"
+    )
+    config = replace(
+        config,
+        checkpoint=replace(config.checkpoint, save_dir=tmp_path / "pretrain"),
+        distributed=replace(config.distributed, requested_world_size=1),
+    )
+    contract = RunContract(
+        job_id="4815",
+        phase="pretrain",
+        node_count=1,
+        processes_per_node=1,
+        world_size=1,
+        rendezvous_endpoint="gpu07:29400",
+        rendezvous_id="4815-pretrain",
+        output_directory=str(tmp_path / "pretrain"),
+        manifest_fingerprint="sha256:manifest",
+    )
+    launcher_environment = {
+        "A2V2_RUN_ID": "4815/pretrain",
+        "A2V2_SLURM_PHASE": "pretrain",
+        "A2V2_SLURM_WORLD_SIZE": "1",
+        "A2V2_SLURM_RDZV_ENDPOINT": contract.rendezvous_endpoint,
+        "A2V2_SLURM_RDZV_ID": contract.rendezvous_id,
+        "A2V2_SLURM_MANIFEST_FINGERPRINT": contract.manifest_fingerprint,
+        "A2V2_SLURM_RUN_CONTRACT": json.dumps(contract.to_mapping()),
+        "A2V2_SLURM_CONTRACT_FINGERPRINT": "0" * 64,
+        "A2V2_SLURM_CONFIG_FINGERPRINT": config_fingerprint(config_to_dict(config)),
+    }
+    for name, value in launcher_environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        workflows,
+        "_distributed_device",
+        lambda _: (torch.device("cpu"), 0, 1, False),
+    )
+    monkeypatch.setattr(
+        workflows,
+        "_make_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("model construction must not run")
+        ),
+    )
+
+    with pytest.raises(TopologyError, match="fingerprint"):
+        workflows._run_training(
+            config,
+            device_name="cpu",
+            resume_path=None,
+            pretrained_checkpoint=None,
+        )
+
+
+def test_runtime_recomputes_active_phase_manifest_identity(tmp_path: Path) -> None:
+    """Catch an exported self-consistent contract after shared data changed."""
+
+    from a2v2.slurm import (
+        DistributedEnvironment,
+        RunContract,
+        TopologyError,
+        config_fingerprint,
+        manifest_fingerprint,
+        validate_launcher_contract,
+    )
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    pretrain_manifest = manifests / "pretrain.tsv"
+    pretrain_manifest.write_text("first\n", encoding="utf-8")
+    output = tmp_path / "pretrain"
+    config = {
+        "stage": "pretrain",
+        "task": {"data": str(manifests)},
+        "dataset": {"train_subset": "train", "valid_subset": "valid"},
+        "checkpoint": {"save_dir": str(output)},
+    }
+    contract = RunContract(
+        job_id="4815",
+        phase="pretrain",
+        node_count=1,
+        processes_per_node=1,
+        world_size=1,
+        rendezvous_endpoint="gpu07:29400",
+        rendezvous_id="4815-pretrain",
+        output_directory=str(output),
+        manifest_fingerprint=manifest_fingerprint(
+            (("pretrain.tsv", pretrain_manifest),)
+        ),
+    )
+    environment = {
+        "A2V2_RUN_ID": "4815/pretrain",
+        "A2V2_SLURM_PHASE": "pretrain",
+        "A2V2_SLURM_WORLD_SIZE": "1",
+        "A2V2_SLURM_RDZV_ENDPOINT": contract.rendezvous_endpoint,
+        "A2V2_SLURM_RDZV_ID": contract.rendezvous_id,
+        "A2V2_SLURM_MANIFEST_FINGERPRINT": contract.manifest_fingerprint,
+        "A2V2_SLURM_RUN_CONTRACT": json.dumps(contract.to_mapping()),
+        "A2V2_SLURM_CONTRACT_FINGERPRINT": contract.fingerprint(),
+        "A2V2_SLURM_CONFIG_FINGERPRINT": config_fingerprint(config),
+    }
+    assert validate_launcher_contract(
+        environment,
+        config=config,
+        slurm=None,
+        distributed=DistributedEnvironment.from_mapping({}),
+    ) == contract
+
+    pretrain_manifest.write_text("changed\n", encoding="utf-8")
+    with pytest.raises(TopologyError, match="manifest fingerprint"):
+        validate_launcher_contract(
+            environment,
+            config=config,
+            slurm=None,
+            distributed=DistributedEnvironment.from_mapping({}),
+        )
 
 
 def _torchrun_environment() -> dict[str, str]:

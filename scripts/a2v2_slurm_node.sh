@@ -5,6 +5,8 @@
 
 set -Eeuo pipefail
 
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SLURM_HELPER_CODE='from a2v2.slurm import main; raise SystemExit(main())'
 
 usage() {
     cat <<'USAGE'
@@ -26,6 +28,9 @@ Rendezvous/topology options:
   --master-port PORT
   --rdzv-endpoint HOST:PORT
   --manifest-fingerprint VALUE
+  --run-contract-json JSON
+  --contract-fingerprint SHA256
+  --config-fingerprint SHA256
 
 Checkpoint preflight options:
   --resume-checkpoint PATH
@@ -92,6 +97,9 @@ RDZV_ENDPOINT=""
 RUN_ID=""
 MANIFEST_DIR=""
 MANIFEST_FINGERPRINT="unverified"
+RUN_CONTRACT_JSON=""
+CONTRACT_FINGERPRINT=""
+CONFIG_FINGERPRINT=""
 OUTPUT_DIR=""
 CONFIG_PATH=""
 RESUME_CHECKPOINT=""
@@ -99,7 +107,7 @@ PRETRAINED_CHECKPOINT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --job-id|--nodes|--node-rank|--gpus-per-node|--master-addr|--master-port|--rdzv-endpoint|--run-id|--manifest-dir|--manifest-fingerprint|--output-dir|--config|--resume-checkpoint|--pretrained-checkpoint)
+        --job-id|--nodes|--node-rank|--gpus-per-node|--master-addr|--master-port|--rdzv-endpoint|--run-id|--manifest-dir|--manifest-fingerprint|--run-contract-json|--contract-fingerprint|--config-fingerprint|--output-dir|--config|--resume-checkpoint|--pretrained-checkpoint)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             option="$1"
             value="$2"
@@ -114,6 +122,9 @@ while [[ $# -gt 0 ]]; do
                 --run-id) RUN_ID="${value}" ;;
                 --manifest-dir) MANIFEST_DIR="${value}" ;;
                 --manifest-fingerprint) MANIFEST_FINGERPRINT="${value}" ;;
+                --run-contract-json) RUN_CONTRACT_JSON="${value}" ;;
+                --contract-fingerprint) CONTRACT_FINGERPRINT="${value}" ;;
+                --config-fingerprint) CONFIG_FINGERPRINT="${value}" ;;
                 --output-dir) OUTPUT_DIR="${value}" ;;
                 --config) CONFIG_PATH="${value}" ;;
                 --resume-checkpoint) RESUME_CHECKPOINT="${value}" ;;
@@ -208,9 +219,13 @@ fi
 if [[ -n "${RDZV_ENDPOINT}" ]]; then
     [[ -z "${MASTER_ADDR}" && -z "${MASTER_PORT}" ]] \
         || die "--rdzv-endpoint cannot be combined with --master-addr or --master-port"
-    [[ "${RDZV_ENDPOINT}" =~ ^(\[[^]]+\]|[^:[:space:]]+):([0-9]+)$ ]] \
-        || die "--rdzv-endpoint must use HOST:PORT syntax"
-    MASTER_PORT="${BASH_REMATCH[2]}"
+    if [[ "${RDZV_ENDPOINT}" =~ ^\[[^]]+\]:([0-9]+)$ ]]; then
+        MASTER_PORT="${BASH_REMATCH[1]}"
+    elif [[ "${RDZV_ENDPOINT}" =~ ^[^:[:space:]]+:([0-9]+)$ ]]; then
+        MASTER_PORT="${BASH_REMATCH[1]}"
+    else
+        die "--rdzv-endpoint must use HOST:PORT syntax (bracket IPv6 literals)"
+    fi
 else
     [[ -n "${MASTER_ADDR}" ]] || die "--master-addr is required"
     [[ -n "${MASTER_PORT}" ]] || die "--master-port is required"
@@ -222,22 +237,51 @@ require_positive_integer "rendezvous port" "${MASTER_PORT}"
 
 WORLD_SIZE=$((NODES * GPUS_PER_NODE))
 RDZV_ID="${JOB_ID}-${PHASE}"
-CONTRACT_INPUT="$(
-    printf '%s\n' \
-        "${JOB_ID}" \
-        "${PHASE}" \
-        "${NODES}" \
-        "${GPUS_PER_NODE}" \
-        "${WORLD_SIZE}" \
-        "${RDZV_ENDPOINT}" \
-        "${RDZV_ID}" \
-        "${OUTPUT_DIR}" \
-        "${MANIFEST_FINGERPRINT}"
-)"
-CONTRACT_FINGERPRINT="$(printf '%s' "${CONTRACT_INPUT}" | sha256sum)"
-CONTRACT_FINGERPRINT="${CONTRACT_FINGERPRINT%% *}"
-
 PYTHON_BIN="${A2V2_PYTHON:-python}"
+CONTRACT_PYTHON="${A2V2_CONTRACT_PYTHON:-${PYTHON_BIN}}"
+CONTRACT_OVERRIDES=()
+for ((index = 0; index < ${#TRAIN_COMMAND[@]}; index++)); do
+    if [[ "${TRAIN_COMMAND[index]}" == --override ]]; then
+        (( index + 1 < ${#TRAIN_COMMAND[@]} )) \
+            || die "training --override is missing its value"
+        CONTRACT_OVERRIDES+=(--override "${TRAIN_COMMAND[index + 1]}")
+        ((index += 1))
+    fi
+done
+if [[ -n "${RUN_CONTRACT_JSON}" || -n "${CONTRACT_FINGERPRINT}" || -n "${CONFIG_FINGERPRINT}" ]]; then
+    [[ -n "${RUN_CONTRACT_JSON}" && -n "${CONTRACT_FINGERPRINT}" && -n "${CONFIG_FINGERPRINT}" ]] \
+        || die "run contract JSON, contract fingerprint, and config fingerprint must be supplied together"
+else
+    CONTRACT_COMMAND=(
+        env
+        "PYTHONPATH=${SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}"
+        "${CONTRACT_PYTHON}"
+        -c "${SLURM_HELPER_CODE}"
+        contract
+        --job-id "${JOB_ID}"
+        --phase "${PHASE}"
+        --nodes "${NODES}"
+        --processes-per-node "${GPUS_PER_NODE}"
+        --rendezvous-endpoint "${RDZV_ENDPOINT}"
+        --rendezvous-id "${RDZV_ID}"
+        --output-directory "${OUTPUT_DIR}"
+        --manifest-fingerprint "${MANIFEST_FINGERPRINT}"
+        --config "${CONFIG_PATH}"
+        "${CONTRACT_OVERRIDES[@]}"
+    )
+    if [[ "${DRY_RUN}" == true && ! -f "${CONFIG_PATH}" ]]; then
+        CONTRACT_COMMAND+=(--allow-missing-config)
+    fi
+    CANONICAL_OUTPUT="$("${CONTRACT_COMMAND[@]}")" \
+        || die "could not construct canonical ${PHASE} RunContract"
+    mapfile -t CANONICAL_FIELDS <<< "${CANONICAL_OUTPUT}"
+    [[ ${#CANONICAL_FIELDS[@]} -eq 3 ]] \
+        || die "canonical RunContract helper returned an incomplete record"
+    RUN_CONTRACT_JSON="${CANONICAL_FIELDS[0]}"
+    CONTRACT_FINGERPRINT="${CANONICAL_FIELDS[1]}"
+    CONFIG_FINGERPRINT="${CANONICAL_FIELDS[2]}"
+fi
+
 TORCHRUN_COMMAND=(
     env
     "A2V2_RUN_ID=${RUN_ID}"
@@ -246,7 +290,9 @@ TORCHRUN_COMMAND=(
     "A2V2_SLURM_RDZV_ENDPOINT=${RDZV_ENDPOINT}"
     "A2V2_SLURM_RDZV_ID=${RDZV_ID}"
     "A2V2_SLURM_MANIFEST_FINGERPRINT=${MANIFEST_FINGERPRINT}"
+    "A2V2_SLURM_RUN_CONTRACT=${RUN_CONTRACT_JSON}"
     "A2V2_SLURM_CONTRACT_FINGERPRINT=${CONTRACT_FINGERPRINT}"
+    "A2V2_SLURM_CONFIG_FINGERPRINT=${CONFIG_FINGERPRINT}"
     "${PYTHON_BIN}"
     -m torch.distributed.run
     "--nnodes=${NODES}"

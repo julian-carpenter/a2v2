@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -238,6 +239,422 @@ def contract_differences(
         for key in sorted(set(expected_values) | set(actual_values))
         if expected_values.get(key) != actual_values.get(key)
     }
+
+
+def _canonical_json_fingerprint(value: object) -> str:
+    """Hash one JSON-safe value with the RunContract canonical encoding."""
+
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def config_fingerprint(config: Mapping[str, object]) -> str:
+    """Return the canonical identity of the fully resolved active config."""
+
+    return _canonical_json_fingerprint(dict(config))
+
+
+def manifest_fingerprint(
+    entries: Sequence[tuple[str, str | Path]],
+    *,
+    allow_missing: bool = False,
+) -> str:
+    """Hash one phase-specific ordered set of named shared manifests."""
+
+    records: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for logical_name, raw_path in entries:
+        if not logical_name or logical_name in seen:
+            raise TopologyError(
+                f"manifest logical names must be unique and nonempty: {logical_name!r}"
+            )
+        seen.add(logical_name)
+        path = Path(raw_path).resolve()
+        if path.is_file():
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as error:
+                raise TopologyError(f"cannot hash manifest {path}: {error}") from error
+            state: object = digest.hexdigest()
+        elif allow_missing:
+            state = None
+        else:
+            raise TopologyError(f"required manifest is missing: {path}")
+        records.append({
+            "logical_name": logical_name,
+            "path": str(path),
+            "sha256": state,
+        })
+    return "sha256:" + _canonical_json_fingerprint(records)
+
+
+_LAUNCHER_CONTRACT_VARIABLES = (
+    "A2V2_RUN_ID",
+    "A2V2_SLURM_PHASE",
+    "A2V2_SLURM_WORLD_SIZE",
+    "A2V2_SLURM_RDZV_ENDPOINT",
+    "A2V2_SLURM_RDZV_ID",
+    "A2V2_SLURM_MANIFEST_FINGERPRINT",
+    "A2V2_SLURM_RUN_CONTRACT",
+    "A2V2_SLURM_CONTRACT_FINGERPRINT",
+    "A2V2_SLURM_CONFIG_FINGERPRINT",
+)
+
+
+def validate_launcher_contract(
+    environment: Mapping[str, str],
+    *,
+    config: Mapping[str, object],
+    slurm: SlurmEnvironment | None,
+    distributed: DistributedEnvironment,
+) -> RunContract | None:
+    """Validate one complete exported launcher contract on every worker rank."""
+
+    present = [name for name in _LAUNCHER_CONTRACT_VARIABLES if name in environment]
+    if not present:
+        return None
+    missing = [
+        name for name in _LAUNCHER_CONTRACT_VARIABLES
+        if name not in environment or not environment[name].strip()
+    ]
+    if missing:
+        raise TopologyError(
+            f"partial launcher contract is missing required variables: {missing}"
+        )
+    try:
+        raw_contract = json.loads(environment["A2V2_SLURM_RUN_CONTRACT"])
+    except json.JSONDecodeError as error:
+        raise TopologyError(
+            f"A2V2_SLURM_RUN_CONTRACT is not valid JSON: {error}"
+        ) from error
+    if not isinstance(raw_contract, Mapping):
+        raise TopologyError("A2V2_SLURM_RUN_CONTRACT root must be a JSON object")
+    contract = RunContract.from_mapping(raw_contract)
+    exported_fingerprint = environment["A2V2_SLURM_CONTRACT_FINGERPRINT"]
+    actual_fingerprint = contract.fingerprint()
+    if exported_fingerprint != actual_fingerprint:
+        raise TopologyError(
+            "launcher RunContract fingerprint mismatch: exported "
+            f"{exported_fingerprint!r}, canonical {actual_fingerprint!r}"
+        )
+    actual_config_fingerprint = config_fingerprint(config)
+    exported_config_fingerprint = environment["A2V2_SLURM_CONFIG_FINGERPRINT"]
+    if exported_config_fingerprint != actual_config_fingerprint:
+        raise TopologyError(
+            "launcher config fingerprint mismatch: exported "
+            f"{exported_config_fingerprint!r}, canonical "
+            f"{actual_config_fingerprint!r}"
+        )
+    task = config.get("task")
+    dataset = config.get("dataset")
+    if not isinstance(task, Mapping) or not isinstance(task.get("data"), str):
+        raise TopologyError("active config task.data must be text")
+    manifest_directory = Path(task["data"])
+    if contract.phase == "pretrain":
+        manifest_entries = (("pretrain.tsv", manifest_directory / "pretrain.tsv"),)
+    elif contract.phase == "finetune":
+        if not isinstance(dataset, Mapping):
+            raise TopologyError("active fine-tuning dataset section must be a mapping")
+        train_subset = dataset.get("train_subset")
+        valid_subset = dataset.get("valid_subset")
+        if not isinstance(train_subset, str) or not isinstance(valid_subset, str):
+            raise TopologyError(
+                "active fine-tuning train_subset and valid_subset must be text"
+            )
+        manifest_entries = (
+            (f"{train_subset}.tsv", manifest_directory / f"{train_subset}.tsv"),
+            (f"{valid_subset}.tsv", manifest_directory / f"{valid_subset}.tsv"),
+        )
+    else:
+        raise TopologyError(
+            f"launcher RunContract phase must be pretrain or finetune, received "
+            f"{contract.phase!r}"
+        )
+    active_manifest_fingerprint = manifest_fingerprint(manifest_entries)
+    if contract.manifest_fingerprint != active_manifest_fingerprint:
+        raise TopologyError(
+            "launcher manifest fingerprint differs from the active shared manifests: "
+            f"contract={contract.manifest_fingerprint!r}, "
+            f"runtime={active_manifest_fingerprint!r}"
+        )
+    try:
+        exported_world = int(environment["A2V2_SLURM_WORLD_SIZE"])
+    except ValueError as error:
+        raise TopologyError(
+            "A2V2_SLURM_WORLD_SIZE must be a base-ten integer"
+        ) from error
+    expected_output = config.get("checkpoint")
+    if not isinstance(expected_output, Mapping):
+        raise TopologyError("active config checkpoint section must be a mapping")
+    save_dir = expected_output.get("save_dir")
+    if not isinstance(save_dir, str):
+        raise TopologyError("active config checkpoint.save_dir must be text")
+    expected_stage = config.get("stage")
+    direct_mismatches = {
+        "phase": (contract.phase, expected_stage),
+        "world_size": (contract.world_size, distributed.world_size),
+        "exported_world_size": (contract.world_size, exported_world),
+        "rendezvous_endpoint": (
+            contract.rendezvous_endpoint,
+            environment["A2V2_SLURM_RDZV_ENDPOINT"],
+        ),
+        "rendezvous_id": (
+            contract.rendezvous_id,
+            environment["A2V2_SLURM_RDZV_ID"],
+        ),
+        "manifest_fingerprint": (
+            contract.manifest_fingerprint,
+            environment["A2V2_SLURM_MANIFEST_FINGERPRINT"],
+        ),
+        "output_directory": (
+            Path(contract.output_directory).resolve(),
+            Path(save_dir).resolve(),
+        ),
+    }
+    mismatches = {
+        name: values
+        for name, values in direct_mismatches.items()
+        if values[0] != values[1]
+    }
+    if slurm is not None:
+        scheduler_values = {
+            "job_id": (contract.job_id, slurm.job_id),
+            "node_count": (contract.node_count, slurm.node_count),
+            "processes_per_node": (
+                contract.processes_per_node,
+                slurm.processes_per_node,
+            ),
+            "scheduler_world_size": (contract.world_size, slurm.world_size),
+        }
+        mismatches.update({
+            name: values
+            for name, values in scheduler_values.items()
+            if values[0] != values[1]
+        })
+    if mismatches:
+        details = ", ".join(
+            f"{name}: contract={before!r}, runtime={after!r}"
+            for name, (before, after) in sorted(mismatches.items())
+        )
+        raise TopologyError(f"launcher RunContract differs from runtime: {details}")
+    return contract
+
+
+COMPLETION_MARKER_SCHEMA = "a2v2.stage-completion.v1"
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+class CompletionMarkerError(RuntimeError):
+    """Raised when completed-stage provenance cannot be trusted."""
+
+
+@dataclass(frozen=True)
+class CheckpointIdentity:
+    """Exact path and byte identity of the checkpoint chosen at completion."""
+
+    path: str
+    size_bytes: int
+    sha256: str
+
+    def to_mapping(self) -> dict[str, object]:
+        """Return the strict JSON-safe checkpoint identity."""
+
+        return asdict(self)
+
+
+def checkpoint_identity(path: str | Path) -> CheckpointIdentity:
+    """Stream the exact checkpoint identity without loading tensor payloads."""
+
+    resolved = Path(path).resolve()
+    try:
+        stat = resolved.stat()
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise CompletionMarkerError(
+            f"cannot identify stage checkpoint {resolved}: {error}"
+        ) from error
+    if not resolved.is_file():
+        raise CompletionMarkerError(f"stage checkpoint is not a file: {resolved}")
+    return CheckpointIdentity(
+        path=str(resolved),
+        size_bytes=stat.st_size,
+        sha256=digest.hexdigest(),
+    )
+
+
+def _parse_checkpoint_identity(value: object) -> CheckpointIdentity:
+    """Parse one exact checkpoint identity record."""
+
+    expected = {"path", "size_bytes", "sha256"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise CompletionMarkerError(
+            "completion checkpoint keys must be exactly path, size_bytes, and sha256"
+        )
+    path = value["path"]
+    size = value["size_bytes"]
+    digest = value["sha256"]
+    if not isinstance(path, str) or not path:
+        raise CompletionMarkerError("completion checkpoint path must be nonempty text")
+    if type(size) is not int or size < 0:
+        raise CompletionMarkerError(
+            "completion checkpoint size_bytes must be a nonnegative integer"
+        )
+    if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+        raise CompletionMarkerError(
+            "completion checkpoint sha256 must contain 64 lowercase hex characters"
+        )
+    return CheckpointIdentity(path=path, size_bytes=size, sha256=digest)
+
+
+def _completion_payload(
+    *,
+    contract: RunContract,
+    config_fingerprint_value: str,
+    checkpoint: CheckpointIdentity,
+) -> dict[str, object]:
+    """Build one complete schema-tagged stage marker payload."""
+
+    if not isinstance(config_fingerprint_value, str) or not config_fingerprint_value:
+        raise CompletionMarkerError("config fingerprint must be nonempty text")
+    return {
+        "schema": COMPLETION_MARKER_SCHEMA,
+        "run_contract": contract.to_mapping(),
+        "run_contract_fingerprint": contract.fingerprint(),
+        "config_fingerprint": config_fingerprint_value,
+        "checkpoint": checkpoint.to_mapping(),
+    }
+
+
+def write_stage_completion(
+    marker_path: str | Path,
+    *,
+    contract: RunContract,
+    config_fingerprint: str,
+    checkpoint_path: str | Path,
+) -> None:
+    """Atomically publish a durable completed-stage record."""
+
+    marker = Path(marker_path)
+    directory = marker.parent
+    if not directory.is_dir():
+        raise CompletionMarkerError(
+            f"completion marker directory does not exist: {directory}"
+        )
+    payload = _completion_payload(
+        contract=contract,
+        config_fingerprint_value=config_fingerprint,
+        checkpoint=checkpoint_identity(checkpoint_path),
+    )
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    descriptor, candidate_name = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{marker.name}.",
+        suffix=".candidate",
+    )
+    candidate = Path(candidate_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(candidate, marker)
+        directory_descriptor = os.open(
+            directory,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def validate_stage_completion(
+    marker_path: str | Path,
+    *,
+    expected_contract: RunContract,
+    expected_config_fingerprint: str,
+    expected_checkpoint_path: str | Path | None = None,
+) -> Path:
+    """Validate marker schema, active contract, and exact checkpoint bytes."""
+
+    marker = Path(marker_path)
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CompletionMarkerError(
+            f"cannot read complete stage marker {marker}: {error}; "
+            "remove or repair it explicitly"
+        ) from error
+    expected_keys = {
+        "schema",
+        "run_contract",
+        "run_contract_fingerprint",
+        "config_fingerprint",
+        "checkpoint",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise CompletionMarkerError(
+            "completion marker keys are malformed; remove or repair it explicitly"
+        )
+    if value["schema"] != COMPLETION_MARKER_SCHEMA:
+        raise CompletionMarkerError(
+            f"unsupported completion marker schema {value['schema']!r}"
+        )
+    raw_contract = value["run_contract"]
+    if not isinstance(raw_contract, Mapping):
+        raise CompletionMarkerError("completion run_contract must be a JSON object")
+    try:
+        recorded_contract = RunContract.from_mapping(raw_contract)
+    except TopologyError as error:
+        raise CompletionMarkerError(f"invalid completion run contract: {error}") from error
+    recorded_fingerprint = value["run_contract_fingerprint"]
+    if recorded_fingerprint != recorded_contract.fingerprint():
+        raise CompletionMarkerError(
+            "completion marker RunContract fingerprint does not match its record"
+        )
+    if recorded_fingerprint != expected_contract.fingerprint():
+        differences = contract_differences(expected_contract, recorded_contract)
+        raise CompletionMarkerError(
+            f"completion marker belongs to a different run contract: {differences}"
+        )
+    if value["config_fingerprint"] != expected_config_fingerprint:
+        raise CompletionMarkerError(
+            "completion marker config fingerprint differs from the active config"
+        )
+    recorded_checkpoint = _parse_checkpoint_identity(value["checkpoint"])
+    recorded_path = Path(recorded_checkpoint.path).resolve()
+    if expected_checkpoint_path is not None and recorded_path != Path(
+        expected_checkpoint_path
+    ).resolve():
+        raise CompletionMarkerError(
+            f"completion marker selects checkpoint {recorded_path}, expected "
+            f"{Path(expected_checkpoint_path).resolve()}"
+        )
+    actual_checkpoint = checkpoint_identity(recorded_path)
+    if actual_checkpoint != recorded_checkpoint:
+        raise CompletionMarkerError(
+            f"completion checkpoint identity changed for {recorded_path}; "
+            "remove or repair the marker explicitly"
+        )
+    return recorded_path
 
 
 _TORCHRUN_VARIABLES = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
@@ -878,3 +1295,220 @@ class TrainingPreempted(RuntimeError):
         super().__init__(
             f"preemption checkpoint saved at update {update}: {self.checkpoint_path}"
         )
+
+
+def _contract_cli(arguments: argparse.Namespace) -> int:
+    """Render canonical RunContract JSON and resolved config fingerprints."""
+
+    from .config import config_to_dict, load_config
+
+    if arguments.allow_missing_config and not arguments.config.is_file():
+        resolved_config_fingerprint = _canonical_json_fingerprint({
+            "dry_run_missing_config": str(arguments.config.resolve()),
+            "overrides": arguments.override,
+        })
+    else:
+        config = load_config(arguments.config, arguments.override)
+        resolved_config_fingerprint = config_fingerprint(config_to_dict(config))
+    contract = RunContract(
+        job_id=arguments.job_id,
+        phase=arguments.phase,
+        node_count=arguments.nodes,
+        processes_per_node=arguments.processes_per_node,
+        world_size=arguments.nodes * arguments.processes_per_node,
+        rendezvous_endpoint=_validate_endpoint(arguments.rendezvous_endpoint),
+        rendezvous_id=arguments.rendezvous_id,
+        output_directory=str(Path(arguments.output_directory).resolve()),
+        manifest_fingerprint=arguments.manifest_fingerprint,
+    )
+    contract_json = json.dumps(
+        contract.to_mapping(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    print(contract_json)
+    print(contract.fingerprint())
+    print(resolved_config_fingerprint)
+    return 0
+
+
+def _manifest_cli(arguments: argparse.Namespace) -> int:
+    """Render one phase-specific manifest identity."""
+
+    entries: list[tuple[str, str]] = []
+    for entry in arguments.entry:
+        logical_name, separator, path = entry.partition("=")
+        if not separator:
+            raise TopologyError("--entry must use LOGICAL_NAME=PATH syntax")
+        entries.append((logical_name, path))
+    print(manifest_fingerprint(entries, allow_missing=arguments.allow_missing))
+    return 0
+
+
+def _launcher_contracts_cli(arguments: argparse.Namespace) -> int:
+    """Render both stable stage identities in one Python process."""
+
+    from .config import config_to_dict, load_config
+
+    phase_specs = (
+        (
+            "pretrain",
+            arguments.pretrain_output_directory,
+            arguments.pretrain_config,
+            arguments.pretrain_override,
+            arguments.pretrain_manifest_entry,
+        ),
+        (
+            "finetune",
+            arguments.finetune_output_directory,
+            arguments.finetune_config,
+            arguments.finetune_override,
+            arguments.finetune_manifest_entry,
+        ),
+    )
+    for phase, output_directory, config_path, overrides, raw_entries in phase_specs:
+        entries: list[tuple[str, str]] = []
+        for entry in raw_entries:
+            logical_name, separator, path = entry.partition("=")
+            if not separator:
+                raise TopologyError(
+                    "manifest entries must use LOGICAL_NAME=PATH syntax"
+                )
+            entries.append((logical_name, path))
+        stage_manifest_fingerprint = manifest_fingerprint(
+            entries,
+            allow_missing=arguments.allow_missing_manifests,
+        )
+        config = load_config(config_path, overrides)
+        contract = RunContract(
+            job_id=arguments.job_id,
+            phase=phase,
+            node_count=arguments.nodes,
+            processes_per_node=arguments.processes_per_node,
+            world_size=arguments.nodes * arguments.processes_per_node,
+            rendezvous_endpoint=_validate_endpoint(arguments.rendezvous_endpoint),
+            rendezvous_id=f"{arguments.job_id}-{phase}",
+            output_directory=str(Path(output_directory).resolve()),
+            manifest_fingerprint=stage_manifest_fingerprint,
+        )
+        print(stage_manifest_fingerprint)
+        print(json.dumps(
+            contract.to_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ))
+        print(contract.fingerprint())
+        print(config_fingerprint(config_to_dict(config)))
+    return 0
+
+
+def _completion_cli(arguments: argparse.Namespace, *, write: bool) -> int:
+    """Write or validate a completion marker for shell orchestration."""
+
+    try:
+        raw_contract = json.loads(arguments.run_contract)
+    except json.JSONDecodeError as error:
+        raise TopologyError(f"--run-contract is not valid JSON: {error}") from error
+    if not isinstance(raw_contract, Mapping):
+        raise TopologyError("--run-contract root must be a JSON object")
+    contract = RunContract.from_mapping(raw_contract)
+    if contract.fingerprint() != arguments.contract_fingerprint:
+        raise TopologyError(
+            "--contract-fingerprint does not match canonical --run-contract"
+        )
+    if write:
+        write_stage_completion(
+            arguments.marker,
+            contract=contract,
+            config_fingerprint=arguments.config_fingerprint,
+            checkpoint_path=arguments.checkpoint,
+        )
+        return 0
+    validated = validate_stage_completion(
+        arguments.marker,
+        expected_contract=contract,
+        expected_config_fingerprint=arguments.config_fingerprint,
+        expected_checkpoint_path=arguments.checkpoint,
+    )
+    print(validated)
+    return 0
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    """Build the narrow Python bridge used by the Bash launchers."""
+
+    parser = argparse.ArgumentParser(prog="python -m a2v2.slurm")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    contract = subparsers.add_parser("contract")
+    contract.add_argument("--job-id", required=True)
+    contract.add_argument("--phase", required=True)
+    contract.add_argument("--nodes", required=True, type=int)
+    contract.add_argument("--processes-per-node", required=True, type=int)
+    contract.add_argument("--rendezvous-endpoint", required=True)
+    contract.add_argument("--rendezvous-id", required=True)
+    contract.add_argument("--output-directory", required=True)
+    contract.add_argument("--manifest-fingerprint", required=True)
+    contract.add_argument("--config", required=True, type=Path)
+    contract.add_argument("--override", action="append", default=[])
+    contract.add_argument("--allow-missing-config", action="store_true")
+    manifest = subparsers.add_parser("manifest")
+    manifest.add_argument("--entry", action="append", default=[], required=True)
+    manifest.add_argument("--allow-missing", action="store_true")
+    launcher = subparsers.add_parser("launcher-contracts")
+    launcher.add_argument("--job-id", required=True)
+    launcher.add_argument("--nodes", required=True, type=int)
+    launcher.add_argument("--processes-per-node", required=True, type=int)
+    launcher.add_argument("--rendezvous-endpoint", required=True)
+    launcher.add_argument("--pretrain-output-directory", required=True)
+    launcher.add_argument("--finetune-output-directory", required=True)
+    launcher.add_argument("--pretrain-config", required=True, type=Path)
+    launcher.add_argument("--finetune-config", required=True, type=Path)
+    launcher.add_argument("--pretrain-override", action="append", default=[])
+    launcher.add_argument("--finetune-override", action="append", default=[])
+    launcher.add_argument(
+        "--pretrain-manifest-entry",
+        action="append",
+        default=[],
+        required=True,
+    )
+    launcher.add_argument(
+        "--finetune-manifest-entry",
+        action="append",
+        default=[],
+        required=True,
+    )
+    launcher.add_argument("--allow-missing-manifests", action="store_true")
+    for name in ("write-completion", "validate-completion"):
+        completion = subparsers.add_parser(name)
+        completion.add_argument("--marker", required=True, type=Path)
+        completion.add_argument("--run-contract", required=True)
+        completion.add_argument("--contract-fingerprint", required=True)
+        completion.add_argument("--config-fingerprint", required=True)
+        completion.add_argument("--checkpoint", required=True, type=Path)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the shell-interoperability helper with concise actionable errors."""
+
+    parser = _build_cli_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        if arguments.command == "contract":
+            return _contract_cli(arguments)
+        if arguments.command == "manifest":
+            return _manifest_cli(arguments)
+        if arguments.command == "launcher-contracts":
+            return _launcher_contracts_cli(arguments)
+        return _completion_cli(
+            arguments,
+            write=arguments.command == "write-completion",
+        )
+    except (CompletionMarkerError, TopologyError) as error:
+        parser.exit(2, f"ERROR: {error}\n")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

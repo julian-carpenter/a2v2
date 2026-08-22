@@ -74,6 +74,7 @@ from .slurm import (
     build_topology_state,
     coordinated_preemption_requested,
     install_preemption_handlers,
+    validate_launcher_contract,
     validate_resume_topology,
     validate_runtime_topology,
 )
@@ -2367,6 +2368,12 @@ def _run_training(
             f"{config.distributed.requested_world_size} but the launch created {world_size} process(es); "
             "use torchrun with the configured worker count or override the field"
         )
+    validate_launcher_contract(
+        os.environ,
+        config=config_to_dict(config),
+        slurm=_active_slurm_environment(),
+        distributed=distributed,
+    )
     checkpoint_group = _checkpoint_process_group(device, world_size)
     if checkpoint_group is not None and created_checkpoint_groups is not None:
         created_checkpoint_groups.append(checkpoint_group)
