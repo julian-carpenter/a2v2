@@ -10,8 +10,9 @@ research meaning, especially for convolution geometry and schedules.
 from __future__ import annotations
 
 import ast
+import math
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -49,6 +50,11 @@ class CommonConfig:
     log_format: str = "json"
     log_interval: int = 100
     tensorboard_logdir: Path = Path("tensorboard")
+    torch_compile: bool = False
+    torch_compile_backend: str = "inductor"
+    torch_compile_mode: str = "default"
+    torch_compile_fullgraph: bool = False
+    torch_compile_dynamic: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,10 @@ class OptimizationConfig:
     max_update: int = 0
     clip_norm: float = 0.0
     learning_rate: float = 1e-4
+    gradient_clip_method: str = "global"
+    adagc_beta: float = 0.99
+    adagc_relative_clip: float = 1.04
+    adagc_warmup_updates: int = 100
 
 
 @dataclass(frozen=True)
@@ -139,6 +149,9 @@ class OptimizerConfig:
     betas: tuple[float, float] = (0.9, 0.98)
     eps: float = 1e-8
     weight_decay: float = 0.0
+    min_8bit_size: int = 4096
+    weight_decay_schedule: str = "constant"
+    weight_decay_end: float | None = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +254,14 @@ class ModelConfig:
     drop_path: float = 0.0
     load_pretrain_weights: bool = True
     checkpoint_activations: bool = False
+    position_encoding: str = "legacy"
+    attention_backend: str = "legacy"
+    rope_theta: float = 10_000.0
+    use_cls_token: bool = False
+    cls_loss_weight: float = 1.0
+    classification_head: str = "frame"
+    ffn_type: str = "mlp"
+    initialization: str = "legacy"
     audio: AudioModelConfig = field(default_factory=AudioModelConfig)
 
 
@@ -399,6 +420,144 @@ def _checkpoint_activations_bool(value: object) -> bool:
     return value
 
 
+def _strict_bool(value: object, field_name: str) -> bool:
+    """Accept only YAML booleans for execution and architecture switches."""
+
+    if type(value) is not bool:
+        raise ConfigError(f"{field_name} must be a boolean")
+    return value
+
+
+def _strict_optional_bool(value: object, field_name: str) -> bool | None:
+    """Accept a boolean or null for a tri-state execution option."""
+
+    if value is None:
+        return None
+    return _strict_bool(value, field_name)
+
+
+def _enum(value: object, field_name: str, allowed: set[str]) -> str:
+    """Return one explicitly supported strategy name."""
+
+    if not isinstance(value, str) or value not in allowed:
+        choices = ", ".join(sorted(allowed))
+        raise ConfigError(f"{field_name} must be one of: {choices}")
+    return value
+
+
+def _finite_float(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float | None = None,
+    exclusive_minimum: bool = False,
+) -> float:
+    """Validate a finite numeric strategy parameter with its documented range."""
+
+    if type(value) not in {int, float}:
+        raise ConfigError(f"{field_name} must be a number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ConfigError(f"{field_name} must be finite")
+    if minimum is not None and (
+        result < minimum or (exclusive_minimum and result <= minimum)
+    ):
+        qualifier = "greater than" if exclusive_minimum else "at least"
+        raise ConfigError(f"{field_name} must be {qualifier} {minimum}")
+    return result
+
+
+def _non_negative_int(value: object, field_name: str) -> int:
+    """Validate an integer counter or size without coercing booleans or floats."""
+
+    if type(value) is not int or value < 0:
+        raise ConfigError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _serialized_defaults(config_type: type[Any], values: Mapping[str, Any]) -> dict[str, Any]:
+    """Supply current dataclass defaults to fields absent from old checkpoints."""
+
+    restored = dict(values)
+    for definition in fields(config_type):
+        if definition.name in restored:
+            continue
+        if definition.default is not MISSING:
+            restored[definition.name] = definition.default
+        elif definition.default_factory is not MISSING:
+            restored[definition.name] = definition.default_factory()
+    return restored
+
+
+def resolve_position_encoding(model: ModelConfig) -> str:
+    """Resolve the modern position strategy without changing legacy recipes."""
+
+    if model.position_encoding == "legacy":
+        return "alibi" if model.audio.use_alibi_encoder else "none"
+    return model.position_encoding
+
+
+def resolve_attention_backend(model: ModelConfig) -> str:
+    """Resolve legacy/manual attention and the modern SDPA default."""
+
+    position_encoding = resolve_position_encoding(model)
+    if model.position_encoding == "legacy" or position_encoding == "alibi":
+        return "manual"
+    if model.attention_backend == "legacy":
+        return "sdpa"
+    return model.attention_backend
+
+
+def _validate_modern_options(
+    common: CommonConfig,
+    optimization: OptimizationConfig,
+    optimizer: OptimizerConfig,
+    model: ModelConfig,
+) -> None:
+    """Validate strategy fields shared by YAML and checkpoint deserialization."""
+
+    _strict_bool(common.torch_compile, "common.torch_compile")
+    _enum(common.torch_compile_backend, "common.torch_compile_backend", {"inductor", "eager", "aot_eager"})
+    _enum(
+        common.torch_compile_mode,
+        "common.torch_compile_mode",
+        {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"},
+    )
+    _strict_bool(common.torch_compile_fullgraph, "common.torch_compile_fullgraph")
+    _strict_optional_bool(common.torch_compile_dynamic, "common.torch_compile_dynamic")
+    _enum(model.position_encoding, "model.position_encoding", {"legacy", "alibi", "rope", "none"})
+    _enum(model.attention_backend, "model.attention_backend", {"legacy", "manual", "sdpa", "flash"})
+    _finite_float(model.rope_theta, "model.rope_theta", minimum=0.0, exclusive_minimum=True)
+    _strict_bool(model.use_cls_token, "model.use_cls_token")
+    _finite_float(model.cls_loss_weight, "model.cls_loss_weight", minimum=0.0)
+    _enum(model.classification_head, "model.classification_head", {"frame", "cls"})
+    _enum(model.ffn_type, "model.ffn_type", {"mlp", "geglu"})
+    _enum(model.initialization, "model.initialization", {"legacy", "deepscale_lm"})
+    _enum(optimization.gradient_clip_method, "optimization.gradient_clip_method", {"global", "adagc", "none"})
+    adagc_beta = _finite_float(optimization.adagc_beta, "optimization.adagc_beta", minimum=0.0)
+    if adagc_beta >= 1.0:
+        raise ConfigError("optimization.adagc_beta must be less than 1.0")
+    _finite_float(
+        optimization.adagc_relative_clip,
+        "optimization.adagc_relative_clip",
+        minimum=0.0,
+        exclusive_minimum=True,
+    )
+    _non_negative_int(optimization.adagc_warmup_updates, "optimization.adagc_warmup_updates")
+    _enum(optimizer.name, "optimizer._name", {"adam", "adamw", "adam8bit", "adamw8bit"})
+    _non_negative_int(optimizer.min_8bit_size, "optimizer.min_8bit_size")
+    _enum(optimizer.weight_decay_schedule, "optimizer.weight_decay_schedule", {"constant", "cosine"})
+    if optimizer.weight_decay_end is not None:
+        _finite_float(optimizer.weight_decay_end, "optimizer.weight_decay_end", minimum=0.0)
+
+    if model.position_encoding == "alibi" and model.attention_backend in {"sdpa", "flash"}:
+        raise ConfigError("model.position_encoding=alibi is incompatible with attention_backend=sdpa or flash")
+    if model.position_encoding == "legacy" and model.attention_backend in {"sdpa", "flash"}:
+        raise ConfigError("model.position_encoding=legacy requires attention_backend=legacy or manual")
+    if model.classification_head == "cls" and not model.use_cls_token:
+        raise ConfigError("model.classification_head=cls requires model.use_cls_token=true")
+
+
 # =============================================================================
 # PUBLISHED RECIPE TRANSLATION
 # =============================================================================
@@ -421,6 +580,8 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     _check_keys("common", common_raw, {
         "fp16", "seed", "log_format", "log_interval", "tensorboard_logdir",
         "min_loss_scale", "fp16_no_flatten_grads", "fp16_init_scale", "all_gather_list_size",
+        "torch_compile", "torch_compile_backend", "torch_compile_mode",
+        "torch_compile_fullgraph", "torch_compile_dynamic",
     })
     # Mathematics: fp16_effective = fp16_requested ∧ CUDA_available.
     # Interpretation: CPU verification follows the same recipe without asking
@@ -436,6 +597,25 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         log_format=str(common_raw.get("log_format", "json")),
         log_interval=int(common_raw.get("log_interval", 100)),
         tensorboard_logdir=tensorboard_logdir,
+        torch_compile=_strict_bool(common_raw.get("torch_compile", False), "common.torch_compile"),
+        torch_compile_backend=_enum(
+            common_raw.get("torch_compile_backend", "inductor"),
+            "common.torch_compile_backend",
+            {"inductor", "eager", "aot_eager"},
+        ),
+        torch_compile_mode=_enum(
+            common_raw.get("torch_compile_mode", "default"),
+            "common.torch_compile_mode",
+            {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"},
+        ),
+        torch_compile_fullgraph=_strict_bool(
+            common_raw.get("torch_compile_fullgraph", False),
+            "common.torch_compile_fullgraph",
+        ),
+        torch_compile_dynamic=_strict_optional_bool(
+            common_raw.get("torch_compile_dynamic"),
+            "common.torch_compile_dynamic",
+        ),
     )
 
     checkpoint_raw = _mapping(raw, "checkpoint")
@@ -531,7 +711,10 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     )
 
     optimization_raw = _mapping(raw, "optimization")
-    _check_keys("optimization", optimization_raw, {"update_freq", "max_update", "clip_norm", "lr"})
+    _check_keys("optimization", optimization_raw, {
+        "update_freq", "max_update", "clip_norm", "lr", "gradient_clip_method",
+        "adagc_beta", "adagc_relative_clip", "adagc_warmup_updates",
+    })
     # Mathematics: update_freq[e] is the number of microbatches accumulated
     # into one optimizer update during epoch e, with the final value reused.
     # Interpretation: scheduler and EMA time advance by optimizer updates,
@@ -542,6 +725,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     optimizer_raw = _mapping(raw, "optimizer")
     _check_keys("optimizer", optimizer_raw, {
         "_name", "adam_betas", "adam_eps", "weight_decay", "dynamic_groups", "groups",
+        "min_8bit_size", "weight_decay_schedule", "weight_decay_end",
     })
     effective_optimizer = optimizer_raw
     embedded_scheduler: Mapping[str, Any] = {}
@@ -572,12 +756,54 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         max_update=int(optimization_raw.get("max_update", 0)),
         clip_norm=float(optimization_raw.get("clip_norm", 0.0)),
         learning_rate=learning_rate,
+        gradient_clip_method=_enum(
+            optimization_raw.get("gradient_clip_method", "global"),
+            "optimization.gradient_clip_method",
+            {"global", "adagc", "none"},
+        ),
+        adagc_beta=_finite_float(
+            optimization_raw.get("adagc_beta", 0.99),
+            "optimization.adagc_beta",
+            minimum=0.0,
+        ),
+        adagc_relative_clip=_finite_float(
+            optimization_raw.get("adagc_relative_clip", 1.04),
+            "optimization.adagc_relative_clip",
+            minimum=0.0,
+            exclusive_minimum=True,
+        ),
+        adagc_warmup_updates=_non_negative_int(
+            optimization_raw.get("adagc_warmup_updates", 100),
+            "optimization.adagc_warmup_updates",
+        ),
     )
     optimizer = OptimizerConfig(
-        name=str(effective_optimizer.get("_name", "adam")),
+        name=_enum(
+            effective_optimizer.get("_name", "adam"),
+            "optimizer._name",
+            {"adam", "adamw", "adam8bit", "adamw8bit"},
+        ),
         betas=(float(betas[0]), float(betas[1])),
         eps=float(effective_optimizer.get("adam_eps", 1e-8)),
         weight_decay=float(effective_optimizer.get("weight_decay", 0.0)),
+        min_8bit_size=_non_negative_int(
+            effective_optimizer.get("min_8bit_size", 4096),
+            "optimizer.min_8bit_size",
+        ),
+        weight_decay_schedule=_enum(
+            effective_optimizer.get("weight_decay_schedule", "constant"),
+            "optimizer.weight_decay_schedule",
+            {"constant", "cosine"},
+        ),
+        weight_decay_end=(
+            _finite_float(
+                effective_optimizer["weight_decay_end"],
+                "optimizer.weight_decay_end",
+                minimum=0.0,
+            )
+            if effective_optimizer.get("weight_decay_end") is not None
+            else None
+        ),
     )
 
     scheduler_value = raw.get("lr_scheduler", {})
@@ -605,6 +831,8 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         "mask_prob", "mask_length", "mask_channel_prob", "mask_channel_length", "dropout",
         "dropout_input", "activation_dropout", "attention_dropout", "final_dropout", "drop_path",
         "load_pretrain_weights", "checkpoint_activations",
+        "position_encoding", "attention_backend", "rope_theta", "use_cls_token",
+        "cls_loss_weight", "classification_head", "ffn_type", "initialization",
     })
     modalities = model_raw.get("modalities", {})
     if modalities is None:
@@ -661,6 +889,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         audio=audio,
         **model_kwargs,
     )
+    _validate_modern_options(common, optimization, optimizer, model)
     # Mathematics: stage = finetune iff labels are requested or the criterion
     # name marks a fine-tuning criterion; all remaining recipes are pretraining.
     # Interpretation: one validated field chooses the model and workflow while
@@ -729,14 +958,14 @@ def config_from_serialized_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     """Restore the native dataclass representation stored in checkpoints."""
 
     try:
-        common_values = dict(raw["common"])  # type: ignore[arg-type]
+        common_values = _serialized_defaults(CommonConfig, raw["common"])  # type: ignore[arg-type]
         if "tensorboard_logdir" in common_values:
             common_values["tensorboard_logdir"] = Path(common_values["tensorboard_logdir"])
         common = CommonConfig(**common_values)
-        checkpoint_values = dict(raw["checkpoint"])  # type: ignore[arg-type]
+        checkpoint_values = _serialized_defaults(CheckpointConfig, raw["checkpoint"])  # type: ignore[arg-type]
         checkpoint_values["save_dir"] = Path(checkpoint_values["save_dir"])
         checkpoint = CheckpointConfig(**checkpoint_values)
-        task_values = dict(raw["task"])  # type: ignore[arg-type]
+        task_values = _serialized_defaults(TaskConfig, raw["task"])  # type: ignore[arg-type]
         task_values["data"] = Path(task_values["data"])
         task_values["unique_labels"] = tuple(task_values["unique_labels"])
         # Mathematics: serialization maps nested tuples to lists; this inverse
@@ -745,27 +974,28 @@ def config_from_serialized_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         # after a checkpoint round trip.
         task_values["conv_feature_layers"] = tuple(tuple(layer) for layer in task_values["conv_feature_layers"])
         task = TaskConfig(**task_values)
-        dataset = DatasetConfig(**dict(raw["dataset"]))  # type: ignore[arg-type]
-        distributed = DistributedConfig(**dict(raw["distributed"]))  # type: ignore[arg-type]
-        criterion = CriterionConfig(**dict(raw["criterion"]))  # type: ignore[arg-type]
-        optimization_values = dict(raw["optimization"])  # type: ignore[arg-type]
+        dataset = DatasetConfig(**_serialized_defaults(DatasetConfig, raw["dataset"]))  # type: ignore[arg-type]
+        distributed = DistributedConfig(**_serialized_defaults(DistributedConfig, raw["distributed"]))  # type: ignore[arg-type]
+        criterion = CriterionConfig(**_serialized_defaults(CriterionConfig, raw["criterion"]))  # type: ignore[arg-type]
+        optimization_values = _serialized_defaults(OptimizationConfig, raw["optimization"])  # type: ignore[arg-type]
         optimization_values["update_freq"] = tuple(optimization_values["update_freq"])
         optimization = OptimizationConfig(**optimization_values)
-        optimizer_values = dict(raw["optimizer"])  # type: ignore[arg-type]
+        optimizer_values = _serialized_defaults(OptimizerConfig, raw["optimizer"])  # type: ignore[arg-type]
         optimizer_values["betas"] = tuple(optimizer_values["betas"])
         optimizer = OptimizerConfig(**optimizer_values)
-        scheduler = SchedulerConfig(**dict(raw["scheduler"]))  # type: ignore[arg-type]
-        model_values = dict(raw["model"])  # type: ignore[arg-type]
+        scheduler = SchedulerConfig(**_serialized_defaults(SchedulerConfig, raw["scheduler"]))  # type: ignore[arg-type]
+        model_values = _serialized_defaults(ModelConfig, raw["model"])  # type: ignore[arg-type]
         model_values["checkpoint_activations"] = _checkpoint_activations_bool(
             model_values.get("checkpoint_activations", False)
         )
-        audio_values = dict(model_values.pop("audio"))
-        decoder = DecoderConfig(**dict(audio_values.pop("decoder")))
+        audio_values = _serialized_defaults(AudioModelConfig, model_values.pop("audio"))
+        decoder = DecoderConfig(**_serialized_defaults(DecoderConfig, audio_values.pop("decoder")))
         audio = AudioModelConfig(**audio_values, decoder=decoder)
         model = ModelConfig(**model_values, audio=audio)
         stage = str(raw["stage"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError(f"invalid serialized native configuration: {exc}") from exc
+    _validate_modern_options(common, optimization, optimizer, model)
     return Animal2VecConfig(
         common=common,
         checkpoint=checkpoint,

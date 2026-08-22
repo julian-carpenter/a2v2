@@ -518,6 +518,30 @@ def test_dry_run_is_one_fold_and_uses_all_eight_gpus(tmp_path: Path) -> None:
     assert str(output / "final-evaluation/tensorboard") in semantic_stdout
 
 
+def test_reproduction_driver_retains_frozen_local_command_graph(tmp_path: Path) -> None:
+    """Keep the published local reproduction launch graph unchanged."""
+
+    manifests = tmp_path / "manifests"
+    output = tmp_path / "experiment"
+    _placeholder_manifests(manifests)
+
+    completed = _run_driver(str(manifests), str(output), "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    launches = [
+        line.replace("\\", "")
+        for line in completed.stdout.splitlines()
+        if line.startswith("Launching:") and "a2v2-train" in line
+    ]
+    assert len(launches) == 3
+    assert "a2v_large_pretrain_best.yaml" in launches[0]
+    assert "--stop-at-update 1" in launches[0]
+    assert "a2v_large_pretrain_best.yaml" in launches[1]
+    assert f"--resume {output / 'pretrain/checkpoint_last.pt'}" in launches[1]
+    assert "finetune_mixup_100.yaml" in launches[2]
+    assert f"--pretrained-checkpoint {output / 'pretrain/checkpoint_last.pt'}" in launches[2]
+
+
 def test_dry_run_enables_activation_checkpointing_only_for_finetuning(
     tmp_path: Path,
 ) -> None:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from torch import nn
 
+import a2v2.config as config_module
 from a2v2.config import load_config
 from a2v2.model import Animal2VecFineTuningModel, Animal2VecPretrainingModel
 
@@ -30,6 +31,8 @@ def test_pretraining_checkpoint_structure_survives_source_reorganization() -> No
     config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
     model = Animal2VecPretrainingModel.from_config(config)
 
+    assert config_module.resolve_position_encoding(config.model) == "alibi"
+    assert config_module.resolve_attention_backend(config.model) == "manual"
     assert _state_signature(model) == (
         120,
         "5efbec43fd1c1c392b8b4278cee6a21513f68f3095353bb22524d2ada2ecf6ad",
@@ -45,6 +48,8 @@ def test_finetuning_checkpoint_structure_survives_source_reorganization() -> Non
         pretrained_config=pretraining,
     )
 
+    assert config_module.resolve_position_encoding(fine_tuning.model) == "alibi"
+    assert config_module.resolve_attention_backend(fine_tuning.model) == "manual"
     assert _state_signature(model) == (
         59,
         "b7b2ea2ad9017ec94d56516fbda49a932866b472a48633804619b7232f3d05bb",

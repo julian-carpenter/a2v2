@@ -9,6 +9,7 @@ import pytest
 import torch
 import yaml
 
+import a2v2.config as config_module
 from a2v2.config import (
     ConfigError,
     config_from_dict,
@@ -21,6 +22,181 @@ from a2v2.workflows import _ddp_bucket_cap_mb_list, _ddp_find_unused_parameters
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_modern_options_default_to_legacy_and_round_trip() -> None:
+    """Keep checked-in recipes on their frozen legacy configuration path."""
+
+    recipe_paths = sorted((ROOT / "configs/MeerKAT").glob("*.yaml")) + sorted(
+        (ROOT / "configs/hyenas").glob("*.yaml")
+    )
+    assert recipe_paths
+
+    for path in recipe_paths:
+        config = load_config(path)
+        restored = config_from_serialized_dict(config_to_dict(config))
+
+        assert config.common.torch_compile is False
+        assert config.common.torch_compile_backend == "inductor"
+        assert config.common.torch_compile_mode == "default"
+        assert config.common.torch_compile_fullgraph is False
+        assert config.common.torch_compile_dynamic is None
+        assert config.model.position_encoding == "legacy"
+        assert config.model.attention_backend == "legacy"
+        assert config.model.rope_theta == 10_000.0
+        assert config.model.use_cls_token is False
+        assert config.model.cls_loss_weight == 1.0
+        assert config.model.classification_head == "frame"
+        assert config.model.ffn_type == "mlp"
+        assert config.model.initialization == "legacy"
+        assert config.optimization.gradient_clip_method == "global"
+        assert config.optimization.adagc_beta == 0.99
+        assert config.optimization.adagc_relative_clip == 1.04
+        assert config.optimization.adagc_warmup_updates == 100
+        assert config.optimizer.min_8bit_size == 4096
+        assert config.optimizer.weight_decay_schedule == "constant"
+        assert config.optimizer.weight_decay_end is None
+        assert restored == config
+
+    modern = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=(
+            "common.torch_compile=true",
+            "common.torch_compile_backend=eager",
+            "common.torch_compile_mode=reduce-overhead",
+            "common.torch_compile_fullgraph=true",
+            "common.torch_compile_dynamic=false",
+            "model.position_encoding=rope",
+            "model.attention_backend=legacy",
+            "model.rope_theta=5000.0",
+            "model.use_cls_token=true",
+            "model.cls_loss_weight=0.5",
+            "model.classification_head=cls",
+            "model.ffn_type=geglu",
+            "model.initialization=deepscale_lm",
+            "optimization.gradient_clip_method=adagc",
+            "optimization.adagc_beta=0.95",
+            "optimization.adagc_relative_clip=1.2",
+            "optimization.adagc_warmup_updates=10",
+            "optimizer._name=adamw",
+            "optimizer.min_8bit_size=1024",
+            "optimizer.weight_decay_schedule=cosine",
+            "optimizer.weight_decay_end=0.01",
+        ),
+    )
+
+    assert modern.common.torch_compile is True
+    assert modern.common.torch_compile_backend == "eager"
+    assert modern.common.torch_compile_mode == "reduce-overhead"
+    assert modern.common.torch_compile_fullgraph is True
+    assert modern.common.torch_compile_dynamic is False
+    assert config_module.resolve_position_encoding(modern.model) == "rope"
+    assert config_module.resolve_attention_backend(modern.model) == "sdpa"
+    assert modern.model.classification_head == "cls"
+    assert modern.model.ffn_type == "geglu"
+    assert modern.model.initialization == "deepscale_lm"
+    assert modern.optimization.gradient_clip_method == "adagc"
+    assert modern.optimizer.name == "adamw"
+    assert modern.optimizer.weight_decay_schedule == "cosine"
+    assert config_from_serialized_dict(config_to_dict(modern)) == modern
+
+
+def test_legacy_serialized_config_supplies_modern_defaults() -> None:
+    """Restore checkpoints written before modern strategy fields existed."""
+
+    serialized = config_to_dict(load_config(ROOT / "tests/fixtures/tiny_finetune.yaml"))
+    sections = {
+        "common": (
+            "torch_compile",
+            "torch_compile_backend",
+            "torch_compile_mode",
+            "torch_compile_fullgraph",
+            "torch_compile_dynamic",
+        ),
+        "model": (
+            "position_encoding",
+            "attention_backend",
+            "rope_theta",
+            "use_cls_token",
+            "cls_loss_weight",
+            "classification_head",
+            "ffn_type",
+            "initialization",
+        ),
+        "optimization": (
+            "gradient_clip_method",
+            "adagc_beta",
+            "adagc_relative_clip",
+            "adagc_warmup_updates",
+        ),
+        "optimizer": (
+            "min_8bit_size",
+            "weight_decay_schedule",
+            "weight_decay_end",
+        ),
+    }
+    for section, fields in sections.items():
+        values = serialized[section]
+        assert isinstance(values, dict)
+        for field in fields:
+            values.pop(field, None)
+
+    restored = config_from_serialized_dict(serialized)
+
+    assert restored.common.torch_compile is False
+    assert restored.common.torch_compile_dynamic is None
+    assert restored.model.position_encoding == "legacy"
+    assert restored.model.attention_backend == "legacy"
+    assert restored.model.use_cls_token is False
+    assert restored.model.classification_head == "frame"
+    assert restored.model.ffn_type == "mlp"
+    assert restored.model.initialization == "legacy"
+    assert restored.optimization.gradient_clip_method == "global"
+    assert restored.optimizer.weight_decay_schedule == "constant"
+    assert restored.optimizer.weight_decay_end is None
+
+
+def test_modern_option_validation_rejects_incompatible_combinations() -> None:
+    """Reject invalid strategy selections before runtime construction."""
+
+    raw = yaml.safe_load((ROOT / "tests/fixtures/tiny_finetune.yaml").read_text())
+    assert isinstance(raw, dict)
+    base_raw = deepcopy(raw)
+    model = raw["model"]
+    assert isinstance(model, dict)
+    model["position_encoding"] = "alibi"
+    model["attention_backend"] = "sdpa"
+
+    with pytest.raises(ConfigError, match=r"position_encoding=alibi.*attention_backend"):
+        config_from_dict(raw)
+
+    invalid_values = (
+        ("common", "torch_compile", "false"),
+        ("model", "position_encoding", "absolute"),
+        ("model", "rope_theta", 0.0),
+        ("model", "use_cls_token", 1),
+        ("optimization", "adagc_beta", 1.0),
+        ("optimization", "adagc_relative_clip", 0.0),
+        ("optimization", "adagc_warmup_updates", -1),
+        ("optimizer", "min_8bit_size", -1),
+        ("optimizer", "weight_decay_schedule", "linear"),
+    )
+    for section, field, value in invalid_values:
+        invalid = deepcopy(base_raw)
+        values = invalid.setdefault(section, {})
+        assert isinstance(values, dict)
+        values[field] = value
+
+        with pytest.raises(ConfigError, match=rf"{section}\.{field}"):
+            config_from_dict(invalid)
+
+    missing_cls_token = deepcopy(base_raw)
+    cls_model = missing_cls_token["model"]
+    assert isinstance(cls_model, dict)
+    cls_model["position_encoding"] = "rope"
+    cls_model["classification_head"] = "cls"
+    with pytest.raises(ConfigError, match=r"classification_head=cls.*use_cls_token"):
+        config_from_dict(missing_cls_token)
 
 
 def test_checkpoint_activations_defaults_overrides_and_round_trips() -> None:
