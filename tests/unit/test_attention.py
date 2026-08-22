@@ -134,6 +134,72 @@ def test_attention_rejects_invalid_dimensions() -> None:
         raise AssertionError("invalid head dimension was accepted")
 
 
+def test_rope_attention_rejects_alibi_bias() -> None:
+    """Reject simultaneous rotary phases and an additive ALiBi prior."""
+
+    layer = MultiheadAttention(
+        8,
+        2,
+        position_encoding="rope",
+        attention_backend="manual",
+    )
+
+    with pytest.raises(ValueError, match=r"RoPE.*ALiBi.*mutually exclusive"):
+        layer(
+            torch.randn(1, 4, 8),
+            alibi=alibi_bias(2, 4),
+            position_ids=torch.tensor([[0, 3, 1, 2]]),
+        )
+
+
+def _attention_outputs_and_gradients(
+    layer: MultiheadAttention,
+    value: torch.Tensor,
+    upstream_gradient: torch.Tensor,
+    *,
+    training: bool,
+    seed: int,
+) -> tuple[torch.Tensor, ...]:
+    """Return output, input gradient, and ordered parameter gradients."""
+
+    layer.train(training)
+    sample = value.detach().clone().requires_grad_(True)
+    torch.manual_seed(seed)
+    output = layer(sample)
+    gradients = torch.autograd.grad(
+        (output * upstream_gradient).sum(),
+        (sample, *layer.parameters()),
+    )
+    return (output.detach(), *(gradient.detach() for gradient in gradients))
+
+
+def _mean_attention_outputs_and_gradients(
+    layer: MultiheadAttention,
+    value: torch.Tensor,
+    upstream_gradient: torch.Tensor,
+    *,
+    draws: int,
+    seed_offset: int,
+) -> tuple[torch.Tensor, ...]:
+    """Average train-mode dropout outputs and gradients over independent draws."""
+
+    totals: list[torch.Tensor] | None = None
+    for draw in range(draws):
+        result = _attention_outputs_and_gradients(
+            layer,
+            value,
+            upstream_gradient,
+            training=True,
+            seed=seed_offset + draw,
+        )
+        if totals is None:
+            totals = [torch.zeros_like(item) for item in result]
+        for total, item in zip(totals, result, strict=True):
+            total.add_(item)
+    assert totals is not None
+    return tuple(total / draws for total in totals)
+
+
 @pytest.mark.parametrize("case", ("no_padding", "key_padding", "rope"))
 def test_sdpa_matches_manual_attention_forward_and_backward(case: str) -> None:
     """Match the reference path for padding and rotary coordinates."""
@@ -187,7 +253,7 @@ def test_sdpa_branch_routes_configured_training_dropout(
     training: bool,
     expected_dropout: float,
 ) -> None:
-    """Call real SDPA and disable its unconditional dropout during evaluation."""
+    """Call real SDPA with configured train dropout and zero eval dropout."""
 
     original = F.scaled_dot_product_attention
     observed: list[tuple[float, float | None]] = []
@@ -230,6 +296,110 @@ def test_sdpa_branch_routes_configured_training_dropout(
     layer(torch.randn(2, 4, 8))
 
     assert observed == [(expected_dropout, 0.41)]
+
+
+def test_attention_dropout_eval_matches_manual_forward_and_backward() -> None:
+    """Disable attention dropout in eval for both implementations."""
+
+    torch.manual_seed(77)
+    manual = MultiheadAttention(
+        8,
+        2,
+        qkv_bias=True,
+        attention_dropout=0.3,
+        projection_dropout=0.0,
+        attention_backend="manual",
+    )
+    sdpa = deepcopy(manual)
+    sdpa.attention_backend = "sdpa"
+    value = torch.randn(2, 4, 8)
+    upstream_gradient = torch.randn(2, 4, 8)
+
+    manual_first = _attention_outputs_and_gradients(
+        manual, value, upstream_gradient, training=False, seed=101
+    )
+    manual_second = _attention_outputs_and_gradients(
+        manual, value, upstream_gradient, training=False, seed=102
+    )
+    sdpa_first = _attention_outputs_and_gradients(
+        sdpa, value, upstream_gradient, training=False, seed=201
+    )
+    sdpa_second = _attention_outputs_and_gradients(
+        sdpa, value, upstream_gradient, training=False, seed=202
+    )
+
+    for first, second in zip(manual_first, manual_second, strict=True):
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    for first, second in zip(sdpa_first, sdpa_second, strict=True):
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    for actual, expected in zip(sdpa_first, manual_first, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=4e-5, atol=4e-6)
+
+
+def test_attention_dropout_training_matches_in_expectation_forward_and_backward() -> None:
+    """Match unbiased dropout outputs and gradients across independent RNG streams."""
+
+    torch.manual_seed(77)
+    manual = MultiheadAttention(
+        8,
+        2,
+        qkv_bias=True,
+        attention_dropout=0.3,
+        projection_dropout=0.0,
+        attention_backend="manual",
+    )
+    sdpa = deepcopy(manual)
+    sdpa.attention_backend = "sdpa"
+    value = torch.randn(2, 4, 8)
+    upstream_gradient = torch.randn(2, 4, 8)
+    reference = _attention_outputs_and_gradients(
+        manual,
+        value,
+        upstream_gradient,
+        training=False,
+        seed=1,
+    )
+
+    manual_first = _attention_outputs_and_gradients(
+        manual, value, upstream_gradient, training=True, seed=1_000
+    )
+    manual_second = _attention_outputs_and_gradients(
+        manual, value, upstream_gradient, training=True, seed=1_001
+    )
+    sdpa_first = _attention_outputs_and_gradients(
+        sdpa, value, upstream_gradient, training=True, seed=5_000
+    )
+    sdpa_second = _attention_outputs_and_gradients(
+        sdpa, value, upstream_gradient, training=True, seed=5_001
+    )
+    assert not torch.equal(manual_first[0], manual_second[0])
+    assert not torch.equal(manual_first[1], manual_second[1])
+    assert not torch.equal(sdpa_first[0], sdpa_second[0])
+    assert not torch.equal(sdpa_first[1], sdpa_second[1])
+
+    manual_mean = _mean_attention_outputs_and_gradients(
+        manual,
+        value,
+        upstream_gradient,
+        draws=512,
+        seed_offset=1_000,
+    )
+    sdpa_mean = _mean_attention_outputs_and_gradients(
+        sdpa,
+        value,
+        upstream_gradient,
+        draws=512,
+        seed_offset=5_000,
+    )
+
+    for actual in (*manual_mean, *sdpa_mean):
+        assert torch.isfinite(actual).all()
+    for actual, expected in zip(manual_mean, reference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.12)
+    for actual, expected in zip(sdpa_mean, reference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.12)
+    for actual, expected in zip(sdpa_mean, manual_mean, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.12)
 
 
 @pytest.mark.parametrize("attention_backend", ("sdpa", "flash"))

@@ -604,6 +604,8 @@ class MultiheadAttention(nn.Module):
         dtype for projections and matrix multiplication.
         """
 
+        if self.position_encoding == "rope" and alibi is not None:
+            raise ValueError("RoPE and ALiBi position encodings are mutually exclusive")
         batch, length, dimension = value.shape
         # Mathematics: one affine map produces [Q,K,V] in R^{B×T×3×H×d_h},
         # followed by a permutation to R^{3×B×H×T×d_h}.
