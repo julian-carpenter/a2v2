@@ -1,10 +1,14 @@
 """Run complete tiny mean-teacher pretraining steps. The suite checks student gradients,
 optimizer updates, EMA movement, and independent masking of cloned student views."""
 
+from copy import deepcopy
+import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile as sf
 import torch
 
 from a2v2.config import load_config
@@ -17,10 +21,163 @@ from a2v2.model import (
     make_teacher_targets,
     masks_for_cloned_batch,
 )
-from a2v2.training import CosineUpdateScheduler, TrainingEngine
+from a2v2.training import CosineUpdateScheduler, TrainingEngine, load_checkpoint
+from a2v2.workflows import train_main
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_compiled_pretraining_reports_execution_policy_without_state_prefixes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Run fullgraph-false pretraining while keeping compile out of mathematical state."""
+
+    audio_root = tmp_path / "audio"
+    manifest_root = tmp_path / "manifests"
+    output_root = tmp_path / "compiled"
+    audio_root.mkdir()
+    manifest_root.mkdir()
+    rows: list[str] = []
+    for index, length in enumerate((64, 72)):
+        name = f"sample_{index}.wav"
+        sf.write(
+            audio_root / name,
+            np.linspace(-0.5, 0.5, length, dtype=np.float32),
+            8_000,
+            subtype="FLOAT",
+        )
+        rows.append(f"{name}\t{length}")
+    manifest = f"{audio_root}\n" + "\n".join(rows) + "\n"
+    (manifest_root / "pretrain.tsv").write_text(manifest, encoding="utf-8")
+
+    assert train_main([
+        "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
+        "--override", f"task.data={manifest_root}",
+        "--override", f"checkpoint.save_dir={output_root}",
+        "--override", "common.torch_compile=true",
+        "--override", "common.torch_compile_backend=eager",
+        "--override", "common.torch_compile_mode=default",
+        "--override", "common.torch_compile_fullgraph=false",
+        "--override", "common.torch_compile_dynamic=false",
+        "--max-updates", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    summary = next(
+        record["training_summary"]
+        for record in records
+        if "training_summary" in record
+    )
+    assert summary["torch_compile"] == {
+        "enabled": True,
+        "backend": "eager",
+        "mode": "default",
+        "fullgraph": False,
+        "dynamic": False,
+    }
+    checkpoint = load_checkpoint(output_root / "checkpoint_last.pt")
+    common = checkpoint["config"]["active"]["common"]
+    assert common["torch_compile"] is True
+    assert common["torch_compile_backend"] == "eager"
+    assert common["torch_compile_mode"] == "default"
+    assert common["torch_compile_fullgraph"] is False
+    assert common["torch_compile_dynamic"] is False
+    assert all(not key.startswith("_orig_mod.") for key in checkpoint["model"])
+    fingerprint = checkpoint["resume_compatibility"]
+    assert all(not key.startswith("common.torch_compile") for key in fingerprint)
+
+
+def test_compiled_rope_cls_geglu_checkpointed_pretraining_update_matches_eager() -> None:
+    """Match one modern masked mean-teacher update under fullgraph-false compile."""
+
+    cfg = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=(
+            "model.position_encoding=rope",
+            "model.attention_backend=sdpa",
+            "model.use_cls_token=true",
+            "model.ffn_type=geglu",
+            "model.checkpoint_activations=true",
+            "model.encoder_dropout=0.0",
+            "model.attention_dropout=0.0",
+            "model.activation_dropout=0.0",
+            "model.post_mlp_drop=0.0",
+            "model.dropout_input=0.0",
+            "model.modalities.audio.prenet_dropout=0.0",
+        ),
+    )
+    torch.manual_seed(601)
+    eager = Animal2VecPretrainingModel.from_config(cfg).train()
+    compiled = deepcopy(eager).train()
+    compiled.compile(backend="eager", fullgraph=False, dynamic=False)
+
+    def make_engine(model: Animal2VecPretrainingModel) -> TrainingEngine:
+        """Build the optimizer after optional in-place compilation."""
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        scheduler = CosineUpdateScheduler(
+            optimizer,
+            max_lr=1e-3,
+            min_lr=0.0,
+            warmup_updates=0,
+            max_updates=2,
+        )
+        return TrainingEngine(
+            model,
+            optimizer,
+            scheduler,
+            clip_norm=1.0,
+            device=torch.device("cpu"),
+        )
+
+    eager_engine = make_engine(eager)
+    compiled_engine = make_engine(compiled)
+    batch = {
+        "source": torch.randn(2, 64),
+        "id": torch.tensor([31, 32]),
+    }
+
+    def update(
+        model: Animal2VecPretrainingModel,
+        engine: TrainingEngine,
+    ) -> object:
+        """Run one identically seeded masked update."""
+
+        torch.manual_seed(602)
+        np.random.seed(603)
+        return engine.step(
+            [batch],
+            lambda value: model(
+                value["source"],
+                sample_ids=value["id"],
+                update=engine.update,
+            ),
+        )
+
+    eager_result = update(eager, eager_engine)
+    compiled_result = update(compiled, compiled_engine)
+
+    assert compiled_result == eager_result
+    assert tuple(compiled.state_dict()) == tuple(eager.state_dict())
+    for name, expected in eager.state_dict().items():
+        torch.testing.assert_close(compiled.state_dict()[name], expected, rtol=0, atol=0)
+    assert compiled_engine.optimizer.state_dict().keys() == eager_engine.optimizer.state_dict().keys()
+    for actual_state, expected_state in zip(
+        compiled_engine.optimizer.state.values(),
+        eager_engine.optimizer.state.values(),
+        strict=True,
+    ):
+        assert actual_state.keys() == expected_state.keys()
+        for key in expected_state:
+            actual = actual_state[key]
+            expected = expected_state[key]
+            if isinstance(expected, torch.Tensor):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            else:
+                assert actual == expected
 
 
 def test_tiny_pretraining_forward_backward_optimizer_and_ema() -> None:

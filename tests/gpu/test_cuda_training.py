@@ -9,6 +9,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -31,7 +32,12 @@ from a2v2.training import CosineUpdateScheduler, build_gradient_clipper, build_o
 
 
 ROOT = Path(__file__).parents[2]
-pytestmark = pytest.mark.gpu
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.filterwarnings(
+        "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning"
+    ),
+]
 
 
 def _report_error(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -469,6 +475,294 @@ def test_transformer_activation_checkpointing_autocast_cuda_parity(
             atol=gradient_atol,
         )
     assert torch.equal(checkpointed_rng, direct_rng)
+
+
+def test_compile_cuda_flash_rope_geglu_parity_and_benchmark(
+    cuda_device: torch.device,
+) -> None:
+    """Match one update and report bounded eager/Inductor Flash diagnostics."""
+
+    torch.manual_seed(751)
+    torch.cuda.manual_seed_all(752)
+    eager = TransformerStack(
+        64,
+        4,
+        depth=2,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        post_mlp_dropout=0.0,
+        layerdrop=0.0,
+        input_dropout=0.0,
+        checkpoint_activations=True,
+        position_encoding="rope",
+        attention_backend="flash",
+        ffn_type="geglu",
+    ).to(device=cuda_device, dtype=torch.float16).train()
+    compiled = deepcopy(eager).train()
+    state_keys = tuple(compiled.state_dict())
+    parameter_ids = tuple(id(parameter) for parameter in compiled.parameters())
+    compiled.compile(
+        backend="inductor",
+        mode="default",
+        fullgraph=True,
+        dynamic=False,
+    )
+    assert tuple(compiled.state_dict()) == state_keys
+    assert tuple(id(parameter) for parameter in compiled.parameters()) == parameter_ids
+
+    batch, heads, length, dimension = 2, 4, 128, 64
+    base = torch.randn(
+        batch,
+        length,
+        dimension,
+        device=cuda_device,
+        dtype=torch.float16,
+    )
+    position_ids = torch.arange(length, device=cuda_device).expand(batch, -1)
+
+    def forward_backward(
+        stack: TransformerStack,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate the same scalar training objective for parity and timing."""
+
+        stack.zero_grad(set_to_none=True)
+        output, targets = stack(value * 1.0, position_ids=position_ids)
+        loss = output.float().square().mean() + sum(
+            target.float().square().mean() for target in targets
+        )
+        loss.backward()
+        return output.detach(), loss.detach()
+
+    eager_value = base.clone().requires_grad_(True)
+    compiled_value = base.clone().requires_grad_(True)
+    eager_output, eager_loss = forward_backward(eager, eager_value)
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    compiled_output, compiled_loss = forward_backward(compiled, compiled_value)
+    torch.testing.assert_close(compiled_output, eager_output, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(compiled_loss, eager_loss, rtol=3e-3, atol=3e-3)
+    torch.testing.assert_close(compiled_value.grad, eager_value.grad, rtol=5e-3, atol=5e-4)
+    for actual, expected in zip(compiled.parameters(), eager.parameters(), strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=5e-3, atol=5e-4)
+
+    eager_optimizer = torch.optim.SGD(eager.parameters(), lr=1e-3)
+    compiled_optimizer = torch.optim.SGD(compiled.parameters(), lr=1e-3)
+    eager_optimizer.step()
+    compiled_optimizer.step()
+    for actual, expected in zip(compiled.parameters(), eager.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    assert sum(torch._dynamo.utils.counters["graph_break"].values()) == 0
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1
+
+    warmup_iterations = 2
+    measured_iterations = 5
+
+    def measure(stack: TransformerStack) -> dict[str, float | int]:
+        """Time synchronized forward/backward iterations and peak CUDA memory."""
+
+        for _ in range(warmup_iterations):
+            forward_backward(stack, base)
+        torch.cuda.synchronize(cuda_device)
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+        started = time.perf_counter()
+        for _ in range(measured_iterations):
+            forward_backward(stack, base)
+        torch.cuda.synchronize(cuda_device)
+        elapsed = time.perf_counter() - started
+        return {
+            "total_seconds": elapsed,
+            "milliseconds_per_iteration": elapsed * 1_000 / measured_iterations,
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(cuda_device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(cuda_device),
+        }
+
+    eager_metrics = measure(eager)
+    compiled_metrics = measure(compiled)
+    print(json.dumps({
+        "compile_benchmark": {
+            "gpu": torch.cuda.get_device_name(cuda_device),
+            "shape": [batch, length, dimension],
+            "heads": heads,
+            "dtype": "float16",
+            "warmup_iterations": warmup_iterations,
+            "measured_iterations": measured_iterations,
+            "compiler": {
+                "backend": "inductor",
+                "mode": "default",
+                "fullgraph": True,
+                "dynamic": False,
+            },
+            "eager": eager_metrics,
+            "compiled": compiled_metrics,
+            "eager_over_compiled_time_ratio": (
+                eager_metrics["milliseconds_per_iteration"]
+                / compiled_metrics["milliseconds_per_iteration"]
+            ),
+        }
+    }, sort_keys=True))
+
+
+def test_compile_cuda_complete_pretraining_and_finetuning_updates(
+    cuda_device: torch.device,
+) -> None:
+    """Run complete modern updates and report their bounded compile diagnostics."""
+
+    pretrain = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=(
+            "model.position_encoding=rope",
+            "model.attention_backend=sdpa",
+            "model.use_cls_token=true",
+            "model.ffn_type=geglu",
+            "model.checkpoint_activations=true",
+            "model.encoder_dropout=0.0",
+            "model.attention_dropout=0.0",
+            "model.activation_dropout=0.0",
+            "model.post_mlp_drop=0.0",
+            "model.dropout_input=0.0",
+            "model.modalities.audio.prenet_dropout=0.0",
+        ),
+    )
+    finetune = load_config(
+        ROOT / "tests/fixtures/tiny_finetune.yaml",
+        overrides=(
+            "model.use_cls_token=true",
+            "model.classification_head=cls",
+            "model.checkpoint_activations=true",
+            "model.freeze_finetune_updates=0",
+            "model.apply_mask=false",
+        ),
+    )
+
+    def make_engine(model: torch.nn.Module, config: object) -> TrainingEngine:
+        """Build the optimizer after the module has been compiled in place."""
+
+        optimizer = build_optimizer(
+            model,
+            name=config.optimizer.name,
+            learning_rate=config.optimization.learning_rate,
+            betas=config.optimizer.betas,
+            eps=config.optimizer.eps,
+            weight_decay=config.optimizer.weight_decay,
+            device=cuda_device,
+        )
+        scheduler = CosineUpdateScheduler(
+            optimizer,
+            max_lr=config.optimization.learning_rate,
+            min_lr=config.scheduler.min_lr,
+            warmup_updates=config.scheduler.warmup_updates,
+            warmup_init_lr=config.scheduler.warmup_init_lr,
+            max_updates=config.optimization.max_update,
+        )
+        return TrainingEngine(
+            model,
+            optimizer,
+            scheduler,
+            clip_norm=config.optimization.clip_norm,
+            device=cuda_device,
+        )
+
+    diagnostics: dict[str, object] = {
+        "gpu": torch.cuda.get_device_name(cuda_device),
+        "dtype": "float32",
+        "compiler": {
+            "backend": "inductor",
+            "mode": "default",
+            "fullgraph": False,
+            "dynamic": True,
+        },
+    }
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    pretraining_model = Animal2VecPretrainingModel.from_config(pretrain).to(cuda_device).train()
+    pretraining_keys = tuple(pretraining_model.state_dict())
+    pretraining_parameters = tuple(id(parameter) for parameter in pretraining_model.parameters())
+    pretraining_model.compile(
+        backend="inductor",
+        mode="default",
+        fullgraph=False,
+        dynamic=True,
+    )
+    assert tuple(pretraining_model.state_dict()) == pretraining_keys
+    assert tuple(id(parameter) for parameter in pretraining_model.parameters()) == pretraining_parameters
+    pretraining_engine = make_engine(pretraining_model, pretrain)
+    torch.cuda.reset_peak_memory_stats(cuda_device)
+    torch.cuda.synchronize(cuda_device)
+    started = time.perf_counter()
+    pretraining_result = pretraining_engine.step(
+        [{
+            "source": torch.randn(2, 64, device=cuda_device),
+            "id": torch.tensor([41, 42]),
+        }],
+        lambda batch: pretraining_model(
+            batch["source"],
+            sample_ids=batch["id"],
+            update=pretraining_engine.update,
+        ),
+    )
+    torch.cuda.synchronize(cuda_device)
+    diagnostics["pretraining"] = {
+        "shape": [2, 64],
+        "elapsed_seconds_including_compile": time.perf_counter() - started,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(cuda_device),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(cuda_device),
+        "loss": pretraining_result.loss,
+        "graph_breaks": sum(torch._dynamo.utils.counters["graph_break"].values()),
+        "graph_break_reasons": dict(torch._dynamo.utils.counters["graph_break"]),
+        "unique_graphs": torch._dynamo.utils.counters["stats"]["unique_graphs"],
+    }
+    assert torch.isfinite(torch.tensor(pretraining_result.loss))
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    finetuning_model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+    ).to(cuda_device).train()
+    finetuning_keys = tuple(finetuning_model.state_dict())
+    finetuning_parameters = tuple(id(parameter) for parameter in finetuning_model.parameters())
+    finetuning_model.compile(
+        backend="inductor",
+        mode="default",
+        fullgraph=False,
+        dynamic=True,
+    )
+    assert tuple(finetuning_model.state_dict()) == finetuning_keys
+    assert tuple(id(parameter) for parameter in finetuning_model.parameters()) == finetuning_parameters
+    finetuning_engine = make_engine(finetuning_model, finetune)
+    torch.cuda.reset_peak_memory_stats(cuda_device)
+    torch.cuda.synchronize(cuda_device)
+    started = time.perf_counter()
+    finetuning_result = finetuning_engine.step(
+        [{
+            "source": torch.randn(2, 64, device=cuda_device),
+            "target": torch.randint(0, 2, (2, 16, 2), device=cuda_device).float(),
+            "id": torch.tensor([51, 52]),
+        }],
+        lambda batch: finetuning_model(
+            batch["source"],
+            target=batch["target"],
+            sample_ids=batch["id"],
+            update=finetuning_engine.update,
+        ),
+    )
+    torch.cuda.synchronize(cuda_device)
+    diagnostics["finetuning"] = {
+        "shape": [2, 64],
+        "target_shape": [2, 16, 2],
+        "elapsed_seconds_including_compile": time.perf_counter() - started,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(cuda_device),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(cuda_device),
+        "loss": finetuning_result.loss,
+        "graph_breaks": sum(torch._dynamo.utils.counters["graph_break"].values()),
+        "graph_break_reasons": dict(torch._dynamo.utils.counters["graph_break"]),
+        "unique_graphs": torch._dynamo.utils.counters["stats"]["unique_graphs"],
+    }
+    assert torch.isfinite(torch.tensor(finetuning_result.loss))
+    print(json.dumps({"compile_complete_updates": diagnostics}, sort_keys=True))
 
 
 @pytest.mark.parametrize("gradient_clip_method", ("global", "adagc"))

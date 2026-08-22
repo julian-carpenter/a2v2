@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .config import (
     Animal2VecConfig,
+    CommonConfig,
     ConfigError,
     config_from_dict,
     config_from_serialized_dict,
@@ -1931,12 +1932,39 @@ def _tracked_metric(config: Animal2VecConfig, metrics: dict[str, float]) -> tupl
 
 
 def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, object]:
-    """Move tensor fields to one rank's device and preserve metadata fields."""
+    """Move model tensors to one rank's device while keeping sample IDs on CPU."""
 
     return {
-        key: value.to(device) if isinstance(value, Tensor) else value
+        key: value.to(device) if isinstance(value, Tensor) and key != "id" else value
         for key, value in batch.items()
     }
+
+
+def _compile_model_in_place(model: nn.Module, common: CommonConfig) -> None:
+    """Apply the configured execution policy without wrapping the module."""
+
+    if not common.torch_compile:
+        return
+    if torch._dynamo.config.suppress_errors:
+        raise RuntimeError(
+            "torch.compile requires torch._dynamo.config.suppress_errors=False; "
+            "suppress_errors=True permits a silent eager fallback"
+        )
+    try:
+        model.compile(
+            backend=common.torch_compile_backend,
+            mode=common.torch_compile_mode,
+            fullgraph=common.torch_compile_fullgraph,
+            dynamic=common.torch_compile_dynamic,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "torch.compile setup failed "
+            f"(backend={common.torch_compile_backend}, "
+            f"mode={common.torch_compile_mode}, "
+            f"fullgraph={common.torch_compile_fullgraph}, "
+            f"dynamic={common.torch_compile_dynamic}): {error}"
+        ) from error
 
 
 def _restore_and_release_checkpoint(
@@ -1990,6 +2018,7 @@ def _run_training(
         resume_checkpoint=resume_checkpoint,
     )
     model.to(device)
+    _compile_model_in_place(model, config.common)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     gradient_clipper = _build_gradient_clipper_for_config(model, config)
@@ -2310,6 +2339,13 @@ def _run_training(
         "configured_max_update": config.optimization.max_update,
         "elapsed_seconds": time.perf_counter() - started_at,
         "amp_scale": engine.scaler.get_scale() if engine.scaler is not None else None,
+        "torch_compile": {
+            "enabled": config.common.torch_compile,
+            "backend": config.common.torch_compile_backend,
+            "mode": config.common.torch_compile_mode,
+            "fullgraph": config.common.torch_compile_fullgraph,
+            "dynamic": config.common.torch_compile_dynamic,
+        },
     }
     summary.update(_optimizer_run_metadata(optimizer))
     if (

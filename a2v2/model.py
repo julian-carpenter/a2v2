@@ -642,7 +642,7 @@ class MultiheadAttention(nn.Module):
                 # Interpretation: attention combines learned acoustic similarity
                 # with a fixed or scaled preference for temporal proximity.
                 scores = scores.to(alibi.dtype) + alibi
-            if padding_mask is not None and padding_mask.any():
+            if padding_mask is not None:
                 # Mathematics: padded keys receive -∞, hence exp(-∞)=0 in softmax.
                 # Interpretation: real frames cannot attend to batch padding.
                 scores = scores.masked_fill(padding_mask[:, None, None, :].bool(), float("-inf"))

@@ -1401,7 +1401,7 @@ class TrainingEngine:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         total_sample_size = 0
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
         pred_var_sum = 0.0
         target_var_sum = 0.0
         variance_microbatches = 0
@@ -1446,14 +1446,17 @@ class TrainingEngine:
             # Interpretation: later normalization weights every frame token
             # equally even when microbatches contain different lengths.
             total_sample_size += int(output.sample_size)
-            total_loss += float(output.loss.detach())
+            total_loss = total_loss + output.loss.detach().to(dtype=torch.float64)
             self.batch_in_epoch += 1
 
-        totals = torch.tensor(
-            [float(total_sample_size), total_loss],
-            device=self.device,
-            dtype=torch.float64,
-        )
+        totals = torch.stack((
+            torch.tensor(
+                float(total_sample_size),
+                device=self.device,
+                dtype=torch.float64,
+            ),
+            total_loss,
+        ))
         world_size = 1
         # Mathematics: all-reduce sums [N_r,L_r] over ranks r=0,...,W-1.
         # Interpretation: logging and normalization describe the global batch,
