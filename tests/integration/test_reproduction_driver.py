@@ -8,6 +8,7 @@ the report helper against a genuinely loadable tiny native checkpoint.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -32,6 +33,13 @@ ROOT = Path(__file__).parents[2]
 DRIVER = ROOT / "scripts/reproduce_meerkat_paper.sh"
 EVALUATOR = ROOT / "scripts/evaluate_finetuning_checkpoint.py"
 PREFLIGHT = ROOT / "scripts/check_reproduction_environment.py"
+FROZEN_DRIVER_SHA256 = "485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18"
+
+
+def test_local_reproduction_driver_bytes_remain_frozen() -> None:
+    """Catch any Task 10 edit to the canonical local reproduction control."""
+
+    assert hashlib.sha256(DRIVER.read_bytes()).hexdigest() == FROZEN_DRIVER_SHA256
 
 
 def _load_preflight() -> ModuleType:
