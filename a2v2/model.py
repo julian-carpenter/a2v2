@@ -2620,6 +2620,18 @@ class Animal2VecFineTuningModel(nn.Module):
                 window_seconds=cfg.model.mixing_window_length,
             )
             waveform = mixed.waveforms
+            if padding_mask is not None and cfg.model.classification_head == "cls":
+                mixed_padding = padding_mask.clone()
+                # Mathematics: pad_mix[b,s] = pad[b,s] AND pad[pi(b),s]
+                # for applied mixes, so a position is valid when either
+                # contributing waveform has a real sample there.
+                # Interpretation: CLS attention sees every waveform position
+                # represented by the occurrence targets mixed below.
+                mixed_padding[mixed.applied] = (
+                    padding_mask[mixed.applied]
+                    & padding_mask[mixed.permutation][mixed.applied]
+                )
+                padding_mask = mixed_padding
             if target is not None and cfg.model.target_mixup:
                 target = mix_targets(
                     target,

@@ -158,10 +158,10 @@ def test_cls_head_averages_top_layer_cls_states() -> None:
     assert output.logits.shape == (2, 2)
 
 
-def test_cls_targets_reduce_occurrences_before_target_mixup(
+def test_cls_mixup_shares_permutation_ratio_and_union_validity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Do not make clip labels depend on frame alignment across recordings."""
+    """Mix waveforms, clip labels, and valid positions with one pairing."""
 
     pretrain = load_config(
         ROOT / "tests/fixtures/tiny_pretrain.yaml",
@@ -175,8 +175,9 @@ def test_cls_targets_reduce_occurrences_before_target_mixup(
             "model.source_mixup=0.25",
             "model.mixup_prob=1.0",
             "model.target_mixup=true",
-            "model.same_mixup=true",
+            "model.same_mixup=false",
             "model.gain_mode=none",
+            "model.apply_mask=false",
         ),
     )
     model = Animal2VecFineTuningModel.from_config(
@@ -185,27 +186,85 @@ def test_cls_targets_reduce_occurrences_before_target_mixup(
     ).train()
     target = torch.zeros(2, 16, 2)
     target[0, 1, 0] = 1
-    target[1, 12, 0] = 1
+    target[1, 10, 1] = 1
+    waveform = torch.zeros(2, 64)
+    waveform[0, :32] = 1
+    waveform[1, :48] = 2
+    padding = torch.zeros_like(waveform, dtype=torch.bool)
+    padding[0, 32:] = True
+    padding[1, 48:] = True
+    ratios = torch.tensor([0.25, 0.6])
+    permutation = torch.tensor([1, 0])
+    observed: dict[str, torch.Tensor | None] = {}
+    mix_waveforms = model_module.mix_waveforms
+    project = model._project
+    encode_projected = model.encoder.encode_projected
 
     def fixed_mix(waveform: torch.Tensor, **_: object) -> MixResult:
-        """Return fixed cross-recording pairs with an alignment-sensitive ratio."""
+        """Run real waveform mixup with fixed metadata."""
 
-        return MixResult(
-            waveforms=waveform,
-            ratios=torch.tensor([0.25]),
-            permutation=torch.tensor([1, 0]),
-            applied=torch.tensor([True, True]),
+        return mix_waveforms(
+            waveform,
+            strength=0.25,
+            probability=1.0,
+            same_ratio=False,
+            gain_mode="none",
+            sample_rate=8_000,
+            window_seconds=0.1,
+            ratios=ratios,
+            permutation=permutation,
         )
 
-    monkeypatch.setattr(model_module, "mix_waveforms", fixed_mix)
+    def record_project(
+        mixed_waveform: torch.Tensor,
+        mixed_padding: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Capture the mixed waveform and sample mask entering the encoder."""
 
-    output = model(torch.randn(2, 64), target=target, update=2)
+        observed["waveform"] = mixed_waveform.detach().clone()
+        observed["sample_padding"] = (
+            mixed_padding.detach().clone() if mixed_padding is not None else None
+        )
+        return project(mixed_waveform, mixed_padding)
+
+    def record_encode_projected(
+        projected: torch.Tensor,
+        feature_padding: torch.Tensor | None = None,
+        mask_info: object | None = None,
+    ) -> object:
+        """Capture the feature mask received by CLS attention."""
+
+        observed["feature_padding"] = (
+            feature_padding.detach().clone() if feature_padding is not None else None
+        )
+        return encode_projected(projected, feature_padding, mask_info)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model_module, "mix_waveforms", fixed_mix)
+    monkeypatch.setattr(model, "_project", record_project)
+    monkeypatch.setattr(model.encoder, "encode_projected", record_encode_projected)
+
+    output = model(waveform, target=target, padding_mask=padding, update=2)
 
     assert output.targets is not None
     torch.testing.assert_close(
         output.targets,
-        torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+        torch.tensor([[0.25, 0.75], [0.4, 0.6]]),
     )
+    expected_waveform = torch.empty_like(waveform)
+    expected_waveform[0, :32] = 1.75 / (0.25**2 + 0.75**2) ** 0.5
+    expected_waveform[0, 32:48] = 1.5 / (0.25**2 + 0.75**2) ** 0.5
+    expected_waveform[0, 48:] = 0
+    expected_waveform[1, :32] = 1.6 / (0.6**2 + 0.4**2) ** 0.5
+    expected_waveform[1, 32:48] = 1.2 / (0.6**2 + 0.4**2) ** 0.5
+    expected_waveform[1, 48:] = 0
+    torch.testing.assert_close(observed["waveform"], expected_waveform)
+    expected_padding = torch.zeros_like(padding)
+    expected_padding[:, 48:] = True
+    assert observed["sample_padding"] is not None
+    assert torch.equal(observed["sample_padding"], expected_padding)
+    expected_feature_padding = torch.zeros(2, 16, dtype=torch.bool)
+    expected_feature_padding[:, 12:] = True
+    assert torch.equal(observed["feature_padding"], expected_feature_padding)
 
 
 def test_cls_focal_loss_counts_sequence_examples() -> None:
