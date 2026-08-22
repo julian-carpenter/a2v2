@@ -6,6 +6,7 @@ import math
 import torch
 from torch.nn import functional as F
 
+import a2v2.model as model_module
 from a2v2.model import (
     RegressionLoss,
     SigmoidFocalLoss,
@@ -44,6 +45,82 @@ def test_teacher_targets_instance_normalize_each_layer_then_average() -> None:
     )
     assert torch.allclose(target.mean(dim=1), torch.zeros(1, 2), atol=1e-6)
     assert torch.allclose(target.var(dim=1, unbiased=False), torch.ones(1, 2), atol=2e-5)
+
+
+def test_cls_teacher_target_split_keeps_frame_targets_identical() -> None:
+    """Prevent the prepended token from changing frame normalization statistics."""
+
+    frame_layers = [
+        torch.tensor([[[1.0, 2.0], [3.0, 7.0], [8.0, 4.0]]]),
+        torch.tensor([[[2.0, 5.0], [6.0, 1.0], [9.0, 3.0]]]),
+    ]
+    cls_layers = [
+        torch.tensor([[[100.0, -50.0]]]),
+        torch.tensor([[[-200.0, 75.0]]]),
+    ]
+    layers_with_cls = [
+        torch.cat((cls, frames), dim=1)
+        for cls, frames in zip(cls_layers, frame_layers)
+    ]
+
+    frame_target, _ = model_module.make_pretraining_targets(
+        layers_with_cls,
+        top_k=2,
+        instance_norm_per_layer=True,
+        layer_norm_per_layer=False,
+        layer_norm_final=False,
+        use_cls_token=True,
+    )
+    expected = make_teacher_targets(
+        frame_layers,
+        top_k=2,
+        instance_norm_per_layer=True,
+        layer_norm_per_layer=False,
+        layer_norm_final=False,
+    )
+
+    assert torch.equal(frame_target, expected)
+
+
+@torch.no_grad()
+def test_cls_teacher_target_uses_finite_feature_normalization() -> None:
+    """Normalize each CLS vector over features even for instance-norm recipes."""
+
+    first = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 4.0, 8.0],
+                [0.0, 1.0, 2.0, 3.0],
+                [1.0, 3.0, 5.0, 7.0],
+            ],
+            [
+                [-3.0, 1.0, 5.0, 9.0],
+                [2.0, 4.0, 6.0, 8.0],
+                [3.0, 6.0, 9.0, 12.0],
+            ],
+        ]
+    )
+    second = first.clone()
+    second[:, 0] = second[:, 0] * 3 + 7
+
+    _, cls_target = model_module.make_pretraining_targets(
+        [first, second],
+        top_k=2,
+        instance_norm_per_layer=True,
+        layer_norm_per_layer=False,
+        layer_norm_final=True,
+        use_cls_token=True,
+    )
+
+    assert cls_target is not None
+    assert cls_target.shape == (2, 4)
+    assert torch.isfinite(cls_target).all()
+    assert torch.allclose(cls_target.mean(dim=-1), torch.zeros(2), atol=1e-6)
+    assert torch.allclose(
+        cls_target.var(dim=-1, unbiased=False),
+        torch.ones(2),
+        atol=2e-5,
+    )
 
 
 def test_mix_waveforms_matches_between_class_formula_without_gain_weighting() -> None:

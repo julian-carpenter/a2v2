@@ -10,6 +10,7 @@ from a2v2.config import load_config
 from a2v2.model import (
     AudioEncoder,
     MaskInfo,
+    alibi_bias,
     compute_mask_indices,
     make_mask_info,
     masks_for_cloned_batch,
@@ -144,6 +145,174 @@ def test_masked_encoder_gathers_original_shuffled_position_ids(
     assert len(observed) == 2
     assert all(position_ids is not None for position_ids in observed)
     assert all(torch.equal(position_ids, expected) for position_ids in observed)
+
+
+@pytest.mark.parametrize("position_encoding", ["none", "rope", "alibi"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_cls_encoder_prepends_context_without_changing_frame_masking(
+    position_encoding: str,
+    masked: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep CLS outside the frame-only position convolution and mask metadata."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        (
+            "model.use_cls_token=true",
+            f"model.position_encoding={position_encoding}",
+            "model.attention_backend=manual",
+        ),
+    )
+    encoder = AudioEncoder.from_config(config).eval()
+    projected = torch.randn(1, 4, config.model.embed_dim)
+    padding = torch.tensor([[False, False, False, True]])
+    mask_info = None
+    if masked:
+        mask_info = make_mask_info(
+            projected,
+            torch.tensor([[False, True, False, False]]),
+        )
+
+    positional_inputs: list[torch.Tensor] = []
+    positional_forward = encoder.positional_encoder.forward
+
+    def capture_positional_input(value: torch.Tensor) -> torch.Tensor:
+        """Record the frame-only input before running positional convolution."""
+
+        positional_inputs.append(value.detach().clone())
+        return positional_forward(value)
+
+    monkeypatch.setattr(encoder.positional_encoder, "forward", capture_positional_input)
+    context = encoder.encode_projected(projected, padding, mask_info)
+
+    retained_frames = 3 if masked else 4
+    assert context.x.shape == (1, retained_frames + 1, config.model.embed_dim)
+    assert context.padding_mask is not None
+    assert context.padding_mask.shape == (1, retained_frames + 1)
+    assert context.padding_mask[0, 0].item() is False
+    assert positional_inputs[0].shape == projected.shape
+    if mask_info is not None:
+        assert mask_info.mask.shape == (1, 4)
+        assert mask_info.ids_keep.shape[1] == retained_frames
+        assert mask_info.ids_restore.shape[1] == 4
+
+
+def test_cls_encoder_keeps_local_features_on_the_frame_axis() -> None:
+    """Keep the convolutional feature contract frame-only when CLS is enabled."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        (
+            "model.use_cls_token=true",
+            "model.position_encoding=none",
+            "model.attention_backend=manual",
+        ),
+    )
+    output = AudioEncoder.from_config(config).eval()(torch.randn(2, 64))
+
+    assert output.x.shape[1] == output.local_features.shape[1] + 1
+    assert output.local_features.shape[0] == 2
+
+
+@pytest.mark.parametrize(
+    ("mask_info", "expected"),
+    [
+        (None, torch.tensor([[0, 1, 2, 3, 4]])),
+        (
+            MaskInfo(
+                x_unmasked=torch.empty(1, 3, 16),
+                mask=torch.tensor([[False, True, False, False]]),
+                ids_restore=torch.arange(4).view(1, 4, 1).expand(1, 4, 16),
+                ids_keep=torch.tensor([[3, 0, 2]]).unsqueeze(-1).expand(1, 3, 16),
+            ),
+            torch.tensor([[0, 4, 1, 3]]),
+        ),
+    ],
+)
+def test_cls_rope_uses_zero_then_one_based_original_frame_ids(
+    mask_info: MaskInfo | None,
+    expected: torch.Tensor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Give CLS ID zero while retained frames keep their teacher coordinates."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        (
+            "model.use_cls_token=true",
+            "model.position_encoding=rope",
+            "model.attention_backend=manual",
+        ),
+    )
+    encoder = AudioEncoder.from_config(config).eval()
+    projected = torch.randn(1, 4, config.model.embed_dim)
+    if mask_info is not None:
+        mask_info = MaskInfo(
+            x_unmasked=torch.gather(projected, 1, mask_info.ids_keep),
+            mask=mask_info.mask,
+            ids_restore=mask_info.ids_restore.long(),
+            ids_keep=mask_info.ids_keep.long(),
+        )
+    observed: list[torch.Tensor | None] = []
+
+    for stack in (encoder.prenet, encoder.transformer):
+        original = stack.forward
+
+        def forward(
+            value: torch.Tensor,
+            padding_mask: torch.Tensor | None = None,
+            alibi: torch.Tensor | None = None,
+            alibi_scale: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            *,
+            _original=original,
+        ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+            """Record explicit token positions while preserving stack behavior."""
+
+            observed.append(None if position_ids is None else position_ids.detach().clone())
+            return _original(value, padding_mask, alibi, alibi_scale, position_ids)
+
+        monkeypatch.setattr(stack, "forward", forward)
+
+    encoder.encode_projected(projected, mask_info=mask_info)
+
+    assert len(observed) == 2
+    assert all(position_ids is not None for position_ids in observed)
+    assert all(torch.equal(position_ids, expected) for position_ids in observed)
+
+
+def test_cls_alibi_has_zero_global_bias_and_gathered_frame_distances() -> None:
+    """Keep CLS global while ALiBi frames retain shuffled temporal distances."""
+
+    config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        (
+            "model.use_cls_token=true",
+            "model.position_encoding=alibi",
+            "model.attention_backend=manual",
+        ),
+    )
+    encoder = AudioEncoder.from_config(config).eval()
+    projected = torch.randn(1, 4, config.model.embed_dim)
+    keep = torch.tensor([[3, 0, 2]])
+    ids_keep = keep.unsqueeze(-1).expand(-1, -1, projected.shape[-1])
+    mask_info = MaskInfo(
+        x_unmasked=torch.gather(projected, 1, ids_keep),
+        mask=torch.tensor([[False, True, False, False]]),
+        ids_restore=torch.arange(4).view(1, 4, 1).expand_as(projected).long(),
+        ids_keep=ids_keep,
+    )
+
+    actual = encoder.encode_projected(projected, mask_info=mask_info).alibi
+    frame_bias = alibi_bias(config.model.num_heads, 4)
+    expected_frames = frame_bias[:, keep[0]][:, :, keep[0]]
+
+    assert actual is not None
+    assert actual.shape == (1, config.model.num_heads, 4, 4)
+    assert torch.count_nonzero(actual[:, :, 0, :]) == 0
+    assert torch.count_nonzero(actual[:, :, :, 0]) == 0
+    assert torch.equal(actual[0, :, 1:, 1:], expected_frames)
 
 
 def test_cloned_batches_receive_distinct_reproducible_masks() -> None:

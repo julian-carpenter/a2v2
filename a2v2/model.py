@@ -1166,6 +1166,55 @@ def make_teacher_targets(
     return target
 
 
+def make_pretraining_targets(
+    layer_outputs: Sequence[Tensor],
+    *,
+    top_k: int,
+    instance_norm_per_layer: bool,
+    layer_norm_per_layer: bool,
+    layer_norm_final: bool,
+    use_cls_token: bool,
+) -> tuple[Tensor, Tensor | None]:
+    """Build frame targets and an optional feature-normalized CLS target."""
+
+    if not use_cls_token:
+        return make_teacher_targets(
+            layer_outputs,
+            top_k=top_k,
+            instance_norm_per_layer=instance_norm_per_layer,
+            layer_norm_per_layer=layer_norm_per_layer,
+            layer_norm_final=layer_norm_final,
+        ), None
+
+    # Mathematics: split h_l=[c_l;f_l] before applying frame normalization, so
+    # the time axis of every f_l remains the original T acoustic frames.
+    # Interpretation: adding CLS cannot alter the established frame targets.
+    frame_layers = [layer[:, 1:] for layer in layer_outputs]
+    frame_target = make_teacher_targets(
+        frame_layers,
+        top_k=top_k,
+        instance_norm_per_layer=instance_norm_per_layer,
+        layer_norm_per_layer=layer_norm_per_layer,
+        layer_norm_final=layer_norm_final,
+    )
+    selected = list(layer_outputs[-top_k:])
+    normalized_cls: list[Tensor] = []
+    with torch.no_grad():
+        for layer in selected:
+            cls = layer[:, 0].float()
+            # Mathematics: both per-layer target-normalization modes reduce a
+            # CLS vector over D because it has no frame axis to instance-normalize.
+            # Interpretation: CLS remains finite and feature-normalized under
+            # recipes whose frame targets normalize over time.
+            if instance_norm_per_layer or layer_norm_per_layer:
+                cls = F.layer_norm(cls, cls.shape[-1:])
+            normalized_cls.append(cls)
+        cls_target = torch.stack(normalized_cls).mean(dim=0)
+        if layer_norm_final:
+            cls_target = F.layer_norm(cls_target, cls_target.shape[-1:])
+    return frame_target, cls_target
+
+
 def a_weighted_level(
     waveform: Tensor,
     sample_rate: int,
@@ -1389,6 +1438,23 @@ def _select_and_scale_alibi(
     # Interpretation: each layer or head can weaken or strengthen distance
     # preference without reversing it into a preference for distant frames.
     return bias * scale.clamp_min(0).squeeze(0).to(bias)
+
+
+def _prepend_cls_alibi(frame_bias: Tensor) -> Tensor:
+    """Add a zero-bias CLS row and column around frame-only ALiBi values."""
+
+    # Mathematics: B_cls has B_cls[...,1:,1:]=B_frames and zero entries when
+    # either attention coordinate is the special token at index zero.
+    # Interpretation: CLS attends globally without a temporal-distance prior,
+    # while frame pairs retain their exact original ALiBi values.
+    shape = (
+        *frame_bias.shape[:-2],
+        frame_bias.shape[-2] + 1,
+        frame_bias.shape[-1] + 1,
+    )
+    bias = frame_bias.new_zeros(shape)
+    bias[..., 1:, 1:] = frame_bias
+    return bias
 
 
 class MLP(nn.Module):
@@ -1759,8 +1825,8 @@ class PositionalConvEncoder(nn.Module):
 class EncoderOutput:
     """Complete encoder result.
 
-    ``x`` and ``local_features`` use ``[batch, frames, embedding]``.
-    ``padding_mask`` uses ``[batch, frames]`` with ``True`` for padding.
+    ``local_features`` stays frame-only. ``x`` and ``padding_mask`` use the
+    contextual token axis, which is one item longer when CLS is enabled.
     """
 
     x: Tensor
@@ -1773,7 +1839,7 @@ class EncoderOutput:
 
 @dataclass(frozen=True)
 class ContextOutput:
-    """Transformer-only result for features that were already projected."""
+    """Transformer-only result, optionally including CLS at token index zero."""
 
     x: Tensor
     padding_mask: Tensor | None
@@ -1790,7 +1856,7 @@ class AudioEncoder(nn.Module):
     1. ``local_encoder`` turns samples into convolution frames.
     2. ``project_features`` maps those frames to the transformer dimension.
     3. ``positional_encoder`` adds local positional context.
-    4. ``prenet`` and ``transformer`` produce contextual representations.
+    4. Optional CLS is prepended before ``prenet`` and ``transformer``.
 
     Pretraining can enter at phase 3 through :meth:`encode_projected`, allowing
     the student to remove masked tokens while the EMA teacher sees all tokens.
@@ -1835,6 +1901,7 @@ class AudioEncoder(nn.Module):
         position_encoding: str | None = None,
         rope_theta: float = 10_000.0,
         attention_backend: str = "manual",
+        use_cls_token: bool = False,
     ) -> None:
         super().__init__()
         self.layers = tuple(layers)
@@ -1843,6 +1910,9 @@ class AudioEncoder(nn.Module):
             "alibi" if use_alibi else "none"
         ) if position_encoding is None else position_encoding
         self.use_alibi = self.position_encoding == "alibi"
+        self.use_cls_token = use_cls_token
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, dimension))
         self.local_encoder = ConvFeatureEncoder(
             layers,
             sample_rate=sample_rate,
@@ -1948,6 +2018,7 @@ class AudioEncoder(nn.Module):
             position_encoding=resolve_position_encoding(model),
             rope_theta=model.rope_theta,
             attention_backend=resolve_attention_backend(model),
+            use_cls_token=model.use_cls_token,
         )
 
     @staticmethod
@@ -2035,6 +2106,8 @@ class AudioEncoder(nn.Module):
         position_ids = None
         if self.position_encoding == "rope":
             position_ids = torch.arange(time, device=projected.device).unsqueeze(0)
+            if self.use_cls_token:
+                position_ids = position_ids + 1
             position_ids = position_ids.expand(batch, -1)
         bias = None
         if self.use_alibi:
@@ -2074,6 +2147,35 @@ class AudioEncoder(nn.Module):
                 keep,
                 self.num_heads,
             )
+        if self.use_cls_token:
+            # Mathematics: c∈R^D is broadcast to [B,1,D] and concatenated
+            # after positional convolution and any frame gather.
+            # Interpretation: CLS is contextual but never participates in the
+            # frame mask, restore permutation, or convolutional positions.
+            cls = self.cls_token.expand(batch, -1, -1)
+            value = torch.cat((cls, value), dim=1)
+            if contextual_padding is not None:
+                contextual_padding = torch.cat((
+                    torch.zeros(
+                        batch,
+                        1,
+                        dtype=contextual_padding.dtype,
+                        device=contextual_padding.device,
+                    ),
+                    contextual_padding,
+                ), dim=1)
+            if position_ids is not None:
+                position_ids = torch.cat((
+                    torch.zeros(
+                        batch,
+                        1,
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                    ),
+                    position_ids,
+                ), dim=1)
+            if bias is not None:
+                bias = _prepend_cls_alibi(bias)
 
         # Mathematics: contextual representation is Transformer(
         # Prenet(value; padding,bias); padding,bias), retaining every layer target.
@@ -2120,7 +2222,7 @@ class AudioEncoder(nn.Module):
 
 @dataclass(frozen=True)
 class PretrainingOutput:
-    """Loss and masked-token tensors returned by one pretraining step."""
+    """Loss and regression tensors returned by one pretraining step."""
 
     loss: Tensor
     sample_size: int
@@ -2133,9 +2235,9 @@ class PretrainingOutput:
 class Animal2VecPretrainingModel(nn.Module):
     """Mean-teacher masked-prediction model used for Animal2Vec pretraining.
 
-    The student sees only unmasked frame tokens. A convolutional decoder
-    restores the full time axis and predicts normalized representations made by
-    an exponential-moving-average copy of the same audio encoder.
+    The student sees only unmasked frames plus optional CLS. A convolutional
+    decoder restores the frame axis, and an optional linear head directly
+    regresses CLS against normalized EMA-teacher representations.
     """
 
     def __init__(self, config: Animal2VecConfig) -> None:
@@ -2147,6 +2249,8 @@ class Animal2VecPretrainingModel(nn.Module):
         self.teacher = EMATeacher(self.student)
         self.decoder = ConvDecoder(config.model.audio.decoder, config.model.embed_dim)
         self.regression = RegressionLoss(config.model.loss_beta, config.model.loss_scale)
+        if config.model.use_cls_token:
+            self.cls_predictor = nn.Linear(config.model.embed_dim, config.model.embed_dim)
 
     @classmethod
     def from_config(cls, config: Animal2VecConfig) -> "Animal2VecPretrainingModel":
@@ -2212,8 +2316,12 @@ class Animal2VecPretrainingModel(nn.Module):
         # Interpretation: reconstruction requires contextual inference from
         # audible surroundings rather than copying hidden frame features.
         student_context = self.student.encode_projected(cloned, cloned_padding, mask_info)
+        decoder_input = (
+            student_context.x[:, 1:]
+            if cfg.model.use_cls_token else student_context.x
+        )
         restored = self.decoder.prepare_input(
-            student_context.x,
+            decoder_input,
             mask_info,
             noise_std=cfg.model.audio.mask_noise_std,
         )
@@ -2226,14 +2334,17 @@ class Animal2VecPretrainingModel(nn.Module):
             # Interpretation: the slowly moving teacher supplies stable targets
             # without gradient flow or masked information loss.
             teacher_context = self.teacher.model.encode_projected(projected.detach(), feature_padding)
-            targets = make_teacher_targets(
+            targets, cls_targets = make_pretraining_targets(
                 teacher_context.layer_outputs,
                 top_k=cfg.model.average_top_k_layers,
                 instance_norm_per_layer=cfg.model.instance_norm_target_layer,
                 layer_norm_per_layer=cfg.model.layer_norm_target_layer,
                 layer_norm_final=cfg.model.layer_norm_targets,
+                use_cls_token=cfg.model.use_cls_token,
             )
             targets = targets.repeat_interleave(clones, dim=0)
+            if cls_targets is not None:
+                cls_targets = cls_targets.repeat_interleave(clones, dim=0)
 
         # Mathematics: objective inputs are p = decoded[M] and y = targets[M];
         # all unmasked decoder positions are excluded from the regression sum.
@@ -2242,6 +2353,16 @@ class Animal2VecPretrainingModel(nn.Module):
         selected_predictions = decoded[mask.bool()]
         selected_targets = targets[mask.bool()]
         loss = self.regression(selected_predictions, selected_targets)
+        if cfg.model.use_cls_token:
+            assert cls_targets is not None
+            cls_predictions = self.cls_predictor(student_context.x[:, 0])
+            cls_loss = self.regression(cls_predictions, cls_targets)
+            selected_predictions = torch.cat((selected_predictions, cls_predictions), dim=0)
+            selected_targets = torch.cat((selected_targets, cls_targets), dim=0)
+            loss = LossResult(
+                loss=loss.loss + cfg.model.cls_loss_weight * cls_loss.loss,
+                sample_size=loss.sample_size + cls_loss.sample_size,
+            )
         return PretrainingOutput(
             loss=loss.loss,
             sample_size=loss.sample_size,
