@@ -8,7 +8,13 @@ import pytest
 import torch
 
 from a2v2.config import load_config
-from a2v2.model import Animal2VecPretrainingModel, MaskInfo
+from a2v2.model import (
+    Animal2VecPretrainingModel,
+    MaskInfo,
+    make_mask_info,
+    make_teacher_targets,
+    masks_for_cloned_batch,
+)
 from a2v2.training import CosineUpdateScheduler, TrainingEngine
 
 
@@ -131,22 +137,74 @@ def test_cls_regression_combines_weighted_loss_and_gradients() -> None:
     assert all(parameter.grad is None for parameter in model.teacher.parameters())
 
 
-def test_disabled_cls_preserves_frame_only_output_and_state() -> None:
-    """Keep legacy modules absent and diagnostics restricted to masked frames."""
+@torch.no_grad()
+def test_disabled_cls_matches_legacy_numerical_pretraining_pipeline() -> None:
+    """Match the established frame-only forward result without a golden snapshot."""
 
+    torch.manual_seed(41)
     cfg = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
     model = Animal2VecPretrainingModel.from_config(cfg).eval()
+    waveform = torch.linspace(-1.0, 1.0, steps=128).reshape(2, 64)
+    sample_ids = torch.tensor([30, 31])
+    update = 3
     output = model(
-        torch.randn(1, 64),
-        sample_ids=torch.tensor([30]),
-        update=0,
+        waveform,
+        sample_ids=sample_ids,
+        update=update,
     )
+
+    projected, feature_padding = model.student.project_waveform(waveform)
+    batch, length, _ = projected.shape
+    clones = cfg.model.clone_batch
+    cloned = projected.repeat_interleave(clones, dim=0)
+    mask = masks_for_cloned_batch(
+        batch_size=batch,
+        length=length,
+        clone_count=clones,
+        mask_prob=cfg.model.audio.mask_prob,
+        mask_length=cfg.model.audio.mask_length,
+        global_seed=cfg.common.seed,
+        update=update,
+        sample_ids=sample_ids,
+        padding_mask=feature_padding,
+        mask_dropout=cfg.model.audio.mask_dropout,
+    ).to(projected.device)
+    mask_info = make_mask_info(cloned, mask)
+    student_context = model.student.encode_projected(
+        cloned,
+        feature_padding,
+        mask_info,
+    )
+    restored = model.decoder.prepare_input(
+        student_context.x,
+        mask_info,
+        noise_std=cfg.model.audio.mask_noise_std,
+    )
+    decoded = model.decoder(restored)
+    teacher_context = model.teacher.model.encode_projected(
+        projected.detach(),
+        feature_padding,
+    )
+    targets = make_teacher_targets(
+        teacher_context.layer_outputs,
+        top_k=cfg.model.average_top_k_layers,
+        instance_norm_per_layer=cfg.model.instance_norm_target_layer,
+        layer_norm_per_layer=cfg.model.layer_norm_target_layer,
+        layer_norm_final=cfg.model.layer_norm_targets,
+    ).repeat_interleave(clones, dim=0)
+    expected_predictions = decoded[mask.bool()]
+    expected_targets = targets[mask.bool()]
+    expected_loss = model.regression(expected_predictions, expected_targets)
 
     assert not hasattr(model.student, "cls_token")
     assert not hasattr(model.teacher.model, "cls_token")
     assert not hasattr(model, "cls_predictor")
-    assert output.sample_size == int(output.mask.sum().item())
-    assert output.predictions.shape[0] == output.sample_size
+    assert output.sample_size == expected_loss.sample_size
+    assert output.ema_decay == 0.0
+    assert torch.equal(output.mask, mask)
+    torch.testing.assert_close(output.predictions, expected_predictions, rtol=0, atol=0)
+    torch.testing.assert_close(output.targets, expected_targets, rtol=0, atol=0)
+    torch.testing.assert_close(output.loss, expected_loss.loss, rtol=0, atol=0)
 
 
 def test_pretraining_engine_reports_finite_variance_across_microbatches() -> None:
