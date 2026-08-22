@@ -10,6 +10,8 @@ import torch
 from a2v2.config import load_config
 from a2v2.model import (
     Animal2VecPretrainingModel,
+    AudioEncoder,
+    ConvDecoder,
     MaskInfo,
     make_mask_info,
     make_teacher_targets,
@@ -109,6 +111,29 @@ def test_deepscale_initial_teacher_and_optional_predictor_roles() -> None:
         rel=0.15,
     )
     assert torch.count_nonzero(model.cls_predictor.bias) == 0
+
+
+def test_deepscale_does_not_reinitialize_decoder_roles() -> None:
+    """Keep the decoder exactly as initialized after the DeepScale student."""
+
+    cfg = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.initialization=deepscale_lm",),
+    )
+    torch.manual_seed(113)
+    AudioEncoder.from_config(cfg)
+    expected = ConvDecoder(cfg.model.audio.decoder, cfg.model.embed_dim)
+    torch.manual_seed(113)
+    model = Animal2VecPretrainingModel.from_config(cfg)
+
+    assert list(model.decoder.state_dict()) == list(expected.state_dict())
+    for name, frozen in expected.state_dict().items():
+        torch.testing.assert_close(
+            model.decoder.state_dict()[name],
+            frozen,
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_cloned_student_masks_are_distinct() -> None:

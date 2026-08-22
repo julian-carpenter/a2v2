@@ -4,6 +4,7 @@ checks that the stack returns one teacher-target tensor for each block that exec
 from contextlib import nullcontext
 from copy import deepcopy
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,8 +13,12 @@ from torch import nn
 from torch.nn import functional as F
 
 import a2v2.model as model_module
+from a2v2.config import load_config
 from a2v2.model import AudioEncoder, TransformerBlock, TransformerStack
 from a2v2.model import alibi_bias
+
+
+ROOT = Path(__file__).parents[2]
 
 
 class _ScaleAttention(nn.Module):
@@ -195,7 +200,7 @@ def test_deepscale_initializes_roles_with_branch_dropout_variances() -> None:
         attention_dropout=0.47,
         activation_dropout=0.61,
         post_mlp_dropout=ffn_branch_dropout,
-        prenet_dropout=0.25,
+        prenet_dropout=0.75,
         dropout_input=0.0,
         use_alibi=False,
         use_cls_token=True,
@@ -240,11 +245,12 @@ def test_deepscale_initializes_roles_with_branch_dropout_variances() -> None:
         assert block.residual_beta == pytest.approx(math.sqrt(2.0 / 3.0))
 
     # CLS is the only learned embedding at its token position and is followed
-    # by prenet dropout p=0.25, so the embedding variance is 1-p. With 256
-    # coordinates its sample-std relative error is about 4.4%; 15% is robust.
+    # by prenet dropout p=0.75, so the embedding variance is 1-p. With 256
+    # coordinates its sample-std relative error is about 4.4%; 12% is robust,
+    # while a plausible wrong p=0 role would have twice the expected std.
     assert encoder.cls_token.std().item() == pytest.approx(
-        math.sqrt(1.0 - 0.25),
-        rel=0.15,
+        math.sqrt(1.0 - 0.75),
+        rel=0.12,
     )
     # The acoustic projection remains under nn.Linear.reset_parameters rather
     # than receiving any Transformer-role distribution.
@@ -253,6 +259,36 @@ def test_deepscale_initializes_roles_with_branch_dropout_variances() -> None:
         projection_std,
         rel=0.08,
     )
+
+
+def test_deepscale_does_not_reinitialize_convolutional_roles() -> None:
+    """Leave Sinc, local, and positional convolution tensors bit-for-bit unchanged."""
+
+    legacy_config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    deepscale_config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.initialization=deepscale_lm",),
+    )
+    torch.manual_seed(109)
+    legacy = AudioEncoder.from_config(legacy_config)
+    torch.manual_seed(109)
+    deepscale = AudioEncoder.from_config(deepscale_config)
+    convolutional_names = (
+        "local_encoder.conv_layers.0.conv.low_hz_",
+        "local_encoder.conv_layers.0.conv.band_hz_",
+        "local_encoder.conv_layers.1.conv.weight",
+        "local_encoder.conv_layers.2.conv.weight",
+        "positional_encoder.blocks.0.conv.weight",
+        "positional_encoder.blocks.0.conv.bias",
+    )
+
+    for name in convolutional_names:
+        torch.testing.assert_close(
+            deepscale.state_dict()[name],
+            legacy.state_dict()[name],
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_post_norm_block_matches_official_residual_sequence() -> None:

@@ -145,37 +145,165 @@ def test_deepscale_encoder_checkpoint_loading_overrides_initialization() -> None
         )
 
 
-def test_explicit_legacy_initialization_keeps_exact_tensors_and_outputs() -> None:
-    """Keep the default and explicit legacy constructor paths bit-for-bit equal."""
+def test_legacy_initialization_matches_frozen_tensor_and_rng_oracle() -> None:
+    """Freeze meaningful tensor values and construction RNG order independently."""
 
-    default_config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
-    explicit_config = load_config(
-        ROOT / "tests/fixtures/tiny_pretrain.yaml",
-        overrides=("model.initialization=legacy",),
-    )
+    config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
     torch.manual_seed(101)
-    default = AudioEncoder.from_config(default_config).eval()
-    torch.manual_seed(101)
-    explicit = AudioEncoder.from_config(explicit_config).eval()
+    model = AudioEncoder.from_config(config).eval()
+    expected = {
+        "project_features.weight": torch.tensor([
+            0.011359423398971558,
+            -0.04257035255432129,
+            0.0513286292552948,
+            0.06016454100608826,
+            -0.06892189383506775,
+            -0.1976364254951477,
+            -0.0064213573932647705,
+            0.019809722900390625,
+        ]),
+        "prenet.blocks.0.attn.qkv.weight": torch.tensor([
+            0.03903722018003464,
+            -0.017712950706481934,
+            0.009713570587337017,
+            -0.009759217500686646,
+            -0.0012960262829437852,
+            0.007639708463102579,
+            0.01715032383799553,
+            -0.02523055486381054,
+        ]),
+        "prenet.blocks.0.mlp.fc1.weight": torch.tensor([
+            -0.01275860145688057,
+            0.001614767825230956,
+            -0.01917700283229351,
+            0.03594064339995384,
+            0.0319422148168087,
+            0.04713429883122444,
+            0.021025190129876137,
+            0.00992377009242773,
+        ]),
+        "transformer.blocks.1.mlp.fc2.weight": torch.tensor([
+            -0.011548127979040146,
+            0.021507998928427696,
+            -0.0016178557416424155,
+            0.012524111196398735,
+            -0.016345340758562088,
+            -0.002257388550788164,
+            -0.06215336546301842,
+            -0.002851117867976427,
+        ]),
+    }
 
-    assert list(default.state_dict()) == list(explicit.state_dict())
-    for name, expected in default.state_dict().items():
+    assert config.model.initialization == "legacy"
+    for name, frozen in expected.items():
         torch.testing.assert_close(
-            explicit.state_dict()[name],
-            expected,
+            model.state_dict()[name].flatten()[:8],
+            frozen,
             rtol=0,
             atol=0,
         )
+    # CPU initializers are deterministic for the pinned PyTorch runtime, so
+    # this exact probe catches added/removed/reordered construction draws.
+    torch.testing.assert_close(
+        torch.rand(8),
+        torch.tensor([
+            0.0024824142456054688,
+            0.8695276975631714,
+            0.6588976383209229,
+            0.2709083557128906,
+            0.334867000579834,
+            0.000815272331237793,
+            0.9917974472045898,
+            0.5380000472068787,
+        ]),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_legacy_forward_matches_frozen_output_oracle() -> None:
+    """Freeze end-to-end legacy residual and initialization behavior."""
+
+    config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    torch.manual_seed(101)
+    model = AudioEncoder.from_config(config).eval()
     waveform = torch.linspace(-1.0, 1.0, 128).reshape(2, 64)
-    default_output = default(waveform)
-    explicit_output = explicit(waveform)
-    torch.testing.assert_close(explicit_output.x, default_output.x, rtol=0, atol=0)
-    for actual, expected in zip(
-        explicit_output.layer_outputs,
-        default_output.layer_outputs,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with torch.no_grad():
+        output = model(waveform)
+
+    # GEMM/convolution reduction order may vary in the final bits across CPU
+    # builds, so the forward oracle uses tight numerical tolerances rather than
+    # a byte hash. The initialized tensor/RNG oracle above remains bit-exact.
+    torch.testing.assert_close(
+        output.x[0, 0, :8],
+        torch.tensor([
+            -0.4695950448513031,
+            2.1438100337982178,
+            -0.4790281057357788,
+            -0.7077038884162903,
+            -0.5008716583251953,
+            0.9729785919189453,
+            -1.0133659839630127,
+            -0.2658218741416931,
+        ]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        output.x[1, -1, -8:],
+        torch.tensor([
+            -1.5285754203796387,
+            0.3256520926952362,
+            1.867682695388794,
+            -0.7041085958480835,
+            0.18142500519752502,
+            0.054556552320718765,
+            0.09402453154325485,
+            -0.3258442282676697,
+        ]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        output.layer_outputs[0][0, 0, :8],
+        torch.tensor([
+            0.005438052583485842,
+            0.0009517626604065299,
+            -0.002345379674807191,
+            0.009505631402134895,
+            0.0051078493706882,
+            0.0019196192733943462,
+            -0.008520583622157574,
+            0.001855779206380248,
+        ]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        output.layer_outputs[-1][1, -1, -8:],
+        torch.tensor([
+            -0.006451415363699198,
+            0.0033123784232884645,
+            -0.008892624638974667,
+            0.0025248508900403976,
+            0.007080330513417721,
+            0.00374116119928658,
+            0.011118483729660511,
+            -0.0061199851334095,
+        ]),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    assert output.x.square().mean().item() == pytest.approx(
+        0.999989926815033,
+        rel=1e-5,
+        abs=1e-7,
+    )
+    assert [layer.square().mean().item() for layer in output.layer_outputs] == pytest.approx(
+        [3.293444024166092e-05, 4.3511441617738456e-05],
+        rel=1e-5,
+        abs=1e-8,
+    )
 
 
 def test_deepscale_finetuning_preserves_classifier_xavier_initialization() -> None:
