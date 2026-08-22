@@ -14,6 +14,7 @@ EXPECTED_MODULES = (
     "config",
     "data",
     "model",
+    "slurm",
     "training",
     "workflows",
 )
@@ -30,7 +31,7 @@ FORBIDDEN_RUNTIME_IMPORTS = {
 }
 
 
-def test_a2v2_package_has_exactly_six_flat_source_files() -> None:
+def test_a2v2_package_has_exactly_seven_flat_source_files() -> None:
     """Require one compact A2V2 package and reject superseded namespaces."""
 
     assert PACKAGE.is_dir()

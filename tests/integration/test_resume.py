@@ -181,6 +181,30 @@ def _teacher_step(engine: TrainingEngine, model: TeacherFixture) -> None:
     )
 
 
+def test_preemption_cli_returns_requeue_code_only_after_checkpoint_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch a valid preemption checkpoint surfacing as an uncaught traceback or success."""
+
+    from a2v2.slurm import TrainingPreempted
+
+    checkpoint_path = Path("checkpoint_last.pt")
+
+    def preempted(*_: object, **__: object) -> Path:
+        """Model a workflow that already wrote its valid safe-point checkpoint."""
+
+        raise TrainingPreempted(checkpoint_path, update=7)
+
+    monkeypatch.setattr(workflows, "run_training", preempted)
+
+    assert workflows.train_main([
+        "--config",
+        "tests/fixtures/tiny_pretrain.yaml",
+        "--device",
+        "cpu",
+    ]) == 75
+
+
 @pytest.mark.parametrize("format_version", (1, 2))
 def test_checkpoint_resume_matches_uninterrupted_next_update(
     tmp_path: Path,

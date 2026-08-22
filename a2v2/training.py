@@ -35,6 +35,7 @@ import torch.distributed as dist
 # =============================================================================
 
 FORMAT_VERSION = 2
+RANK_LOCAL_RNG_SCHEMA = "a2v2.rng.rank-local.v1"
 LEGACY_REQUIRED_KEYS = {
     "format_version", "stage", "config", "model", "teacher", "optimizer",
     "scheduler", "scaler", "update", "epoch", "batch_in_epoch", "rng_state",
@@ -141,6 +142,7 @@ def gather_rank_rng_states(
             "distributed RNG gather did not return one byte payload per rank"
         )
     return {
+        "schema": RANK_LOCAL_RNG_SCHEMA,
         "world_size": world_size,
         "by_rank": [deserialize_rng_state(item) for item in gathered],
     }
@@ -154,7 +156,16 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
         # rank r must restore R_r under the same world size W.
         # Interpretation: workers consume different dropout and augmentation
         # streams, so broadcasting rank zero's state would diverge after resume.
-        saved_world_size = int(state.get("world_size", 0))
+        schema = state.get("schema")
+        if schema is not None and schema != RANK_LOCAL_RNG_SCHEMA:
+            raise CheckpointError(
+                f"unsupported rank-local RNG schema {schema!r}; "
+                f"expected {RANK_LOCAL_RNG_SCHEMA}"
+            )
+        saved_world_size_value = state.get("world_size")
+        if type(saved_world_size_value) is not int:
+            raise CheckpointError("rank-specific RNG world size must be an integer")
+        saved_world_size = saved_world_size_value
         initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
         world_size = torch.distributed.get_world_size() if initialized else 1
         rank = torch.distributed.get_rank() if initialized else 0
@@ -169,17 +180,38 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
         if not isinstance(selected, Mapping):
             raise CheckpointError(f"invalid RNG state for rank {rank}")
         state = selected
+    required = {"python", "numpy", "torch"}
+    missing = sorted(required - set(state))
+    if missing:
+        raise CheckpointError(f"RNG state is missing required keys: {missing}")
+    numpy_state = state["numpy"]
+    if not isinstance(numpy_state, Mapping):
+        raise CheckpointError("invalid NumPy RNG state")
+    keys = numpy_state.get("keys")
+    if not isinstance(keys, torch.Tensor):
+        raise CheckpointError("invalid NumPy RNG key array")
+    torch_state = state["torch"]
+    if not isinstance(torch_state, torch.Tensor):
+        raise CheckpointError("invalid PyTorch RNG state")
+    cuda_states: list[Tensor] | None = None
+    if torch.cuda.is_available() and "cuda" in state:
+        raw_cuda_states = state["cuda"]
+        if not isinstance(raw_cuda_states, (list, tuple)) or not all(
+            isinstance(item, torch.Tensor) for item in raw_cuda_states
+        ):
+            raise CheckpointError("invalid CUDA RNG state")
+        visible_devices = torch.cuda.device_count()
+        if len(raw_cuda_states) != visible_devices:
+            raise CheckpointError(
+                f"checkpoint has {len(raw_cuda_states)} CUDA RNG states but the "
+                f"local rank has {visible_devices} visible CUDA devices"
+            )
+        cuda_states = [item.cpu() for item in raw_cuda_states]
     # Mathematics: restoring generator state places every pseudorandom stream
     # at the exact point immediately after the checkpointed transition.
     # Interpretation: the next mask, crop, layer drop, and shuffle matches the
     # uninterrupted run rather than merely sharing its initial seed.
     random.setstate(state["python"])  # type: ignore[arg-type]
-    numpy_state = state["numpy"]
-    if not isinstance(numpy_state, Mapping):
-        raise CheckpointError("invalid NumPy RNG state")
-    keys = numpy_state["keys"]
-    if not isinstance(keys, torch.Tensor):
-        raise CheckpointError("invalid NumPy RNG key array")
     np.random.set_state((
         str(numpy_state["algorithm"]),
         keys.cpu().numpy().astype(np.uint32, copy=False),
@@ -187,20 +219,12 @@ def restore_rng_state(state: Mapping[str, object]) -> None:
         int(numpy_state["has_gauss"]),
         float(numpy_state["cached_gaussian"]),
     ))
-    torch_state = state["torch"]
-    if not isinstance(torch_state, torch.Tensor):
-        raise CheckpointError("invalid PyTorch RNG state")
     # A checkpoint loaded with map_location="cuda" moves every tensor,
     # including generator states, onto CUDA. Generator state setters require
     # CPU byte tensors even when restoring a CUDA generator.
     torch.random.set_rng_state(torch_state.cpu())
-    if torch.cuda.is_available() and "cuda" in state:
-        cuda_states = state["cuda"]
-        if not isinstance(cuda_states, (list, tuple)) or not all(
-            isinstance(item, torch.Tensor) for item in cuda_states
-        ):
-            raise CheckpointError("invalid CUDA RNG state")
-        torch.cuda.set_rng_state_all([item.cpu() for item in cuda_states])
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 def validate_checkpoint(payload: Mapping[str, object]) -> None:

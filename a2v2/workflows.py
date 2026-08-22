@@ -19,8 +19,10 @@ import json
 import os
 import random
 import re
+import socket
+import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from enum import Enum
@@ -59,6 +61,22 @@ from .data import (
 from .model import (
     Animal2VecFineTuningModel,
     Animal2VecPretrainingModel,
+)
+from .slurm import (
+    DistributedEnvironment,
+    LockOwner,
+    OutputLock,
+    OutputLockError,
+    PreemptionFlag,
+    RankTopology,
+    SlurmEnvironment,
+    TrainingPreempted,
+    build_topology_state,
+    coordinated_preemption_requested,
+    gather_rank_topologies,
+    install_preemption_handlers,
+    validate_resume_topology,
+    validate_runtime_topology,
 )
 from .training import (
     CheckpointError,
@@ -1456,21 +1474,99 @@ def _distributed_device(requested: str) -> tuple[torch.device, int, int, bool]:
     # world size W through environment variables.
     # Interpretation: one command works for a CPU process, one GPU, or an
     # eight-GPU launch without embedding cluster-specific addresses in recipes.
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = DistributedEnvironment.from_mapping(os.environ)
+    slurm = _active_slurm_environment()
     initialized_here = False
     if requested == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available")
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        validate_runtime_topology(
+            distributed,
+            slurm=slurm,
+            cuda_requested=True,
+            visible_cuda_devices=torch.cuda.device_count(),
+        )
+        torch.cuda.set_device(distributed.local_rank)
+        device = torch.device("cuda", distributed.local_rank)
     else:
+        validate_runtime_topology(
+            distributed,
+            slurm=slurm,
+            cuda_requested=False,
+            visible_cuda_devices=torch.cuda.device_count(),
+        )
         device = torch.device("cpu")
-    if world_size > 1 and not dist.is_initialized():
+    if distributed.world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
         initialized_here = True
-    return device, rank, world_size, initialized_here
+    return device, distributed.rank, distributed.world_size, initialized_here
+
+
+_SLURM_RUNTIME_VARIABLES = (
+    "SLURM_JOB_ID",
+    "SLURM_JOB_NUM_NODES",
+    "SLURM_NODEID",
+    "SLURM_GPUS_ON_NODE",
+    "SLURM_JOB_NODELIST",
+)
+
+
+def _active_slurm_environment() -> SlurmEnvironment | None:
+    """Return no scheduler locally or validate one complete SLURM allocation."""
+
+    if not any(name in os.environ for name in _SLURM_RUNTIME_VARIABLES):
+        return None
+    return SlurmEnvironment.from_mapping(os.environ)
+
+
+def _current_distributed_environment(
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> DistributedEnvironment:
+    """Recover parsed torchrun state while retaining private-test injection support."""
+
+    if any(name in os.environ for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")):
+        return DistributedEnvironment.from_mapping(os.environ)
+    local_world_size = world_size
+    local_rank = device.index if device.type == "cuda" and device.index is not None else rank
+    return DistributedEnvironment(
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        local_world_size=local_world_size,
+    )
+
+
+def _capture_rank_topology(
+    distributed: DistributedEnvironment,
+    device: torch.device,
+) -> RankTopology:
+    """Capture JSON-safe rank and visible-device identity after early validation."""
+
+    visible_cuda_devices = torch.cuda.device_count()
+    selected_cuda_device: int | None = None
+    cuda_device_name: str | None = None
+    cuda_device_uuid: str | None = None
+    if device.type == "cuda":
+        selected_cuda_device = device.index
+        if selected_cuda_device is None:
+            raise ValueError("CUDA device ordinal is unavailable after device selection")
+        properties = torch.cuda.get_device_properties(device)
+        cuda_device_name = properties.name
+        uuid = getattr(properties, "uuid", None)
+        cuda_device_uuid = str(uuid) if uuid is not None else None
+    return RankTopology(
+        hostname=socket.gethostname(),
+        global_rank=distributed.rank,
+        local_rank=distributed.local_rank,
+        local_world_size=distributed.local_world_size,
+        visible_cuda_devices=visible_cuda_devices,
+        selected_cuda_device=selected_cuda_device,
+        cuda_device_name=cuda_device_name,
+        cuda_device_uuid=cuda_device_uuid,
+    )
 
 
 def _checkpoint_process_group(
@@ -1976,6 +2072,137 @@ def _restore_and_release_checkpoint(
     checkpoint.clear()
 
 
+def _write_training_checkpoint(
+    path: Path,
+    *,
+    engine: TrainingEngine,
+    stage: str,
+    config: Mapping[str, object],
+    topology: RankTopology,
+    world_size: int,
+    rank: int,
+    group: dist.ProcessGroup | None,
+) -> bool:
+    """Gather rank-local runtime state and let global rank zero write atomically."""
+
+    payload = engine.checkpoint_payload(stage=stage, config=config)
+    if world_size > 1:
+        local_rng_state = payload["rng_state"]
+        if not isinstance(local_rng_state, Mapping):
+            raise CheckpointError("local RNG checkpoint state is not a mapping")
+        gathered_rng = gather_rank_rng_states(
+            local_rng_state,
+            world_size=world_size,
+            rank=rank,
+            group=group,
+        )
+        gathered_topology = gather_rank_topologies(
+            topology,
+            world_size=world_size,
+            rank=rank,
+            group=group,
+        )
+        if rank == 0:
+            if gathered_rng is None:
+                raise CheckpointError("rank zero received no distributed RNG state")
+            if gathered_topology is None:
+                raise CheckpointError("rank zero received no distributed topology state")
+            payload["rng_state"] = gathered_rng
+            payload["topology"] = gathered_topology
+    else:
+        payload["topology"] = build_topology_state((topology,))
+    if rank == 0:
+        save_checkpoint(path, payload)
+        return True
+    return False
+
+
+def _checkpoint_at_preemption_safe_point(
+    flag: PreemptionFlag,
+    *,
+    update: int,
+    checkpoint_path: Path,
+    collective_device: torch.device,
+    group: dist.ProcessGroup | None,
+    write_checkpoint: Callable[[], None],
+    flush_logs: Callable[[], None],
+) -> bool:
+    """Coordinate one valid checkpoint and common exit after a completed update."""
+
+    if not coordinated_preemption_requested(
+        flag,
+        collective_device=collective_device,
+        group=group,
+    ):
+        return False
+    local_error: Exception | None = None
+    try:
+        write_checkpoint()
+    except Exception as error:
+        local_error = error
+    if dist.is_available() and dist.is_initialized():
+        success = torch.tensor(
+            int(local_error is None),
+            dtype=torch.int32,
+            device=collective_device,
+        )
+        dist.all_reduce(success, op=dist.ReduceOp.MIN, group=group)
+        if not bool(success.item()):
+            raise CheckpointError(
+                "preemption checkpoint failed on one or more ranks; refusing "
+                "requeue-friendly exit"
+            ) from local_error
+        dist.barrier(group=group)
+    elif local_error is not None:
+        raise local_error
+    flush_logs()
+    raise TrainingPreempted(checkpoint_path, update=update)
+
+
+def _prepare_output_directory(
+    output_directory: Path,
+    *,
+    distributed: DistributedEnvironment,
+    slurm: SlurmEnvironment | None,
+    run_id: str,
+    group: dist.ProcessGroup | None,
+    owned_locks: list[OutputLock],
+) -> None:
+    """Let rank zero create and exclusively own shared SLURM checkpoint output."""
+
+    error_message: str | None = None
+    if distributed.rank == 0:
+        try:
+            output_directory.mkdir(parents=True, exist_ok=True)
+            if slurm is not None:
+                lock = OutputLock.acquire(
+                    output_directory,
+                    LockOwner(
+                        job_id=slurm.job_id,
+                        run_id=run_id,
+                        hostname=socket.gethostname(),
+                        pid=os.getpid(),
+                    ),
+                )
+                owned_locks.append(lock)
+        except (OSError, OutputLockError) as error:
+            error_message = str(error)
+    if distributed.world_size > 1:
+        status: list[object] = [error_message]
+        dist.broadcast_object_list(status, src=0, group=group)
+        received = status[0]
+        if received is not None:
+            raise OutputLockError(str(received))
+        dist.barrier(group=group)
+    elif error_message is not None:
+        raise OutputLockError(error_message)
+    if not output_directory.is_dir():
+        raise OutputLockError(
+            f"rank {distributed.rank} cannot see shared output directory "
+            f"{output_directory}"
+        )
+
+
 # Training orchestration
 
 def _run_training(
@@ -1986,11 +2213,21 @@ def _run_training(
     pretrained_checkpoint: Path | None,
     stop_at_update: int | None = None,
     created_checkpoint_groups: list[dist.ProcessGroup] | None = None,
+    preemption_flag: PreemptionFlag | None = None,
+    owned_output_locks: list[OutputLock] | None = None,
 ) -> Path:
     """Run native pretraining or fine-tuning and return the last checkpoint."""
 
     started_at = time.perf_counter()
     device, rank, world_size, initialized_here = _distributed_device(device_name)
+    distributed = _current_distributed_environment(
+        rank=rank,
+        world_size=world_size,
+        device=device,
+    )
+    current_topology = _capture_rank_topology(distributed, device)
+    active_preemption_flag = preemption_flag or PreemptionFlag()
+    output_locks = owned_output_locks if owned_output_locks is not None else []
     if config.distributed.requested_world_size != world_size:
         if initialized_here:
             dist.destroy_process_group()
@@ -2012,6 +2249,18 @@ def _run_training(
     resume_checkpoint = load_checkpoint(resume_path, map_location=device) if resume_path is not None else None
     if resume_checkpoint is not None:
         _validate_resume_compatibility(config, resume_checkpoint)
+        saved_topology = resume_checkpoint.get("topology")
+        if saved_topology is not None:
+            if not isinstance(saved_topology, Mapping):
+                raise CheckpointError("checkpoint topology state is malformed")
+            topology_warnings = validate_resume_topology(
+                saved_topology,
+                current=current_topology,
+                world_size=world_size,
+            )
+            if rank == 0:
+                for warning in topology_warnings:
+                    print(json.dumps({"topology_warning": warning}), flush=True)
     model, pretrained_config = _make_model(
         config,
         pretrained_checkpoint=pretrained_checkpoint,
@@ -2115,7 +2364,14 @@ def _run_training(
     if pretrained_config is not None:
         serialized["pretrained"] = config_to_dict(pretrained_config)
     output_directory = config.checkpoint.save_dir
-    output_directory.mkdir(parents=True, exist_ok=True)
+    _prepare_output_directory(
+        output_directory,
+        distributed=distributed,
+        slurm=_active_slurm_environment(),
+        run_id=os.environ.get("A2V2_RUN_ID", config.stage),
+        group=checkpoint_group,
+        owned_locks=output_locks,
+    )
     last_path = output_directory / "checkpoint_last.pt"
     last_validation_update = -1
     last_result: UpdateResult | None = None
@@ -2135,29 +2391,22 @@ def _run_training(
         )
 
     def write_checkpoint(path: Path) -> None:
-        """Gather rank RNG states and let rank zero write one checkpoint."""
+        """Gather rank RNG and topology state and let rank zero write."""
 
         # Mathematics: rank r serializes RNG state R_r; gather forms the ordered
         # vector (R_0,...,R_{W-1}) on rank zero.
         # Interpretation: one checkpoint file can restore each worker's distinct
         # stochastic stream after a multi-GPU restart.
-        payload = engine.checkpoint_payload(stage=config.stage, config=serialized)
-        if world_size > 1:
-            local_rng_state = payload["rng_state"]
-            if not isinstance(local_rng_state, Mapping):
-                raise CheckpointError("local RNG checkpoint state is not a mapping")
-            gathered = gather_rank_rng_states(
-                local_rng_state,
-                world_size=world_size,
-                rank=rank,
-                group=checkpoint_group,
-            )
-            if rank == 0:
-                if gathered is None:
-                    raise CheckpointError("rank zero received no distributed RNG state")
-                payload["rng_state"] = gathered
-        if rank == 0:
-            save_checkpoint(path, payload)
+        _write_training_checkpoint(
+            path,
+            engine=engine,
+            stage=config.stage,
+            config=serialized,
+            topology=current_topology,
+            world_size=world_size,
+            rank=rank,
+            group=checkpoint_group,
+        )
 
     def validate_and_checkpoint(*, epoch: int | None = None) -> None:
         """Run scheduled validation and update the best checkpoint."""
@@ -2238,6 +2487,27 @@ def _run_training(
                 )
         if result.skipped:
             return
+        control_device = (
+            torch.device("cpu") if checkpoint_group is not None else device
+        )
+
+        def flush_logs() -> None:
+            """Flush every process-local stream after the checkpoint barrier."""
+
+            if tensorboard_logger is not None:
+                tensorboard_logger.close()
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+        _checkpoint_at_preemption_safe_point(
+            active_preemption_flag,
+            update=result.update,
+            checkpoint_path=last_path,
+            collective_device=control_device,
+            group=checkpoint_group,
+            write_checkpoint=lambda: write_checkpoint(last_path),
+            flush_logs=flush_logs,
+        )
         if config.checkpoint.save_interval_updates > 0 and result.update % config.checkpoint.save_interval_updates == 0:
             write_checkpoint(output_directory / f"checkpoint_{result.update}.pt")
         validate_and_checkpoint()
@@ -2387,6 +2657,9 @@ def run_training(
 
     caller_owned_group = dist.is_initialized()
     created_checkpoint_groups: list[dist.ProcessGroup] = []
+    owned_output_locks: list[OutputLock] = []
+    preemption_flag = PreemptionFlag()
+    signal_handlers = install_preemption_handlers(preemption_flag)
     try:
         return _run_training(
             config,
@@ -2395,13 +2668,22 @@ def run_training(
             pretrained_checkpoint=pretrained_checkpoint,
             stop_at_update=stop_at_update,
             created_checkpoint_groups=created_checkpoint_groups,
+            preemption_flag=preemption_flag,
+            owned_output_locks=owned_output_locks,
         )
     finally:
-        if caller_owned_group and dist.is_initialized():
-            for group in reversed(created_checkpoint_groups):
-                dist.destroy_process_group(group)
-        elif not caller_owned_group and dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            signal_handlers.restore()
+        finally:
+            try:
+                for lock in reversed(owned_output_locks):
+                    lock.release()
+            finally:
+                if caller_owned_group and dist.is_initialized():
+                    for group in reversed(created_checkpoint_groups):
+                        dist.destroy_process_group(group)
+                elif not caller_owned_group and dist.is_initialized():
+                    dist.destroy_process_group()
 
 
 def train_main(argv: Sequence[str] | None = None) -> int:
@@ -2427,7 +2709,15 @@ def train_main(argv: Sequence[str] | None = None) -> int:
             pretrained_checkpoint=arguments.pretrained_checkpoint,
             stop_at_update=arguments.stop_at_update,
         )
-    except (ConfigError, CheckpointError, ValueError) as exc:
+    except TrainingPreempted as preempted:
+        print(json.dumps({
+            "preempted": True,
+            "checkpoint": str(preempted.checkpoint_path),
+            "update": preempted.update,
+            "exit_code": preempted.exit_code,
+        }), flush=True)
+        return preempted.exit_code
+    except (ConfigError, CheckpointError, OutputLockError, ValueError) as exc:
         parser.error(str(exc))
     return 0
 

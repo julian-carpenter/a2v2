@@ -249,7 +249,12 @@ def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path, capsys) -> None:
     assert train_main(common) == 0
     pretrain_checkpoint = pretrain_dir / "checkpoint_last.pt"
     assert pretrain_checkpoint.is_file()
-    assert load_checkpoint(pretrain_checkpoint)["update"] == 1
+    first_checkpoint = load_checkpoint(pretrain_checkpoint)
+    assert first_checkpoint["update"] == 1
+    assert first_checkpoint["topology"]["schema"] == "a2v2.topology.v1"
+    assert first_checkpoint["topology"]["world_size"] == 1
+    assert first_checkpoint["topology"]["by_rank"][0]["global_rank"] == 0
+    assert "schema" not in first_checkpoint["rng_state"]
 
     assert train_main(common + ["--resume", str(pretrain_checkpoint), "--max-updates", "2"]) == 0
     assert load_checkpoint(pretrain_checkpoint)["update"] == 2

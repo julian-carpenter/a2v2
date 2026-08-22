@@ -18,7 +18,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from a2v2.slurm import (
+    DistributedEnvironment,
+    RankTopology,
+    gather_rank_topologies,
+)
 from a2v2.training import (
+    FORMAT_VERSION,
+    RANK_LOCAL_RNG_SCHEMA,
     capture_rng_state,
     gather_rank_rng_states,
     load_checkpoint,
@@ -54,6 +61,18 @@ def main() -> int:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     checkpoint_group = dist.new_group(backend="gloo")
+    distributed = DistributedEnvironment.from_mapping(os.environ)
+    properties = torch.cuda.get_device_properties(device)
+    topology = RankTopology(
+        hostname=os.uname().nodename,
+        global_rank=rank,
+        local_rank=local_rank,
+        local_world_size=distributed.local_world_size,
+        visible_cuda_devices=torch.cuda.device_count(),
+        selected_cuda_device=local_rank,
+        cuda_device_name=properties.name,
+        cuda_device_uuid=str(getattr(properties, "uuid", "unavailable")),
+    )
 
     if rank == 0:
         arguments.output_dir.mkdir(parents=True, exist_ok=True)
@@ -83,13 +102,21 @@ def main() -> int:
         rank=rank,
         group=checkpoint_group,
     )
+    ranked_topology = gather_rank_topologies(
+        topology,
+        world_size=world_size,
+        rank=rank,
+        group=checkpoint_group,
+    )
 
     checkpoint_path = arguments.output_dir / "nccl-rng-checkpoint.pt"
     if rank == 0:
         if ranked_rng is None:
             raise RuntimeError("rank zero received no distributed RNG state")
+        if ranked_topology is None:
+            raise RuntimeError("rank zero received no distributed topology state")
         save_checkpoint(checkpoint_path, {
-            "format_version": 1,
+            "format_version": FORMAT_VERSION,
             "stage": "pretrain",
             "config": {"probe": "nccl"},
             "model": {"collective_sum": reduced.detach().clone()},
@@ -97,6 +124,10 @@ def main() -> int:
             "optimizer": None,
             "scheduler": None,
             "scaler": None,
+            "gradient_clipper": None,
+            "weight_decay_scheduler": None,
+            "topology": ranked_topology,
+            "resume_compatibility": None,
             "update": 0,
             "epoch": 1,
             "batch_in_epoch": 0,
@@ -110,13 +141,20 @@ def main() -> int:
     restore_rng_state(checkpoint["rng_state"])
     actual_random = _draw_random(device)
 
-    properties = torch.cuda.get_device_properties(device)
+    topology_ok = (
+        checkpoint["topology"]["schema"] == "a2v2.topology.v1"
+        and [
+            record["global_rank"] for record in checkpoint["topology"]["by_rank"]
+        ] == list(range(world_size))
+        and checkpoint["rng_state"]["schema"] == RANK_LOCAL_RNG_SCHEMA
+    )
     local_ok = (
         float(reduced.item()) == expected_sum
         and float(broadcast.item()) == 97.0
         and gathered_ranks == list(range(world_size))
         and expected_random == actual_random
         and checkpoint["model"]["collective_sum"].device == device
+        and topology_ok
     )
     all_ok = torch.tensor(int(local_ok), dtype=torch.int32, device=device)
     dist.all_reduce(all_ok, op=dist.ReduceOp.MIN)
@@ -138,6 +176,9 @@ def main() -> int:
         "broadcast": float(broadcast.item()),
         "all_gather_ranks": gathered_ranks,
         "rank_rng_restore_exact": expected_random == actual_random,
+        "rng_schema": checkpoint["rng_state"]["schema"],
+        "topology_schema": checkpoint["topology"]["schema"],
+        "topology_ok": topology_ok,
         "checkpoint_device": str(checkpoint["model"]["collective_sum"].device),
         "pass": bool(all_ok.item()),
     }

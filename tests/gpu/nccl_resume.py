@@ -25,9 +25,15 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from a2v2.slurm import (
+    DistributedEnvironment,
+    RankTopology,
+    gather_rank_topologies,
+)
 from a2v2.config import config_to_dict, load_config
 from a2v2.model import Animal2VecPretrainingModel
 from a2v2.training import (
+    RANK_LOCAL_RNG_SCHEMA,
     capture_rng_state,
     gather_rank_rng_states,
     load_checkpoint,
@@ -591,6 +597,18 @@ def main() -> int:
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     checkpoint_group = dist.new_group(backend="gloo")
+    distributed = DistributedEnvironment.from_mapping(os.environ)
+    properties = torch.cuda.get_device_properties(device)
+    topology = RankTopology(
+        hostname=os.uname().nodename,
+        global_rank=rank,
+        local_rank=local_rank,
+        local_world_size=distributed.local_world_size,
+        visible_cuda_devices=torch.cuda.device_count(),
+        selected_cuda_device=local_rank,
+        cuda_device_name=properties.name,
+        cuda_device_uuid=str(getattr(properties, "uuid", "unavailable")),
+    )
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
@@ -649,11 +667,20 @@ def main() -> int:
         rank=rank,
         group=checkpoint_group,
     )
+    ranked_topology = gather_rank_topologies(
+        topology,
+        world_size=world_size,
+        rank=rank,
+        group=checkpoint_group,
+    )
     checkpoint_path = arguments.output_dir / "resume-point.pt"
     if rank == 0:
         if ranked_rng is None:
             raise RuntimeError("rank zero received no distributed RNG state")
+        if ranked_topology is None:
+            raise RuntimeError("rank zero received no distributed topology state")
         payload["rng_state"] = ranked_rng
+        payload["topology"] = ranked_topology
         save_checkpoint(checkpoint_path, payload)
     dist.barrier()
 
@@ -685,7 +712,18 @@ def main() -> int:
     )
     all_ranks_adagc_state = len(set(rank_adagc_digests)) == 1
 
-    local_ok = torch.tensor(int(difference is None), dtype=torch.int32, device=device)
+    topology_ok = (
+        checkpoint["rng_state"]["schema"] == RANK_LOCAL_RNG_SCHEMA
+        and checkpoint["topology"]["schema"] == "a2v2.topology.v1"
+        and [
+            record["global_rank"] for record in checkpoint["topology"]["by_rank"]
+        ] == list(range(world_size))
+    )
+    local_ok = torch.tensor(
+        int(difference is None and topology_ok),
+        dtype=torch.int32,
+        device=device,
+    )
     dist.all_reduce(local_ok, op=dist.ReduceOp.MIN)
     report = {
         "rank": rank,
@@ -701,6 +739,9 @@ def main() -> int:
         "all_ranks_exact": bool(local_ok.item()),
         "adagc_state_digest": adagc_state_digest,
         "all_ranks_adagc_state": all_ranks_adagc_state,
+        "rng_schema": checkpoint["rng_state"]["schema"],
+        "topology_schema": checkpoint["topology"]["schema"],
+        "topology_ok": topology_ok,
         "first_difference": difference,
         "amp_scale": resumed_engine.scaler.get_scale() if resumed_engine.scaler is not None else None,
         "checkpoint": str(checkpoint_path),
@@ -714,6 +755,7 @@ def main() -> int:
     dist.destroy_process_group()
     if (
         difference is not None
+        or not report["topology_ok"]
         or not report["all_ranks_exact"]
         or not report["all_ranks_adagc_state"]
     ):
