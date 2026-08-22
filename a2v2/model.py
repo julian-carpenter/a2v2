@@ -1477,6 +1477,29 @@ class MLP(nn.Module):
         return self.drop2(self.fc2(self.drop1(self.act(self.fc1(value)))))
 
 
+class PackedGEGLU(nn.Module):
+    """Gated GELU feed-forward network with one packed input projection."""
+
+    def __init__(self, dimension: int, hidden_dimension: int, dropout: float) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(dimension, 2 * hidden_dimension)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dimension, dimension)
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, value: Tensor) -> Tensor:
+        """Gate one packed half with GELU of the other half."""
+
+        # Mathematics: [v,g]=W_in x+b, then h=v*GELU(g) and
+        # FFN(x)=Drop_2(W_out Drop_1(h)+b_out).
+        # Interpretation: one affine kernel produces both hidden roles while
+        # retaining the baseline activation-dropout locations around fc2.
+        projected_value, gate = self.fc1(value).chunk(2, dim=-1)
+        hidden = projected_value * self.act(gate)
+        return self.drop2(self.fc2(self.drop1(hidden)))
+
+
 class TransformerBlock(nn.Module):
     """Animal2Vec AltBlock, including its legacy pre-norm residual order."""
 
@@ -1498,8 +1521,22 @@ class TransformerBlock(nn.Module):
         position_encoding: str = "none",
         rope_theta: float = 10_000.0,
         attention_backend: str = "manual",
+        ffn_type: str = "mlp",
+        initialization: str = "legacy",
+        total_depth: int | None = None,
     ) -> None:
         super().__init__()
+        if initialization not in {"legacy", "deepscale_lm"}:
+            raise ValueError("initialization must be legacy or deepscale_lm")
+        if initialization == "deepscale_lm":
+            if total_depth is None or total_depth < 2:
+                raise ValueError("DeepScaleLM total encoder depth must be at least two")
+            self.residual_lambda = math.sqrt(1.0 - 2.0 / total_depth)
+            self.residual_beta = math.sqrt(2.0 / total_depth)
+        else:
+            self.residual_lambda = 1.0
+            self.residual_beta = 1.0
+        self.initialization = initialization
         self.layer_norm_first = layer_norm_first
         self.ffn_targets = ffn_targets
         self.norm1 = nn.LayerNorm(dimension, eps=norm_eps, elementwise_affine=norm_affine)
@@ -1515,7 +1552,13 @@ class TransformerBlock(nn.Module):
         )
         self.drop_path = DropPath(drop_path) if drop_path else nn.Identity()
         self.norm2 = nn.LayerNorm(dimension, eps=norm_eps, elementwise_affine=norm_affine)
-        self.mlp = MLP(dimension, int(dimension * mlp_ratio), activation_dropout)
+        hidden_dimension = int(dimension * mlp_ratio)
+        if ffn_type == "mlp":
+            self.mlp = MLP(dimension, hidden_dimension, activation_dropout)
+        elif ffn_type == "geglu":
+            self.mlp = PackedGEGLU(dimension, hidden_dimension, activation_dropout)
+        else:
+            raise ValueError("ffn_type must be mlp or geglu")
         self.post_mlp_dropout = nn.Dropout(post_mlp_dropout)
 
     def forward(
@@ -1532,7 +1575,39 @@ class TransformerBlock(nn.Module):
         ``ffn_targets`` and the archived residual order.
         """
 
-        if self.layer_norm_first:
+        if self.initialization == "deepscale_lm":
+            if self.layer_norm_first:
+                # Mathematics: both residuals use λx+βf(x), with the MLP
+                # branch receiving the normalized attention residual.
+                # Interpretation: the constructor fixes both scalars, so this
+                # mode branch is stable for compilation and applies equally to
+                # attention and feed-forward paths.
+                value = self.residual_lambda * value + self.residual_beta * self.drop_path(
+                    self.attn(self.norm1(value), padding_mask, alibi, position_ids)
+                )
+                residual = value
+                value = self.mlp(self.norm2(value))
+                target = value
+                value = (
+                    self.residual_lambda * residual
+                    + self.residual_beta * self.drop_path(self.post_mlp_dropout(value))
+                )
+                if not self.ffn_targets:
+                    target = value
+            else:
+                value = self.residual_lambda * value + self.residual_beta * self.drop_path(
+                    self.attn(value, padding_mask, alibi, position_ids)
+                )
+                residual = value = self.norm1(value)
+                value = self.mlp(value)
+                target = value
+                value = self.norm2(
+                    self.residual_lambda * residual
+                    + self.residual_beta * self.drop_path(self.post_mlp_dropout(value))
+                )
+                if not self.ffn_targets:
+                    target = value
+        elif self.layer_norm_first:
             # Mathematics: this branch follows the archived pre-norm ordering;
             # attention receives Norm1(x), then the MLP receives Norm2 of the
             # attention residual. The assignment sequence is kept verbatim.
@@ -1595,8 +1670,14 @@ class TransformerStack(nn.Module):
         position_encoding: str = "none",
         rope_theta: float = 10_000.0,
         attention_backend: str = "manual",
+        ffn_type: str = "mlp",
+        initialization: str = "legacy",
+        total_depth: int | None = None,
     ) -> None:
         super().__init__()
+        encoder_depth = depth if total_depth is None else total_depth
+        if initialization == "deepscale_lm" and encoder_depth < 2:
+            raise ValueError("DeepScaleLM total encoder depth must be at least two")
         self.checkpoint_activations = checkpoint_activations
         rates = list(drop_path_rates or [0.0] * depth)
         if len(rates) != depth:
@@ -1618,6 +1699,9 @@ class TransformerStack(nn.Module):
                 position_encoding=position_encoding,
                 rope_theta=rope_theta,
                 attention_backend=attention_backend,
+                ffn_type=ffn_type,
+                initialization=initialization,
+                total_depth=encoder_depth,
             )
             for index in range(depth)
         ])
@@ -1680,6 +1764,70 @@ class TransformerStack(nn.Module):
         if self.norm is not None and self.norm_after:
             value = self.norm(value)
         return value, layer_outputs
+
+
+def _deepscale_branch_std(dimension: int, dropout: float) -> float:
+    """Return the standard deviation for a simplified DeepScale branch role."""
+
+    # Mathematics: Var(W)=d^-1 sqrt((1-p)/2), while normal_ accepts σ.
+    # Interpretation: the extra square root converts the paper's variance
+    # into the initializer's standard-deviation argument.
+    variance = math.sqrt((1.0 - dropout) / 2.0) / dimension
+    return math.sqrt(variance)
+
+
+def _initialize_deepscale_linear(
+    linear: nn.Linear,
+    *,
+    dimension: int,
+    dropout: float,
+) -> None:
+    """Initialize one V/output/FFN-role affine map and zero its bias."""
+
+    nn.init.normal_(
+        linear.weight,
+        mean=0.0,
+        std=_deepscale_branch_std(dimension, dropout),
+    )
+    if linear.bias is not None:
+        nn.init.zeros_(linear.bias)
+
+
+def _initialize_deepscale_block(
+    block: TransformerBlock,
+    *,
+    dimension: int,
+    attention_dropout: float,
+    ffn_dropout: float,
+) -> None:
+    """Initialize the packed attention and FFN projections by tensor role."""
+
+    query, key, projected_value = block.attn.qkv.weight.chunk(3, dim=0)
+    qk_std = 1.0 / math.sqrt(dimension)
+    nn.init.normal_(query, mean=0.0, std=qk_std)
+    nn.init.normal_(key, mean=0.0, std=qk_std)
+    nn.init.normal_(
+        projected_value,
+        mean=0.0,
+        std=_deepscale_branch_std(dimension, attention_dropout),
+    )
+    if block.attn.qkv.bias is not None:
+        nn.init.zeros_(block.attn.qkv.bias)
+    _initialize_deepscale_linear(
+        block.attn.proj,
+        dimension=dimension,
+        dropout=attention_dropout,
+    )
+    _initialize_deepscale_linear(
+        block.mlp.fc1,
+        dimension=dimension,
+        dropout=ffn_dropout,
+    )
+    _initialize_deepscale_linear(
+        block.mlp.fc2,
+        dimension=dimension,
+        dropout=ffn_dropout,
+    )
 
 
 # Local convolutional and positional frontends
@@ -1902,10 +2050,16 @@ class AudioEncoder(nn.Module):
         rope_theta: float = 10_000.0,
         attention_backend: str = "manual",
         use_cls_token: bool = False,
+        ffn_type: str = "mlp",
+        initialization: str = "legacy",
     ) -> None:
         super().__init__()
+        total_depth = prenet_depth + depth
+        if initialization == "deepscale_lm" and total_depth < 2:
+            raise ValueError("DeepScaleLM total encoder depth must be at least two")
         self.layers = tuple(layers)
         self.num_heads = num_heads
+        self.initialization = initialization
         self.position_encoding = (
             "alibi" if use_alibi else "none"
         ) if position_encoding is None else position_encoding
@@ -1941,6 +2095,9 @@ class AudioEncoder(nn.Module):
             position_encoding=self.position_encoding,
             rope_theta=rope_theta,
             attention_backend=attention_backend,
+            ffn_type=ffn_type,
+            initialization=initialization,
+            total_depth=total_depth,
         )
         self.prenet = TransformerStack(
             depth=prenet_depth,
@@ -1975,6 +2132,25 @@ class AudioEncoder(nn.Module):
         # The official AudioEncoder reset runs after the parent model's BERT
         # initialization and restores this projection to nn.Linear defaults.
         self.project_features.reset_parameters()
+        if initialization == "deepscale_lm":
+            if use_cls_token:
+                # Mathematics: CLS is the sole learned embedding at its token
+                # position, so Var(c)=1-p before prenet input dropout p.
+                # Interpretation: the acoustic projection keeps its empirical
+                # initialization while the optional learned token uses the
+                # paper's embedding role.
+                nn.init.normal_(
+                    self.cls_token,
+                    mean=0.0,
+                    std=math.sqrt(1.0 - prenet_dropout),
+                )
+            for block in (*self.prenet.blocks, *self.transformer.blocks):
+                _initialize_deepscale_block(
+                    block,
+                    dimension=dimension,
+                    attention_dropout=encoder_dropout,
+                    ffn_dropout=post_mlp_dropout,
+                )
 
     @classmethod
     def from_config(cls, config: Animal2VecConfig) -> "AudioEncoder":
@@ -2019,6 +2195,8 @@ class AudioEncoder(nn.Module):
             rope_theta=model.rope_theta,
             attention_backend=resolve_attention_backend(model),
             use_cls_token=model.use_cls_token,
+            ffn_type=model.ffn_type,
+            initialization=model.initialization,
         )
 
     @staticmethod
@@ -2039,6 +2217,8 @@ class AudioEncoder(nn.Module):
             + hidden * dimension + dimension
             + 4 * dimension
         )
+        if model.ffn_type == "geglu":
+            per_block += dimension * hidden + hidden
         transformer = per_block * (model.depth + model.audio.prenet_depth)
         projection = config.task.conv_feature_layers[-1][0] * dimension + dimension
         positional = model.audio.conv_pos_depth * (
@@ -2251,6 +2431,12 @@ class Animal2VecPretrainingModel(nn.Module):
         self.regression = RegressionLoss(config.model.loss_beta, config.model.loss_scale)
         if config.model.use_cls_token:
             self.cls_predictor = nn.Linear(config.model.embed_dim, config.model.embed_dim)
+            if config.model.initialization == "deepscale_lm":
+                _initialize_deepscale_linear(
+                    self.cls_predictor,
+                    dimension=config.model.embed_dim,
+                    dropout=0.0,
+                )
 
     @classmethod
     def from_config(cls, config: Animal2VecConfig) -> "Animal2VecPretrainingModel":

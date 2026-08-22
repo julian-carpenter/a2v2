@@ -1,6 +1,7 @@
 """Test focal loss, target mixup, layer averaging, and pretrained encoder validation. These
 are the main equations and state boundaries specific to supervised adaptation."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,159 @@ def test_active_finetuning_config_controls_encoder_checkpointing() -> None:
     assert pretrain.model.checkpoint_activations is False
     assert model.encoder.prenet.checkpoint_activations is True
     assert model.encoder.transformer.checkpoint_activations is True
+
+
+def test_geglu_config_selects_packed_ffn_in_both_encoder_stacks() -> None:
+    """Use the pretrained architecture choice in prenet and main fine-tuning stacks."""
+
+    pretrain = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.ffn_type=geglu",),
+    )
+    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+    )
+
+    blocks = [*model.encoder.prenet.blocks, *model.encoder.transformer.blocks]
+    assert len(blocks) == pretrain.model.audio.prenet_depth + pretrain.model.depth
+    assert all(isinstance(block.mlp, model_module.PackedGEGLU) for block in blocks)
+
+
+def test_geglu_parameter_estimate_counts_second_packed_input_half() -> None:
+    """Include the extra hidden-by-input weight and hidden bias in every block."""
+
+    mlp = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    geglu = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.ffn_type=geglu",),
+    )
+    dimension = geglu.model.embed_dim
+    hidden = int(dimension * geglu.model.mlp_ratio)
+    depth = geglu.model.depth + geglu.model.audio.prenet_depth
+
+    difference = (
+        AudioEncoder.estimated_parameter_count(geglu)
+        - AudioEncoder.estimated_parameter_count(mlp)
+    )
+
+    assert difference == depth * (dimension * hidden + hidden)
+
+
+def test_mlp_encoder_checkpoint_has_strict_geglu_shape_mismatch() -> None:
+    """Reject an MLP checkpoint instead of reinterpreting it as packed GEGLU."""
+
+    mlp_config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    geglu_config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.ffn_type=geglu",),
+    )
+    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    mlp_state = AudioEncoder.from_config(mlp_config).state_dict()
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=geglu_config,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"prenet\.blocks\.0\.mlp\.fc1\.weight.*expected.*received",
+    ):
+        model.load_pretrained_encoder(mlp_state)
+
+
+def test_deepscale_encoder_checkpoint_loading_overrides_initialization() -> None:
+    """Make supplied encoder tensors authoritative over constructor randomness."""
+
+    pretrain = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.initialization=deepscale_lm",),
+    )
+    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    source = AudioEncoder.from_config(pretrain)
+    checkpoint = {
+        name: value.detach().clone()
+        for name, value in source.state_dict().items()
+    }
+    checkpoint["transformer.blocks.0.attn.qkv.weight"].fill_(0.125)
+
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+        encoder_state=checkpoint,
+    )
+
+    for name, expected in checkpoint.items():
+        torch.testing.assert_close(
+            model.encoder.state_dict()[name],
+            expected,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_explicit_legacy_initialization_keeps_exact_tensors_and_outputs() -> None:
+    """Keep the default and explicit legacy constructor paths bit-for-bit equal."""
+
+    default_config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    explicit_config = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=("model.initialization=legacy",),
+    )
+    torch.manual_seed(101)
+    default = AudioEncoder.from_config(default_config).eval()
+    torch.manual_seed(101)
+    explicit = AudioEncoder.from_config(explicit_config).eval()
+
+    assert list(default.state_dict()) == list(explicit.state_dict())
+    for name, expected in default.state_dict().items():
+        torch.testing.assert_close(
+            explicit.state_dict()[name],
+            expected,
+            rtol=0,
+            atol=0,
+        )
+    waveform = torch.linspace(-1.0, 1.0, 128).reshape(2, 64)
+    default_output = default(waveform)
+    explicit_output = explicit(waveform)
+    torch.testing.assert_close(explicit_output.x, default_output.x, rtol=0, atol=0)
+    for actual, expected in zip(
+        explicit_output.layer_outputs,
+        default_output.layer_outputs,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_deepscale_finetuning_preserves_classifier_xavier_initialization() -> None:
+    """Do not reinterpret the supervised classifier as a Transformer FFN role."""
+
+    pretrain = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=(
+            "model.embed_dim=256",
+            "model.num_heads=8",
+            "model.initialization=deepscale_lm",
+        ),
+    )
+    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    torch.manual_seed(111)
+    model = Animal2VecFineTuningModel.from_config(
+        finetune,
+        pretrained_config=pretrain,
+    )
+
+    expected_std = math.sqrt(
+        2.0 / (model.classifier.in_features + model.classifier.out_features)
+    )
+    # 512 Xavier samples have ~3.1% relative sample-std error; 10% is robust.
+    assert model.classifier.weight.std().item() == pytest.approx(
+        expected_std,
+        rel=0.10,
+    )
+    assert torch.count_nonzero(model.classifier.bias) == 0
 
 
 def test_sigmoid_focal_loss_matches_hand_calculation() -> None:

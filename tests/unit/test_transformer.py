@@ -3,14 +3,256 @@ checks that the stack returns one teacher-target tensor for each block that exec
 
 from contextlib import nullcontext
 from copy import deepcopy
+import math
 
 import numpy as np
 import pytest
 import torch
+from torch import nn
+from torch.nn import functional as F
 
 import a2v2.model as model_module
-from a2v2.model import TransformerBlock, TransformerStack
+from a2v2.model import AudioEncoder, TransformerBlock, TransformerStack
 from a2v2.model import alibi_bias
+
+
+class _ScaleAttention(nn.Module):
+    """Deterministic attention branch used to isolate residual arithmetic."""
+
+    def __init__(self, scale: float) -> None:
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, value: torch.Tensor, *_: object) -> torch.Tensor:
+        """Scale the real block input without adding parameters or randomness."""
+
+        return self.scale * value
+
+
+class _ScaleFFN(nn.Module):
+    """Deterministic FFN branch used to isolate residual arithmetic."""
+
+    def __init__(self, scale: float) -> None:
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Scale the real intermediate block tensor."""
+
+        return self.scale * value
+
+
+def _deepscale_branch_std(dimension: int, dropout: float) -> float:
+    """Convert the design's branch-weight variance into a standard deviation."""
+
+    variance = math.sqrt((1.0 - dropout) / 2.0) / dimension
+    return math.sqrt(variance)
+
+
+def test_packed_geglu_matches_direct_equation_shapes_and_gradients() -> None:
+    """Use one packed affine map, split value/gate, and backpropagate both halves."""
+
+    geglu = model_module.PackedGEGLU(3, 2, dropout=0.0).eval()
+    with torch.no_grad():
+        geglu.fc1.weight.copy_(torch.tensor([
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6],
+            [-0.2, 0.1, 0.3],
+            [0.7, -0.4, 0.2],
+        ]))
+        geglu.fc1.bias.copy_(torch.tensor([0.05, -0.1, 0.2, -0.3]))
+        geglu.fc2.weight.copy_(torch.tensor([
+            [0.3, -0.5],
+            [0.7, 0.2],
+            [-0.4, 0.6],
+        ]))
+        geglu.fc2.bias.copy_(torch.tensor([0.1, -0.2, 0.05]))
+    value = torch.tensor(
+        [[[0.2, -0.1, 0.5], [0.7, 0.3, -0.4]]],
+        requires_grad=True,
+    )
+
+    packed = F.linear(value, geglu.fc1.weight, geglu.fc1.bias)
+    direct_value, direct_gate = packed.chunk(2, dim=-1)
+    expected = F.linear(
+        direct_value * F.gelu(direct_gate),
+        geglu.fc2.weight,
+        geglu.fc2.bias,
+    )
+    output = geglu(value)
+    output.square().sum().backward()
+
+    assert geglu.fc1.weight.shape == (4, 3)
+    assert geglu.fc1.bias.shape == (4,)
+    assert geglu.fc2.weight.shape == (3, 2)
+    assert len([module for module in geglu.modules() if isinstance(module, nn.Linear)]) == 2
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert value.grad is not None and value.grad.abs().sum() > 0
+    assert geglu.fc1.weight.grad is not None
+    assert geglu.fc1.weight.grad[:2].abs().sum() > 0
+    assert geglu.fc1.weight.grad[2:].abs().sum() > 0
+    assert geglu.fc2.weight.grad is not None and geglu.fc2.weight.grad.abs().sum() > 0
+
+
+def test_packed_geglu_drops_gated_hidden_before_output_projection() -> None:
+    """Apply activation dropout to the gated hidden coordinates before fc2."""
+
+    geglu = model_module.PackedGEGLU(2, 3, dropout=1.0).train()
+    with torch.no_grad():
+        geglu.fc1.weight.fill_(1.0)
+        geglu.fc1.bias.fill_(1.0)
+        geglu.fc2.weight.fill_(1.0)
+        geglu.fc2.bias.copy_(torch.tensor([2.0, 3.0]))
+    projected: list[tuple[torch.Tensor, torch.Tensor]] = []
+    handle = geglu.fc2.register_forward_hook(
+        lambda _module, args, output: projected.append(
+            (args[0].detach().clone(), output.detach().clone())
+        )
+    )
+
+    output = geglu(torch.ones(1, 1, 2))
+    handle.remove()
+
+    assert len(projected) == 1
+    assert torch.count_nonzero(projected[0][0]) == 0
+    torch.testing.assert_close(projected[0][1], torch.tensor([[[2.0, 3.0]]]))
+    assert torch.count_nonzero(output) == 0
+
+
+@pytest.mark.parametrize("layer_norm_first", (False, True))
+def test_deepscale_residual_coefficients_scale_both_branches(
+    layer_norm_first: bool,
+) -> None:
+    """Apply lambda to both skips and beta to both branch outputs."""
+
+    total_depth = 8
+    block = TransformerBlock(
+        4,
+        2,
+        dropout=0.0,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+        post_mlp_dropout=0.0,
+        layer_norm_first=layer_norm_first,
+        initialization="deepscale_lm",
+        total_depth=total_depth,
+    ).eval()
+    block.norm1 = nn.Identity()
+    block.norm2 = nn.Identity()
+    block.attn = _ScaleAttention(2.0)
+    block.mlp = _ScaleFFN(3.0)
+    value = torch.tensor([[[1.0, -2.0, 0.5, 4.0]]])
+
+    output, target = block(value)
+
+    expected_lambda = math.sqrt(1.0 - 2.0 / total_depth)
+    expected_beta = math.sqrt(2.0 / total_depth)
+    after_attention = expected_lambda * value + expected_beta * (2.0 * value)
+    expected_target = 3.0 * after_attention
+    expected_output = (
+        expected_lambda * after_attention + expected_beta * expected_target
+    )
+    assert block.residual_lambda == pytest.approx(expected_lambda)
+    assert block.residual_beta == pytest.approx(expected_beta)
+    torch.testing.assert_close(target, expected_target)
+    torch.testing.assert_close(output, expected_output)
+
+
+def test_deepscale_rejects_total_encoder_depth_below_two() -> None:
+    """Refuse undefined residual coefficients before constructing any block."""
+
+    with pytest.raises(ValueError, match=r"DeepScaleLM.*total.*at least two"):
+        TransformerStack(
+            8,
+            2,
+            depth=1,
+            initialization="deepscale_lm",
+            total_depth=1,
+        )
+
+
+def test_deepscale_initializes_roles_with_branch_dropout_variances() -> None:
+    """Initialize packed QKV slices and branch weights from their specified roles."""
+
+    torch.manual_seed(83)
+    dimension = 256
+    attention_branch_dropout = 0.19
+    ffn_branch_dropout = 0.36
+    encoder = AudioEncoder(
+        ((64, 3, 2),),
+        sample_rate=8_000,
+        dimension=dimension,
+        num_heads=8,
+        depth=2,
+        prenet_depth=1,
+        conv_pos_depth=1,
+        conv_pos_width=3,
+        conv_pos_groups=16,
+        sinc_input=False,
+        use_pswish=False,
+        mlp_ratio=2.0,
+        encoder_dropout=attention_branch_dropout,
+        attention_dropout=0.47,
+        activation_dropout=0.61,
+        post_mlp_dropout=ffn_branch_dropout,
+        prenet_dropout=0.25,
+        dropout_input=0.0,
+        use_alibi=False,
+        use_cls_token=True,
+        ffn_type="geglu",
+        initialization="deepscale_lm",
+    )
+    blocks = [*encoder.prenet.blocks, *encoder.transformer.blocks]
+    qk_std = 1.0 / math.sqrt(dimension)
+    attention_std = _deepscale_branch_std(
+        dimension,
+        attention_branch_dropout,
+    )
+    ffn_std = _deepscale_branch_std(dimension, ffn_branch_dropout)
+
+    # Each checked matrix has at least 65,536 samples. A Gaussian sample
+    # standard deviation then has relative standard error below 0.3%; 2.5%
+    # leaves ample deterministic margin while distinguishing every role.
+    for block in blocks:
+        query, key, projected_value = block.attn.qkv.weight.chunk(3, dim=0)
+        assert query.std().item() == pytest.approx(qk_std, rel=0.025)
+        assert key.std().item() == pytest.approx(qk_std, rel=0.025)
+        assert projected_value.std().item() == pytest.approx(
+            attention_std,
+            rel=0.025,
+        )
+        assert block.attn.proj.weight.std().item() == pytest.approx(
+            attention_std,
+            rel=0.025,
+        )
+        assert block.mlp.fc1.weight.std().item() == pytest.approx(
+            ffn_std,
+            rel=0.025,
+        )
+        assert block.mlp.fc2.weight.std().item() == pytest.approx(
+            ffn_std,
+            rel=0.025,
+        )
+        for linear in (block.attn.qkv, block.attn.proj, block.mlp.fc1, block.mlp.fc2):
+            assert linear.bias is not None
+            assert torch.count_nonzero(linear.bias) == 0
+        assert block.residual_lambda == pytest.approx(math.sqrt(1.0 / 3.0))
+        assert block.residual_beta == pytest.approx(math.sqrt(2.0 / 3.0))
+
+    # CLS is the only learned embedding at its token position and is followed
+    # by prenet dropout p=0.25, so the embedding variance is 1-p. With 256
+    # coordinates its sample-std relative error is about 4.4%; 15% is robust.
+    assert encoder.cls_token.std().item() == pytest.approx(
+        math.sqrt(1.0 - 0.25),
+        rel=0.15,
+    )
+    # The acoustic projection remains under nn.Linear.reset_parameters rather
+    # than receiving any Transformer-role distribution.
+    projection_std = math.sqrt(1.0 / (3.0 * encoder.project_features.in_features))
+    assert encoder.project_features.weight.std().item() == pytest.approx(
+        projection_std,
+        rel=0.08,
+    )
 
 
 def test_post_norm_block_matches_official_residual_sequence() -> None:
@@ -142,7 +384,10 @@ def test_stack_checkpoints_only_training_grad_blocks(
     )
 
 
-def test_checkpointed_stack_matches_stochastic_forward_backward_and_rng() -> None:
+@pytest.mark.parametrize("ffn_type", ("mlp", "geglu"))
+def test_checkpointed_stack_matches_stochastic_forward_backward_and_rng(
+    ffn_type: str,
+) -> None:
     """Match ordinary block values, gradients, and post-backward RNG state."""
 
     torch.manual_seed(41)
@@ -157,6 +402,7 @@ def test_checkpointed_stack_matches_stochastic_forward_backward_and_rng() -> Non
         drop_path_rates=(0.1, 0.2),
         input_dropout=0.2,
         layerdrop=0.0,
+        ffn_type=ffn_type,
     ).train()
     checkpointed = deepcopy(ordinary)
     checkpointed.checkpoint_activations = True

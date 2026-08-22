@@ -44,6 +44,73 @@ def test_tiny_pretraining_forward_backward_optimizer_and_ema() -> None:
     assert torch.isfinite(output.loss)
 
 
+def test_checkpointed_geglu_pretraining_forward_backward() -> None:
+    """Run the packed FFN through both encoder stacks and checkpoint recomputation."""
+
+    torch.manual_seed(18)
+    cfg = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=(
+            "model.ffn_type=geglu",
+            "model.checkpoint_activations=true",
+        ),
+    )
+    model = Animal2VecPretrainingModel.from_config(cfg).train()
+
+    output = model(
+        torch.randn(2, 64),
+        sample_ids=torch.tensor([200, 201]),
+        update=0,
+    )
+    (output.loss / output.sample_size).backward()
+
+    assert torch.isfinite(output.loss)
+    blocks = [*model.student.prenet.blocks, *model.student.transformer.blocks]
+    assert all(
+        block.mlp.fc1.out_features
+        == 2 * int(cfg.model.embed_dim * cfg.model.mlp_ratio)
+        for block in blocks
+    )
+    assert all(block.mlp.fc1.weight.grad is not None for block in blocks)
+    assert all(parameter.grad is None for parameter in model.teacher.parameters())
+
+
+def test_deepscale_initial_teacher_and_optional_predictor_roles() -> None:
+    """Copy initialized student tensors exactly and initialize the CLS output role."""
+
+    torch.manual_seed(91)
+    cfg = load_config(
+        ROOT / "tests/fixtures/tiny_pretrain.yaml",
+        overrides=(
+            "model.initialization=deepscale_lm",
+            "model.use_cls_token=true",
+        ),
+    )
+    model = Animal2VecPretrainingModel.from_config(cfg)
+
+    student_state = model.student.state_dict()
+    teacher_state = model.teacher.model.state_dict()
+    assert list(student_state) == list(teacher_state)
+    for name in student_state:
+        torch.testing.assert_close(
+            teacher_state[name],
+            student_state[name],
+            rtol=0,
+            atol=0,
+        )
+
+    dimension = cfg.model.embed_dim
+    predictor_variance = math.sqrt(0.5) / dimension
+    predictor_std = math.sqrt(predictor_variance)
+    # The 16x16 predictor has ~4.4% sample-std relative error; 15% separates
+    # the DeepScale role from nn.Linear's default uniform initialization.
+    assert model.cls_predictor.weight.std().item() == pytest.approx(
+        predictor_std,
+        rel=0.15,
+    )
+    assert torch.count_nonzero(model.cls_predictor.bias) == 0
+
+
 def test_cloned_student_masks_are_distinct() -> None:
     """Check cloned student masks are distinct."""
     cfg = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
