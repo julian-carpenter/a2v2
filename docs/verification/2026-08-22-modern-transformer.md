@@ -1,0 +1,334 @@
+# Modern Transformer and SLURM verification
+
+Date: 2026-08-24 UTC
+
+## Acceptance result
+
+The bounded local gates passed against code revision
+`5fe1656e4844e94405bc2e1b9cf87f24ef965624`. The run covered the full CPU
+suite, one-A100 CUDA components and training, strict Flash attention, compile,
+CLS and AdaGC paths, bitsandbytes 8-bit optimizer resume, two-rank Gloo, and
+two- and four-rank NCCL exact resume. The local and mocked SLURM checks passed.
+
+This verification did not run the paper-scale reproduction or a SLURM
+allocation. It does not validate a site filesystem, scheduler, requeue policy,
+or multi-node transport.
+
+## Git scope
+
+- Base and `origin/main`: `a49d1d18c0adf53c7e33d7df56f47039c144a9e1`
+- Verified code head before this evidence commit:
+  `5fe1656e4844e94405bc2e1b9cf87f24ef965624`
+- Range: 25 commits, 47 tracked files, 19,298 insertions and 251 deletions
+- Initial state: `main...origin/main [ahead 25]`, with an empty short status
+- Task 12 adds this report and `tests/gpu/benchmark_attention.py`. The
+  containing commit records those two files.
+
+The final handoff names the containing commit because a Git commit cannot
+store its own hash in its contents.
+
+## Host and package state
+
+The host exposed Python 3.12.3, PyTorch
+`2.13.0a0+9186a08b2c.nv26.07`, CUDA 13.3, NCCL 2.30.7, and eight
+NVIDIA A100-SXM4-40GB devices. Every GPU reported 0 MiB used and 0% utilization
+before the bounded single-GPU and distributed runs.
+
+The starting host had bitsandbytes 0.50.0, outside the repository's declared
+`bitsandbytes>=0.49,<0.50` range. This command restored the declared extra:
+
+```text
+rtk python -m pip install -e '.[bnb]'
+```
+
+Outcome: exit 0; pip replaced 0.50.0 with bitsandbytes 0.49.2.
+
+Native import on CUDA 13.3 reported the missing
+`libbitsandbytes_cuda133.so`. The negative product gate passed and confirmed
+that `build_optimizer` raises its targeted setup error. This documented
+override loaded the wheel's CUDA 13.0 binary:
+
+```text
+rtk env BNB_CUDA_VERSION=130 python -c 'import bitsandbytes as bnb; from bitsandbytes.cextension import lib; print("bitsandbytes", bnb.__version__); print("compiled_with_cuda", bool(lib.compiled_with_cuda)); print("native_library", getattr(lib, "_name", None))'
+```
+
+Outcome: bitsandbytes 0.49.2, `compiled_with_cuda=True`, native library
+`libbitsandbytes_cuda130.so`. The CUDA 13.3 wheel gap is host compatibility
+evidence, not a product failure. A source build with CUDA 13.3 remains unrun.
+
+The first `pip check` also found that the preinstalled audiomentations 0.41.0
+lacked librosa and soxr. An unpinned repair command selected librosa 1.0.0 and
+soxr 1.1.0, which violated audiomentations' version ranges:
+
+```text
+rtk python -m pip install librosa soxr
+```
+
+The installed metadata identified the required ranges. This correction
+restored librosa 0.10.2.post1 and soxr 0.5.0.post1:
+
+```text
+rtk python -m pip install 'librosa>=0.8.0,<0.11.0,!=0.10.0' 'soxr>=0.3.2,<1.0.0'
+rtk python -m pip check
+```
+
+Outcome: both commands exited 0; `pip check` printed
+`No broken requirements found.`
+
+## CPU, package, and source checks
+
+| Command | Outcome |
+| --- | --- |
+| `rtk python -m pytest -q tests/unit tests/integration` | 526 passed, 8 warnings, 316.99 s |
+| `rtk python -m compileall -q a2v2 tests` | Exit 0 |
+| `rtk python -m pip check` | Exit 0 after the host corrections above |
+| `rtk git diff --check` | Exit 0 |
+| `rtk git status --short` | Empty before Task 12 files |
+
+The eight CPU warnings came from Python 3.12's warning about `fork()` from a
+multithreaded process in two multiworker CLI resume tests. No CPU test failed.
+
+After Task 12 added the benchmark harness, this focused command exposed one
+new documentation failure:
+
+```text
+rtk python -m pytest -q tests/unit/test_repository_layout.py tests/unit/test_documentation.py
+```
+
+The first run reported 1 failed and 22 passed because the nested benchmark
+helper lacked a docstring. I added that docstring without changing executable
+logic. The regression test then passed 1/1, and the full focused command passed
+23/23 in 19.21 s.
+
+## Frozen reproduction control
+
+This focused command reran config round trips, legacy defaults, state
+signatures, published recipes, environment preflight, and local driver dry
+runs:
+
+```text
+rtk python -m pytest -q tests/unit/test_config.py tests/unit/test_model_state_contract.py tests/integration/test_recipe_configs.py tests/integration/test_reproduction_driver.py
+```
+
+Outcome: 78 passed in 22.80 s.
+
+Legacy recipes resolved to eager execution, the legacy position and attention
+selectors, no CLS token, MLP, legacy initialization, global clipping, native
+Adam, and constant weight decay. Serialization supplied the same defaults when
+the new fields were absent. The state signatures remained:
+
+- Tiny pretraining: 120 entries,
+  `5efbec43fd1c1c392b8b4278cee6a21513f68f3095353bb22524d2ada2ecf6ad`
+- Tiny fine-tuning: 59 entries,
+  `b7b2ea2ad9017ec94d56516fbda49a932866b472a48633804619b7232f3d05bb`
+
+The frozen SHA-256 values matched:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `configs/MeerKAT/a2v_large_pretrain_best.yaml` | `c5eb23d979cd12704f0dd3977fac1b6031cb4cbf7d5868930eaa6c2816f36a29` |
+| `configs/MeerKAT/finetune_mixup_001.yaml` | `384eed9a25da913258e618425c9526cffdaccdacc2a16f912f8e1719fe15a9e0` |
+| `configs/MeerKAT/finetune_mixup_025.yaml` | `31daab6409907238af025a480bf236fd2bb82fdd9442a9a1e4d3b0552e0d3f4a` |
+| `configs/MeerKAT/finetune_mixup_100.yaml` | `c31c2a3df37d2397ae2cd7cbc502aa849bd819af5ac35f9ff930ab35fb192fd0` |
+| `configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml` | `6a40999452b56e95834d2487860ddc11974c9840b9814eafec1f21468de09102` |
+| `configs/hyenas/finetune_mixup_100.yaml` | `f892d0f9bb52a823a1fe4bcd168aab33a29cbd6bcc395ce0822525b6bc3c07ca` |
+| `scripts/reproduce_meerkat_paper.sh` | `485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18` |
+
+The frozen driver rendered two eight-rank pretraining launches, including the
+one-update burn-in and resume, followed by one eight-rank fine-tuning launch.
+It retained the published token budgets and update frequencies. The tests also
+confirmed the one-GPU final evaluation command.
+
+## Bounded CUDA results
+
+Each pytest command exposed only GPU 0.
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s tests/gpu/test_cuda_components.py
+```
+
+Outcome: 12 passed in 4.13 s. Strict Flash completed forward and backward for
+FP16 and BF16 with both `position_encoding=none` and RoPE. The representative
+`B=1, T=2048, D=128, heads=8` memory test reported 472,942,080 incremental
+manual allocated bytes and 34,245,120 strict-Flash allocated bytes.
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0 python -m pytest -q tests/gpu/test_cuda_training.py -k missing_native_binary
+```
+
+Outcome: 1 passed and 11 deselected in 4.18 s. This is the native CUDA 13.3
+bitsandbytes failure gate.
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0 BNB_CUDA_VERSION=130 python -m pytest -q -s tests/gpu/test_cuda_training.py
+```
+
+Outcome: 11 passed and 1 skipped in 58.22 s. The override caused the native
+CUDA 13.3 negative gate to skip. The same run passed Adam8bit and AdamW8bit
+state save/resume, global/AdaGC AMP overflow rollback, activation checkpoint
+parity, modern CLS/GEGLU updates, and compile coverage.
+
+The pure Transformer compile measurement used strict Flash, RoPE, GEGLU,
+activation checkpointing, FP16, `B=2, T=128, D=64`, four heads and two layers.
+It used two warm-ups and five measured forward/backward iterations. Inductor
+ran with `mode=default`, `fullgraph=true`, and `dynamic=false`:
+
+| Mode | ms/iteration | Peak allocated | Peak reserved | Graphs / breaks |
+| --- | ---: | ---: | ---: | ---: |
+| Eager | 11.4560 | 70,368,768 | 90,177,536 | n/a |
+| Compiled | 3.8630 | 70,651,392 | 90,177,536 | 1 / 0 |
+
+The observed eager/compiled ratio was 2.9656 for this bounded run. It does not
+set a training throughput expectation.
+
+The complete compiled pretraining step used `fullgraph=false` and reported
+36.261 s including compilation, 67,718,144 peak allocated bytes, 69,206,016
+peak reserved bytes, 10 unique graphs, and 7 graph breaks. The breaks came
+from sample-ID scalar extraction, NumPy masking, data-dependent masking
+branches, and dynamic `nonzero`. The compiled CLS fine-tuning step reported
+13.348 s including compilation, 67,876,352 peak allocated bytes, 69,206,016
+peak reserved bytes, one graph, and no graph breaks.
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0 python -m pytest -q -s tests/gpu/test_cuda_inference.py
+```
+
+Outcome: 2 passed in 2.89 s. The nonempty case produced 2,200 frames and one
+event for a 1.1 s stereo input; the empty-input case retained shaped CPU
+outputs.
+
+## Manual and strict-Flash attention diagnostic
+
+Task 12 added `tests/gpu/benchmark_attention.py` because the existing tests
+did not time manual and strict Flash under one measurement contract. The
+harness uses fresh modules with identical weights and input for each backend.
+It resets parameter gradients each iteration and checks output, input-gradient,
+and parameter-gradient finiteness.
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0 python tests/gpu/benchmark_attention.py --batch 1 --length 2048 --dimension 128 --heads 8 --warmups 2 --iterations 10 --device cuda:0
+```
+
+Exact scope: one attention layer, FP16, no position encoding or padding, eager
+execution with compilation disabled, forward plus FP32 square-mean loss plus
+backward, two warm-ups and ten measured iterations on one A100-SXM4-40GB.
+
+| Backend | Kernel mode | ms/iteration | Peak allocated | Peak reserved |
+| --- | --- | ---: | ---: | ---: |
+| `manual` | Legacy manual dense body | 2.810616 | 492,210,176 | 568,328,192 |
+| `flash` | Strict `SDPBackend.FLASH_ATTENTION` | 1.388581 | 27,200,000 | 31,457,280 |
+
+Both paths produced finite outputs and gradients. Raw differences were
+`6.103515625e-05` maximum and `2.9868801902921405e-06` mean for outputs, plus
+`5.960464477539063e-08` maximum and `3.142304194625467e-10` mean for input
+gradients. These observations describe one small attention module. They do not
+predict model or paper-scale throughput.
+
+## Local distributed results
+
+The final test layout has no `tests/gpu/test_distributed_smoke.py`, and
+`tests/gpu/nccl_resume.py` has no `--device cpu` option. The integration suite
+contains the equivalent two-rank Gloo safe-point tests:
+
+```text
+rtk python -m pytest -q -s tests/integration/test_slurm_launcher.py -k two_rank_gloo
+```
+
+Outcome: 6 passed and 34 deselected in 73.29 s. The selection covered one-rank
+preemption reduced across two ranks, coordinated checkpoint output, and
+rank-common prepare, merge, write, and output-visibility failures.
+
+The two-rank NCCL probe used GPUs 0 and 1:
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_probe.py --output-dir /tmp/a2v2-task12-nccl-probe.9Z4sW3
+```
+
+Outcome: exit 0. Both ranks used NCCL for tensors and Gloo for checkpoint
+metadata. Each rank restored its RNG stream, loaded its checkpoint tensor onto
+its local CUDA device, and validated the rank-local RNG and topology schemas.
+
+The exact-resume script ran at two and four ranks:
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task12-nccl-resume-2.TKsmT6
+rtk env CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --standalone --nproc-per-node=4 tests/gpu/nccl_resume.py --output-dir /tmp/a2v2-task12-nccl-resume-4.kJRh6V
+```
+
+Both commands exited 0. At two ranks, expected and resumed digests matched:
+
+- Rank 0: `c5eab56a9820dde2fd09207ac1d682155442c49271c55b49d14a420472e2a2db`
+- Rank 1: `1979a422bb1e9392bef6c66dfb8f30efcab66a0c9988f03b09064d074339eeb6`
+
+Both ranks shared AdaGC digest
+`6ad554301ec6f72fafa49579394ac4803ae90f438a679f94728102ef79afc012`.
+At four ranks, all expected/resumed pairs matched and all ranks shared AdaGC
+digest `767a0d1f5344f7cc60ef49ee2bde4747be5e2799168335c9dcb23bc81ba205e0`.
+Every report recorded `first_difference=null`, exact local state, exact
+rank-wide state, and valid RNG/topology schemas.
+
+PyTorch warned that the standalone scripts inferred an NCCL device for a
+barrier and that `find_unused_parameters=true` found no unused parameter in
+these tiny updates. The tests passed; the messages identify a performance and
+heterogeneous-mapping limitation in the test launcher, not a failed exactness
+check.
+
+## SLURM launcher checks
+
+```text
+rtk bash -n scripts/a2v2_slurm_node.sh
+rtk bash -n scripts/reproduce_meerkat_slurm.sh
+rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/runs/meerkat --phase all --nodes 2 --gpus-per-node 4 --job-id dryrun-4815 --dry-run
+```
+
+All commands exited 0. The dry run rendered one `srun` task per node, four
+torchrun workers per node, world size 8, distinct pretrain and fine-tune run
+contracts, checkpoint validation between stages, and one-node/one-GPU final
+evaluation. The CPU suite also ran the mocked launcher, lock, contract,
+preemption, and frozen-driver tests.
+
+## Requirements review
+
+| Gate | Evidence | Result |
+| --- | --- | --- |
+| Gate 0 frozen control | 526-test CPU suite, focused 78-test control suite, hashes and state signatures above | Pass |
+| Gate 1 component units | Full unit suite plus 12 CUDA component tests | Pass |
+| Gate 2 CPU integration | Full integration suite and explicit two-rank Gloo selection | Pass |
+| Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank NCCL resume | Pass on this host |
+| Gate 4 SLURM acceptance | Real allocation and site-dependent checks | UNRUN |
+
+The legacy contract kept the checked-in recipes and paper driver hashes, the
+default resolved math path, model state signatures, and old-checkpoint tests.
+The modern component tests covered RoPE token order, SDPA/manual parity, CLS
+masking and targets, sequence classification, packed GEGLU, DeepScaleLM,
+AdaGC transaction state, decay scheduling, compile wiring, and SLURM contract
+validation. The full CPU run supplied this coverage; the CUDA and distributed
+commands exercised the hardware branches.
+
+The task prohibited subagents, so no independent reviewer ran. I applied the
+`requesting-code-review` checklist to the complete `origin/main..5fe1656`
+inventory, the plan and design requirements, compatibility risks, error paths,
+tests, documentation, and production readiness. `git diff --check` found no
+whitespace error. A targeted scan found no new `eval`, `shell=True`, TODO,
+FIXME, HACK, or XXX marker in production files. I found no evidence-backed
+Critical or Important issue. The environment and unrun gates below remain
+release constraints.
+
+## Known limits and unrun gates
+
+- Paper-scale pretraining, fine-tuning, resume, and final evaluation: UNRUN.
+- The canonical local eight-A100 reproduction command graph ran in dry-run
+  tests; no eight-rank training allocation ran.
+- Real one-node SLURM launcher parity: UNRUN.
+- Real multi-node SLURM NCCL and Gloo transport: UNRUN.
+- Site shared-filesystem visibility, output-lock contention, checkpoint
+  atomicity, signal delivery, validated requeue, and scheduler policy: UNRUN
+  outside mocks and local Gloo processes.
+- Native bitsandbytes CUDA 13.3 binary or source build: UNRUN. The supported
+  wheel required `BNB_CUDA_VERSION=130` on this host.
+- Full pretraining compile retains seven graph breaks in the bounded dynamic
+  run. `fullgraph=false` accepts them; fullgraph model training remains outside
+  the supported claim.
+- The one-A100 attention and compile timings describe their recorded shapes,
+  software, and measured scopes. They do not establish paper-scale speed or
+  memory requirements.
