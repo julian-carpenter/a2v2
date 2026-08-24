@@ -444,7 +444,11 @@ def test_documented_slurm_help_dry_run_and_shell_syntax_execute() -> None:
         timeout=30,
     )
     assert sequence_help.returncode == 0, sequence_help.stderr
-    assert "--override SECTION.KEY=VALUE" in sequence_help.stdout
+    normalized_help = " ".join(sequence_help.stdout.split())
+    assert "--override SECTION.KEY=VALUE" in normalized_help
+    assert "--trust-checkpoint" in normalized_help
+    assert "pickle-backed" in normalized_help
+    assert "does not make pickle safe" in normalized_help
 
     for script in (
         "scripts/reproduce_meerkat_slurm.sh",
@@ -499,6 +503,49 @@ def test_modern_cls_guidance_uses_sequence_evaluation_and_no_all_stage_training(
     assert "srun --nodes=1 --ntasks=1 --gpus=1" in guidance
     assert "--phase all" not in guidance
     assert "Task 9" not in slurm
+
+
+def test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths() -> None:
+    """Document trusted pickle loading and the two evaluation config paths."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
+    code_guide = (ROOT / "docs/code-guide.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"(?ms)^### Modern CLS sequence evaluation\n(.*?)(?=^###?\s|\Z)",
+        slurm,
+    )
+    assert section is not None
+    guidance = section.group(1)
+
+    readme_commands = [
+        fence
+        for fence in _shell_fences(readme)
+        if "a2v2-evaluate-sequence" in fence and "--help" not in fence
+    ]
+    slurm_commands = [
+        fence
+        for fence in _shell_fences(guidance)
+        if "a2v2-evaluate-sequence" in fence
+    ]
+    assert len(readme_commands) == 1
+    assert len(slurm_commands) == 2
+    assert all("--trust-checkpoint" in fence for fence in readme_commands)
+    assert all("--trust-checkpoint" in fence for fence in slurm_commands)
+
+    for documented in (readme, guidance):
+        assert "pickle-backed" in documented
+        assert "source you trust" in documented
+        assert "does not make pickle safe" in documented
+
+    normalized_slurm = " ".join(slurm.split())
+    assert "legacy SLURM phase evaluator" in normalized_slurm
+    assert "modern sequence evaluator" in normalized_slurm
+    assert "stored pretraining config" in normalized_slurm
+    assert (
+        "| `a2v2-evaluate-sequence` | `evaluate_sequence_main` |"
+        in code_guide
+    )
 
 
 def test_slurm_site_gate_remains_explicitly_unrun() -> None:

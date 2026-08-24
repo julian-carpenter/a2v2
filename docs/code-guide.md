@@ -641,6 +641,7 @@ The installed commands call these functions:
 | --- | --- |
 | `a2v2-train` | `train_main` |
 | `a2v2-infer` | `infer_main` |
+| `a2v2-evaluate-sequence` | `evaluate_sequence_main` |
 | `a2v2-convert-checkpoint` | `convert_checkpoint_main` |
 
 For DDP, pass the installed training script to `torchrun`:

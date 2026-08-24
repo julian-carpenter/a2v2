@@ -122,6 +122,7 @@ def _arguments(checkpoint: Path, data_dir: Path, *, threshold: float) -> list[st
 
     return [
         str(checkpoint),
+        "--trust-checkpoint",
         "--config",
         str(ROOT / "tests/fixtures/tiny_finetune.yaml"),
         "--override",
@@ -143,6 +144,43 @@ def _arguments(checkpoint: Path, data_dir: Path, *, threshold: float) -> list[st
         "--device",
         "cpu",
     ]
+
+
+def test_sequence_evaluator_refuses_untrusted_checkpoint_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing trust acknowledgement blocks checkpoint deserialization."""
+
+    loader_called = False
+
+    def forbidden_load(*args: object, **kwargs: object) -> object:
+        """Record and reject any attempted checkpoint load."""
+
+        nonlocal loader_called
+        loader_called = True
+        raise AssertionError("checkpoint loader must not run")
+
+    monkeypatch.setattr(workflows, "load_checkpoint", forbidden_load)
+    with pytest.raises(SystemExit, match="2"):
+        workflows.evaluate_sequence_main(
+            [
+                str(tmp_path / "untrusted.pt"),
+                "--config",
+                str(ROOT / "tests/fixtures/tiny_finetune.yaml"),
+                "--override",
+                "model.use_cls_token=true",
+                "--override",
+                "model.classification_head=cls",
+            ]
+        )
+
+    assert loader_called is False
+    error = capsys.readouterr().err
+    assert "--trust-checkpoint" in error
+    assert "pickle" in error
+    assert "does not make pickle safe" in error
 
 
 def test_sequence_evaluator_reports_real_metrics_and_preserves_checkpoint(
@@ -244,6 +282,40 @@ def test_sequence_evaluator_checks_semantic_config_and_model_state(
     assert "strict model-state load failed" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "failure_type",
+    (RuntimeError, TypeError, AttributeError, ValueError, KeyError),
+)
+def test_sequence_evaluator_normalizes_strict_load_validation_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_type: type[Exception],
+) -> None:
+    """Strict-load validation failures become actionable CLI errors."""
+
+    data_dir = _sequence_data(tmp_path)
+    checkpoint = _sequence_checkpoint(tmp_path)
+
+    def reject_state(*args: object, **kwargs: object) -> object:
+        """Raise the selected malformed-state validation error."""
+
+        raise failure_type("malformed model-state value")
+
+    monkeypatch.setattr(
+        Animal2VecFineTuningModel,
+        "load_state_dict",
+        reject_state,
+    )
+    with pytest.raises(SystemExit, match="2"):
+        workflows.evaluate_sequence_main(
+            _arguments(checkpoint, data_dir, threshold=0.4)
+        )
+    error = capsys.readouterr().err
+    assert "strict model-state load failed for sequence evaluation" in error
+    assert "malformed model-state value" in error
+
+
 def test_sequence_evaluator_requires_stored_pretraining_config(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -275,6 +347,7 @@ def test_sequence_evaluator_rejects_unknown_override(
         workflows.evaluate_sequence_main(
             [
                 str(checkpoint),
+                "--trust-checkpoint",
                 "--config",
                 str(ROOT / "tests/fixtures/tiny_finetune.yaml"),
                 "--override",

@@ -531,11 +531,16 @@ Evaluate its validation manifest on one device:
 ```bash
 a2v2-evaluate-sequence \
   /checkpoints/modern-finetune/checkpoint_last.pt \
+  --trust-checkpoint \
   --config configs/modern/rope_cls_geglu_finetune.yaml \
   --override task.data=/datasets/MeerKAT/manifests \
   --override dataset.valid_subset=valid_0 \
   --device cuda
 ```
+
+PyTorch writes native `.pt` checkpoints in a pickle-backed format.
+`--trust-checkpoint` permits deserialization. Pass it for a checkpoint from
+a source you trust. The flag does not make pickle safe.
 
 The evaluator restores the encoder architecture from the checkpoint's
 pretraining config, uses a strict model-state load, and prints sequence

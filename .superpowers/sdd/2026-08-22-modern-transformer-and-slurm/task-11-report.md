@@ -375,3 +375,148 @@ The real-site gate remains unrun. This round executes no SLURM allocation,
 `srun` GPU evaluation, paper-scale training, or scheduler requeue test. A
 target site still must complete the one-node parity gate and the two-node
 acceptance matrix in `docs/slurm.md`.
+
+## Fix Round 2
+
+### Scope and default-deny trust contract
+
+Fix Round 2 changes:
+
+- `a2v2/workflows.py`;
+- `tests/integration/test_sequence_evaluation.py`;
+- `tests/unit/test_documentation.py`;
+- `README.md`;
+- `docs/slurm.md`;
+- `docs/code-guide.md`; and
+- this report.
+
+The public evaluator requires `--trust-checkpoint`. Argument parsing
+finishes before the trust gate, and the gate runs before config or checkpoint
+loading. Without the flag, the command returns exit 2 and names the
+pickle-backed format. It tells the caller to use a file from a source they
+trust and states that the flag does not make pickle safe.
+
+The trust acknowledgement permits the existing native checkpoint loader to
+deserialize a full pickle-backed `.pt` file. It does not inspect, sanitize,
+isolate, or make pickle safe.
+
+### RED evidence
+
+The first trust-gate test replaced `workflows.load_checkpoint` with a sentinel
+that raises on any call. The unflagged CLI reached that sentinel, while the
+flagged metric test failed because the parser did not know the new option:
+
+```text
+rtk proxy pytest -q tests/integration/test_sequence_evaluation.py::test_sequence_evaluator_refuses_untrusted_checkpoint_before_loading tests/integration/test_sequence_evaluation.py::test_sequence_evaluator_reports_real_metrics_and_preserves_checkpoint
+test_sequence_evaluator_refuses_untrusted_checkpoint_before_loading
+AssertionError: checkpoint loader must not run
+test_sequence_evaluator_reports_real_metrics_and_preserves_checkpoint
+error: unrecognized arguments: --trust-checkpoint
+2 failed
+```
+
+The strict-load normalization table then exposed raw exceptions and one
+inconsistent value-error message:
+
+```text
+rtk proxy pytest -q tests/integration/test_sequence_evaluation.py::test_sequence_evaluator_normalizes_strict_load_validation_errors
+TypeError: malformed model-state value
+AttributeError: malformed model-state value
+pytest: error: malformed model-state value
+3 failed, 1 passed
+```
+
+The initial documentation gate found commands without the trust flag and no
+explicit evaluator-path distinction:
+
+```text
+rtk proxy pytest -q tests/unit/test_documentation.py::test_documented_slurm_help_dry_run_and_shell_syntax_execute tests/unit/test_documentation.py::test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths
+assert "does not make pickle safe" in sequence_help.stdout
+assert all("--trust-checkpoint" in fence for fence in readme_commands)
+2 failed
+```
+
+The help assertion failed because argparse wrapped the phrase across output
+lines. The corrected test normalizes whitespace and checks the rendered help
+text without changing the CLI contract.
+
+### Implementation and tests
+
+`build_sequence_evaluation_parser` defines the required acknowledgement.
+`evaluate_sequence_main` rejects an absent flag before it calls
+`load_config` or `_load_sequence_evaluation_checkpoint`. The sentinel test
+asserts that the checkpoint loader receives no call.
+
+The successful evaluator tests pass `--trust-checkpoint`. The existing
+two-example WAV/HDF5 test checks JSON metrics at thresholds 0.6 and 0.4,
+world-size independence, overrides, and checkpoint byte preservation.
+
+The strict model-state boundary catches `RuntimeError`, `TypeError`,
+`AttributeError`, `ValueError`, and `KeyError` from
+`load_state_dict(strict=True)`. It wraps each case in `CheckpointError`
+with the `strict model-state load failed for sequence evaluation` prefix.
+The CLI converts that error to exit 2 with no raw traceback.
+
+`README.md` and both sequence-evaluation commands in `docs/slurm.md`
+include `--trust-checkpoint`. Both guides call native `.pt` files
+pickle-backed, require a source the caller trusts, and state that the flag does
+not make pickle safe.
+
+The SLURM command surface identifies the `evaluate` phase as the legacy
+SLURM phase evaluator. That path does not load a pretraining config. The modern
+sequence evaluator restores the stored pretraining config from its native
+checkpoint. The installed-command table in `docs/code-guide.md` maps
+`a2v2-evaluate-sequence` to `evaluate_sequence_main`.
+
+### GREEN evidence and controls
+
+The focused evaluator and documentation suites returned:
+
+```text
+rtk pytest -q tests/integration/test_sequence_evaluation.py tests/unit/test_documentation.py
+33 passed
+```
+
+The full explicit CPU suite returned:
+
+```text
+rtk pytest -q tests/unit tests/integration
+526 passed
+```
+
+These commands exited 0:
+
+```text
+rtk python -m compileall -q a2v2 scripts tests
+rtk bash -n scripts/reproduce_meerkat_slurm.sh
+rtk bash -n scripts/a2v2_slurm_node.sh
+rtk git diff --check
+```
+
+The frozen published-recipe and local-driver test returned:
+
+```text
+rtk pytest -q tests/unit/test_config.py::test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes
+1 passed
+```
+
+The installed help command returned exit 0 and showed
+`--trust-checkpoint`, `pickle-backed`, and
+`does not make pickle safe`. An unflagged call against the nonexistent
+`/tmp/a2v2-untrusted-do-not-create.pt` returned exit 2 with the trust error.
+Because the path did not exist, the public console reached no file-open error
+before the trust gate.
+
+### Prose, commit, and site status
+
+The stop-slop review covered every Round 2 prose line. The new prose contains
+no em dash, canned contrast, vague safety claim, or unqualified performance
+claim.
+
+Commit status: the Fix Round 2 commit includes this report. The parent handoff
+supplies its hash because a commit cannot contain its own hash.
+
+The real-site gate remains unrun. This round launches no SLURM allocation,
+`srun` GPU evaluation, paper-scale training, or scheduler requeue test. A
+target site must complete the one-node parity gate and two-node
+acceptance matrix in `docs/slurm.md`.

@@ -2876,6 +2876,14 @@ def build_sequence_evaluation_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument(
+        "--trust-checkpoint",
+        action="store_true",
+        help=(
+            "permit pickle-backed native checkpoint deserialization for a "
+            "file from a trusted source; this flag does not make pickle safe"
+        ),
+    )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(
         "--override",
@@ -2976,7 +2984,7 @@ def _load_sequence_evaluation_checkpoint(
         raise CheckpointError("checkpoint model state must be a mapping")
     try:
         model.load_state_dict(model_state, strict=True)
-    except RuntimeError as exc:
+    except (RuntimeError, TypeError, AttributeError, ValueError, KeyError) as exc:
         raise CheckpointError(
             f"strict model-state load failed for sequence evaluation: {exc}"
         ) from exc
@@ -2988,6 +2996,12 @@ def evaluate_sequence_main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_sequence_evaluation_parser()
     arguments = parser.parse_args(argv)
+    if not arguments.trust_checkpoint:
+        parser.error(
+            "native .pt checkpoints are pickle-backed; pass "
+            "--trust-checkpoint for a file from a source you trust. "
+            "The flag does not make pickle safe"
+        )
     try:
         config = load_config(arguments.config, arguments.override)
         if config.stage != "finetune":

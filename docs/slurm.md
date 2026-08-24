@@ -52,7 +52,9 @@ bash scripts/a2v2_slurm_node.sh pretrain --help
 
 The orchestrator accepts `pretrain`, `finetune`, `evaluate`, and `all`.
 It selects inputs by phase. Standalone pretraining does not load fine-tuning
-inputs. Fine-tuning and evaluation do not load the pretraining config.
+inputs. Fine-tuning does not load the pretraining YAML. The legacy SLURM phase
+evaluator does not load a pretraining config. The modern sequence evaluator
+restores the stored pretraining config from its native checkpoint.
 
 ### Pretrain
 
@@ -101,6 +103,7 @@ resulting native fine-tuning checkpoint on one device:
 ```bash
 a2v2-evaluate-sequence \
   /shared/runs/modern-cls/finetune/checkpoint_last.pt \
+  --trust-checkpoint \
   --config configs/modern/rope_cls_geglu_finetune.yaml \
   --override task.data=/datasets/MeerKAT/manifests \
   --override dataset.valid_subset=valid_0 \
@@ -113,11 +116,16 @@ Use one SLURM task and one GPU for the same command inside an allocation:
 srun --nodes=1 --ntasks=1 --gpus=1 \
   a2v2-evaluate-sequence \
   /shared/runs/modern-cls/finetune/checkpoint_last.pt \
+  --trust-checkpoint \
   --config configs/modern/rope_cls_geglu_finetune.yaml \
   --override task.data=/datasets/MeerKAT/manifests \
   --override dataset.valid_subset=valid_0 \
   --device cuda
 ```
+
+PyTorch writes native `.pt` checkpoints in a pickle-backed format.
+`--trust-checkpoint` permits deserialization. Pass it for a checkpoint from
+a source you trust. The flag does not make pickle safe.
 
 The command requires a strict fine-tuning config with
 `model.classification_head=cls`. It restores encoder construction from the
