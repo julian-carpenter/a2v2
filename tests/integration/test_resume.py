@@ -713,13 +713,6 @@ def test_resume_compatibility_rejects_every_mathematical_state_mismatch() -> Non
                 min_loss_scale=config.common.min_loss_scale + 1,
             ),
         ),
-        "criterion.focal_gamma": replace(
-            config,
-            criterion=replace(
-                config.criterion,
-                focal_gamma=config.criterion.focal_gamma + 1,
-            ),
-        ),
         "checkpoint.best_checkpoint_metric": replace(
             config,
             checkpoint=replace(
@@ -743,6 +736,54 @@ def test_resume_fingerprint_records_exact_best_metric_direction() -> None:
     assert fingerprint is not None
     assert fingerprint["checkpoint.best_checkpoint_metric"] == "loss"
     assert fingerprint["checkpoint.best_checkpoint_metric_mode"] == "minimize"
+
+
+def test_resume_fingerprint_binds_criterion_only_when_loss_uses_it() -> None:
+    """Allow inactive pretraining focal settings but bind fine-tuning loss fields."""
+
+    pretrain = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    finetune = load_config(Path("tests/fixtures/tiny_finetune.yaml"))
+    pretrain_fingerprint = training.resume_compatibility_fingerprint(
+        config_to_dict(pretrain)
+    )
+    finetune_fingerprint = training.resume_compatibility_fingerprint(
+        config_to_dict(finetune)
+    )
+
+    assert pretrain_fingerprint is not None
+    assert finetune_fingerprint is not None
+    assert "criterion.focal_gamma" not in pretrain_fingerprint
+    assert (
+        finetune_fingerprint["criterion.focal_gamma"]
+        == finetune.criterion.focal_gamma
+    )
+
+
+def test_strict_pretrain_resume_ignores_criterion_from_earlier_v2_fingerprint() -> None:
+    """Keep strict pretraining resumes compatible with now-inactive saved loss fields."""
+
+    base = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    strict = replace(
+        base,
+        checkpoint=replace(base.checkpoint, resume_policy="strict"),
+    )
+    training_data = {"schema": "a2v2.training-data.v2", "sentinel": "same"}
+    saved = training.resume_compatibility_fingerprint(
+        config_to_dict(strict),
+        training_data=training_data,
+    )
+    assert saved is not None
+    saved["criterion.focal_gamma"] = strict.criterion.focal_gamma + 1
+    checkpoint = {
+        "config": {"active": config_to_dict(strict)},
+        "resume_compatibility": saved,
+    }
+
+    workflows._validate_resume_compatibility(
+        strict,
+        checkpoint,
+        training_data=training_data,
+    )
 
 
 def test_strict_resume_fingerprint_binds_ordered_task_and_manifest_semantics(
@@ -900,16 +941,6 @@ def test_training_data_provenance_binds_filtered_record_identity(
             ),
         ),
         (
-            "criterion.focal_gamma",
-            lambda config: replace(
-                config,
-                criterion=replace(
-                    config.criterion,
-                    focal_gamma=config.criterion.focal_gamma + 1,
-                ),
-            ),
-        ),
-        (
             "common.fp16",
             lambda config: replace(
                 config,
@@ -1015,6 +1046,76 @@ def test_strict_resume_rejects_mismatch_before_model_construction(
     assert checkpoint == pristine_checkpoint
 
 
+def test_strict_finetune_resume_rejects_focal_mismatch_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject changed fine-tuning loss semantics before creating the classifier."""
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    (manifests / "train.tsv").write_text(
+        "/audio\na.wav\t64\n", encoding="utf-8"
+    )
+    saved_config = load_config(
+        Path("tests/fixtures/tiny_finetune.yaml"),
+        overrides=(
+            f"task.data={manifests}",
+            "checkpoint.resume_policy=strict",
+        ),
+    )
+
+    class DatasetSentinel:
+        """Expose the immutable population used by fine-tuning preflight."""
+
+        sizes = (64,)
+
+        def __len__(self) -> int:
+            return 1
+
+    dataset = DatasetSentinel()
+    provenance = workflows._training_data_resume_provenance(saved_config, dataset)
+    checkpoint = {
+        "config": {"active": config_to_dict(saved_config)},
+        "resume_compatibility": training.resume_compatibility_fingerprint(
+            config_to_dict(saved_config), training_data=provenance
+        ),
+        "topology": None,
+        "sampler_state": None,
+    }
+    pristine_checkpoint = deepcopy(checkpoint)
+    active = replace(
+        saved_config,
+        criterion=replace(
+            saved_config.criterion,
+            focal_gamma=saved_config.criterion.focal_gamma + 1,
+        ),
+    )
+    monkeypatch.setattr(
+        workflows,
+        "_distributed_device",
+        lambda *_: (torch.device("cpu"), 0, 1, False),
+    )
+    monkeypatch.setattr(workflows, "_make_dataset", lambda *_: dataset)
+    monkeypatch.setattr(workflows, "load_checkpoint", lambda *_args, **_kwargs: checkpoint)
+    monkeypatch.setattr(
+        workflows,
+        "_make_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("model construction must not run")
+        ),
+    )
+
+    with pytest.raises(training.CheckpointError, match=r"criterion\.focal_gamma"):
+        workflows._run_training(
+            active,
+            device_name="cpu",
+            resume_path=tmp_path / "resume.pt",
+            pretrained_checkpoint=None,
+        )
+    assert checkpoint == pristine_checkpoint
+
+
 @pytest.mark.parametrize("num_workers", (0, 3))
 def test_legacy_random_crop_resume_policy_scans_full_epoch_and_ignores_workers(
     num_workers: int,
@@ -1049,13 +1150,20 @@ def test_legacy_random_crop_resume_policy_scans_full_epoch_and_ignores_workers(
         workflows._validate_crop_resume_policy(strict, dataset, sampler)
 
 
-def test_old_checkpoint_provenance_warns_in_compatible_and_rejects_in_strict() -> None:
-    """Keep old checkpoints usable without presenting their data path as exact."""
+@pytest.mark.parametrize("legacy_kind", ("missing", "v1"))
+def test_old_checkpoint_provenance_warns_in_compatible_and_rejects_in_strict(
+    legacy_kind: str,
+) -> None:
+    """Keep missing and v1 provenance usable without presenting either as exact."""
 
     compatible = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    saved = training.resume_compatibility_fingerprint(config_to_dict(compatible))
+    assert saved is not None
+    if legacy_kind == "v1":
+        saved["training_data.schema"] = "a2v2.training-data.v1"
     checkpoint = {
         "config": {"active": config_to_dict(compatible)},
-        "resume_compatibility": None,
+        "resume_compatibility": None if legacy_kind == "missing" else saved,
     }
     with pytest.warns(
         RuntimeWarning,

@@ -333,7 +333,11 @@ def resume_compatibility_fingerprint(
         add_leaf("optimizer", active_config["optimizer"])
         add_leaf("scheduler", active_config["scheduler"])
         add_leaf("optimization", active_config["optimization"])
-        add_leaf("criterion", active_config["criterion"])
+        stage = active_config["stage"]
+        if stage == "finetune":
+            add_leaf("criterion", active_config["criterion"])
+        elif stage != "pretrain":
+            return None
         add_leaf("task", active_config["task"])
         dataset = active_config["dataset"]
         if not isinstance(dataset, Mapping):

@@ -20,16 +20,25 @@ def main() -> int:
     output_directory = Path(sys.argv[3])
     mode = sys.argv[4]
     marker_directory = Path(sys.argv[5])
+    first_pretrained = None if sys.argv[6] == "-" else Path(sys.argv[6])
+    second_pretrained = None if sys.argv[7] == "-" else Path(sys.argv[7])
     rank = int(os.environ["RANK"])
     data = first_data if rank == 0 else second_data
+    fine_tuning = mode.startswith("pretrained-")
+    requested_world_size = 1 if mode == "requested-world-size" and rank == 1 else 2
     config = load_config(
-        Path(__file__).parents[2] / "configs/cpu_smoke_pretraining.yaml",
+        Path(__file__).parents[2]
+        / (
+            "configs/cpu_smoke_finetuning.yaml"
+            if fine_tuning
+            else "configs/cpu_smoke_pretraining.yaml"
+        ),
         overrides=(
             f"task.data={data}",
             f"checkpoint.save_dir={output_directory}",
             "checkpoint.resume_policy=strict",
             "dataset.crop_strategy=stateless",
-            "distributed_training.distributed_world_size=2",
+            f"distributed_training.distributed_world_size={requested_world_size}",
             "distributed_training.ddp_backend=gloo",
             "optimization.max_update=1",
         ),
@@ -44,14 +53,18 @@ def main() -> int:
         )
         raise AssertionError("model construction crossed distributed preflight")
 
-    workflows._make_model = forbidden_model  # type: ignore[assignment]
+    if fine_tuning:
+        workflows.Animal2VecFineTuningModel.from_config = forbidden_model  # type: ignore[method-assign]
+    else:
+        workflows._make_model = forbidden_model  # type: ignore[assignment]
+    pretrained = first_pretrained if rank == 0 else second_pretrained
     error = ""
     try:
         workflows._run_training(
             config,
             device_name="cpu",
             resume_path=None,
-            pretrained_checkpoint=None,
+            pretrained_checkpoint=pretrained,
         )
     except Exception as caught:
         error = f"{type(caught).__name__}: {caught}"
@@ -66,6 +79,17 @@ def main() -> int:
         expected = "distributed training preflight failed on rank 1: ManifestError"
     elif mode == "fingerprint-mismatch":
         expected = "distributed training preflight fingerprint mismatch"
+    elif mode in {
+        "pretrained-missing",
+        "pretrained-corrupt",
+        "pretrained-config",
+        "pretrained-state",
+    }:
+        expected = "distributed training preflight failed on rank 1"
+    elif mode == "pretrained-identity":
+        expected = "distributed training preflight fingerprint mismatch"
+    elif mode == "requested-world-size":
+        expected = "distributed training preflight failed on rank 1: ValueError"
     else:
         raise AssertionError(f"unknown preflight test mode {mode!r}")
     if expected not in error:

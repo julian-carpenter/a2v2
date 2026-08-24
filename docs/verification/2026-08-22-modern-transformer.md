@@ -16,17 +16,26 @@ A later whole-change review disproved the report's broad multiworker
 exact-resume claim. The original integration input used equal lengths and did
 not execute random cropping. Fix Round 1 added strict, versioned data
 provenance and stateless crop coordinates, then reran variable-length resume in
-fresh processes and on two local Gloo ranks. Exact data-path resume now means
+fresh processes and on two local Gloo ranks. Exact data-path resume requires
 `dataset.crop_strategy=stateless` together with
 `checkpoint.resume_policy=strict`. Frozen legacy recipes remain compatible,
 but their legacy random-crop resume is not bit-exact.
 
 In Fix Round 2, we tightened the strict contract after a scoped review. New
-checkpoints carry `a2v2.training-data.v2`: full loss, effective AMP/scaler,
-best-metric, retained-record, manifest, sampler, and task semantics. Legacy
-crop safety scans the complete repeating epoch without consulting worker
-count. Distributed ranks exchange preflight errors and active fingerprints
-before any rank constructs a model.
+checkpoints carry `a2v2.training-data.v2`: the fine-tuning criterion,
+effective AMP/scaler policy, best-metric, retained-record, manifest, sampler,
+and task semantics. Legacy crop safety scans the complete repeating epoch
+without consulting worker count. Distributed ranks exchange preflight errors
+and active fingerprints before any rank constructs a model.
+
+Fix Round 3 moved fresh fine-tuning checkpoint reads and requested-world-size
+checks into that coordinated preflight. Each rank hashes and loads the external
+checkpoint once, validates its config and student tensor container, then
+exchanges the file identity before model construction. The exact encoder
+key-and-shape check requires an `AudioEncoder`; the workflow performs it
+after the shared preflight and before DDP wrapping. A two-rank NCCL workflow
+test at the Round 3 head covers training, resume, and a canonical asymmetric
+preflight failure.
 
 This verification did not run the paper-scale reproduction or a SLURM
 allocation. It does not validate a site filesystem, scheduler, requeue policy,
@@ -53,6 +62,11 @@ or multi-node transport.
 - Before the Round 2 commit, `main...origin/main [ahead 27]` had nine modified
   tracked files and one new Gloo worker file. The containing commit makes the
   branch 28 commits ahead of `origin/main`.
+- Fix Round 3 starts from
+  `6031b73d6e96960edc6f7c78293d48a1c448bc57`. Before its containing commit,
+  `main...origin/main [ahead 28]` had six modified tracked files, this report,
+  and one new NCCL workflow file. The containing commit makes the branch 29
+  commits ahead of `origin/main`.
 
 ## Host and package state
 
@@ -83,7 +97,7 @@ Outcome: bitsandbytes 0.49.2, `compiled_with_cuda=True`, native library
 `libbitsandbytes_cuda130.so`. The CUDA 13.3 wheel gap is host compatibility
 evidence, not a product failure. A source build with CUDA 13.3 remains unrun.
 
-The first `pip check` also found that the preinstalled audiomentations 0.41.0
+The first `pip check` found that the preinstalled audiomentations 0.41.0
 lacked librosa and soxr. An unpinned repair command selected librosa 1.0.0 and
 soxr 1.1.0, which violated audiomentations' version ranges:
 
@@ -126,10 +140,10 @@ the first state mismatch was `student.alibi_scale`. The root cause was crop
 offset selection from process-local DataLoader worker RNG. Sampler position
 was checkpointed, but worker RNG and prefetch progress were not.
 
-Focused tests also reproduced the other findings before their fixes:
+Focused tests reproduced the other findings before their fixes:
 
 - config tests raised `AttributeError` for the absent crop/resume policies and
-  showed that `optimizer.min_8bit_size=0` loaded successfully;
+  showed that `optimizer.min_8bit_size=0` loaded;
 - removing the new divisibility or RoPE even-head config guard made its focused
   rejection test fail; restoring both guards returned the test to GREEN;
 - strict provenance tests failed because no manifest/sampler provenance helper
@@ -162,7 +176,7 @@ torchrun resume. Both comparisons were exact.
 
 Round 1 bound the full task, ordered labels, dataset mathematics and batching,
 resolved selected-manifest path and bytes, filtered population, and ordered
-sizes. It still omitted loss, AMP/scaler, tracked-metric, and retained-record
+sizes. It omitted loss, AMP/scaler, tracked-metric, and retained-record
 identity fields. Fix Round 2 closes those gaps below. `num_workers`, logging,
 and compile settings remain execution fields.
 
@@ -183,7 +197,7 @@ launcher identity. The earlier bounded CUDA, Flash, compile, AdaGC,
 bitsandbytes, and NCCL evidence remains recorded above; this fix round makes no
 new hardware claim.
 
-Post-fix source and package checks also exited 0:
+Post-fix source and package checks exited 0:
 
 ```text
 rtk python -m compileall -q a2v2 tests
@@ -269,18 +283,21 @@ move/compile/optimizer/DDP order. The rerun passed all 77 cases.
 The v2 retained-record digest encodes each filtered row's original manifest
 index and line, resolved audio path, and selected size in sampler order. The
 regression constructs the same manifest bytes and equal sizes twice, retaining
-rows `[0, 1]` and `[1, 2]`; the digests differ. Full criterion and effective
-`common.fp16`, `fp16_init_scale`, and `min_loss_scale` fields now enter the
-resume fingerprint. The tracked metric contributes its configured identity
-and the same derived `minimize` or `maximize` mode used by best-checkpoint
-selection. The allowed `max_update` extension remains excluded.
+rows `[0, 1]` and `[1, 2]`; the digests differ. The full criterion enters the
+fingerprint for fine-tuning, the stage where focal fields affect loss.
+Pretraining fingerprints omit those inactive fields, including when they read
+a v2 checkpoint written before this scope correction. Effective
+`common.fp16`, `fp16_init_scale`, and `min_loss_scale` fields enter both stage
+fingerprints. The tracked metric contributes its configured identity and the
+derived `minimize` or `maximize` mode used by best-checkpoint selection. The
+allowed `max_update` extension remains excluded.
 
 Strict resume requires v2 provenance. Compatible policy validates the fields
 available in older checkpoints and emits a warning. If any batch in the full
 sampler epoch can crop, compatible legacy mode warns for any worker count and
 strict mode requires stateless coordinates.
 
-For `world_size>1`, each rank now completes dataset construction, checkpoint
+For `world_size>1`, each rank completes dataset construction, checkpoint
 read, provenance validation, and topology validation inside a local preflight.
 Ranks exchange status and full active fingerprints over the Gloo control
 group. A local failure produces the lowest-rank canonical error on each rank;
@@ -318,8 +335,125 @@ four workers per node, world size 8, separate pretraining and fine-tuning
 contracts, checkpoint validation, and one-GPU evaluation. It requested no
 SLURM allocation.
 
-Fix Round 2 changed no CUDA execution path, so it ran no CUDA command. The
-original bounded GPU evidence remains scoped to the earlier revision.
+Fix Round 2 changed NCCL startup ordering: CUDA training creates the Gloo
+control group before distributed preflight. Round 2 ran no CUDA command, so
+its report did not verify that ordering. Fix Round 3 supplies the
+workflow-level NCCL result below. The earlier Flash, compile, inference, and
+bitsandbytes evidence remains scoped to the original Task 12 revision.
+
+## Fix Round 3: pretrained and launch preflight
+
+### RED evidence
+
+The scoped review found three pre-model gaps. Fresh fine-tuning ranks loaded
+their external pretraining checkpoints after the shared preflight. A rank with
+`distributed_world_size=1` destroyed its default group before another
+rank reached the same check. Pretraining fingerprints bound focal-loss
+settings that pretraining never reads.
+
+The criterion RED command produced one failure and three passing policy
+controls:
+
+```text
+rtk python -m pytest -q tests/integration/test_resume.py -k 'fingerprint_binds_criterion_only or strict_finetune_resume_rejects_focal or old_checkpoint_provenance'
+```
+
+`criterion.focal_gamma` remained in the pretraining fingerprint. The direct
+missing-provenance and `a2v2.training-data.v1` compatible-warning and
+strict-rejection controls passed.
+
+Two distributed RED commands reproduced the rank divergence:
+
+```text
+rtk python -m pytest -q tests/integration/test_cli.py -k 'two_rank_gloo_preflight_rejects_different_pretrained_identities or two_rank_gloo_preflight_coordinates_divergent_requested_world_size'
+rtk python -m pytest -q tests/integration/test_cli.py -k 'two_rank_gloo_preflight_coordinates_fresh_pretrained_failures and pretrained-missing'
+```
+
+The first command failed both selected tests. Distinct valid checkpoints
+reached the fine-tuning model sentinel. In the world-size case, rank 1
+destroyed the default group and rank 0 reported a Gloo connection close. The
+second command failed because rank 0 reached model construction while rank 1
+reported the missing file, leaving different terminal errors.
+
+### GREEN evidence
+
+Fresh fine-tuning resolves the command-line checkpoint or `model.w2v_path`
+inside local preflight. The loader resolves the path, streams a SHA-256 digest,
+records byte size, checks device/inode/size/mtime around hashing and loading,
+and loads the checkpoint once onto CPU. It validates the pretraining stage,
+serialized config, model mapping, student keys, and tensor values. The
+preflight returns that bundle to `_make_model`, so model construction performs
+no second checkpoint read.
+
+Ranks gather the resume fingerprint and external file identity over the Gloo
+control group. The lowest-rank local error wins. Successful ranks with
+different identities receive one fingerprint-mismatch error. Tests cover
+missing, corrupt, invalid-config, empty-student-state, and distinct valid
+checkpoint files. A real single-rank fine-tuning test records one checkpoint
+read. Requested-world-size validation runs inside the same collective
+preflight. The sequence evaluator keeps its separate checkpoint path and its
+integration tests passed.
+
+The affected tests passed:
+
+| Command | Outcome |
+| --- | --- |
+| `rtk python -m pytest -q tests/integration/test_resume.py -k 'fingerprint_binds_criterion_only or strict_finetune_resume_rejects_focal or old_checkpoint_provenance or resume_compatibility_rejects_every'` | 5 passed, one expected compatible-policy warning |
+| `rtk python -m pytest -q tests/integration/test_cli.py -k 'two_rank_gloo_preflight'` | 8 passed |
+| `rtk python -m pytest -q tests/integration/test_cli.py -k 'fresh_finetune_consumes_one_preflight_loaded_checkpoint'` | 1 passed |
+| `rtk python -m pytest -q tests/integration/test_resume.py tests/integration/test_cli.py tests/integration/test_sequence_evaluation.py` | Exit 0 |
+
+The first full CPU run found two test-only failures. The construction-order
+fixture lacked the new `pretrained_bundle` field, and two nested test helpers
+lacked docstrings required by the repository documentation test. The focused
+rerun passed 24 tests. The final command exited 0 with 556 collected tests and
+12 warnings:
+
+```text
+rtk python -m pytest -q tests/unit tests/integration
+```
+
+Eight warnings came from Python 3.12 `fork()` calls in multiworker integration
+processes. Four tests emitted the expected compatible-policy warning for
+checkpoints without v2 data provenance.
+
+The Round 3 static, package, frozen-control, and dry-run checks passed:
+
+```text
+rtk python -m compileall -q a2v2 tests
+rtk python -m pip check
+rtk git diff --check
+rtk bash -n scripts/reproduce_meerkat_slurm.sh scripts/a2v2_slurm_node.sh
+rtk python -m pytest -q tests/unit/test_config.py tests/unit/test_model_state_contract.py tests/integration/test_recipe_configs.py tests/integration/test_reproduction_driver.py
+rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/runs/meerkat --phase all --nodes 2 --gpus-per-node 4 --job-id dryrun-4815 --dry-run
+```
+
+`pip check` printed `No broken requirements found.` The frozen command passed
+79 tests in 23.23 s. The recipe, driver, and state-signature hashes remained
+equal to the values below. The dry run rendered the unchanged two-node,
+eight-worker phase graph and requested no allocation.
+
+All eight A100s reported 0 MiB used and 0% utilization before this bounded
+two-rank command:
+
+```text
+rtk env CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc-per-node=2 tests/gpu/nccl_workflow_resume.py /tmp/a2v2-round3-nccl.3Iga27
+```
+
+The command exited 0 in 17.6 s. Both ranks trained to update 1 and resumed to
+update 2. The third startup supplied `distributed_world_size=1` on rank 1 and
+2 on rank 0. Both ranks received
+`distributed training preflight failed on rank 1: ValueError`; no model marker
+existed. The two update losses were `2.7812186754666843` and
+`2.5518138592059794`, with sample size 52. Each rank reserved 23,068,672 CUDA
+bytes. Peak allocated memory was 17,502,720 bytes on rank 0 and 17,511,936 on
+rank 1 for update 1, then 17,712,128 and 17,700,864 bytes for update 2.
+
+PyTorch warned that the harness inferred NCCL barrier device IDs and that the
+tiny update found no unused DDP parameter despite
+`find_unused_parameters=true`. The command used one process per visible GPU,
+so the inferred mapping matched this local launch. This test did not exercise
+multi-node rank mapping.
 
 ## Frozen reproduction control
 
@@ -505,17 +639,17 @@ rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/
 All commands exited 0. The dry run rendered one `srun` task per node, four
 torchrun workers per node, world size 8, distinct pretrain and fine-tune run
 contracts, checkpoint validation between stages, and one-node/one-GPU final
-evaluation. The CPU suite also ran the mocked launcher, lock, contract,
+evaluation. The CPU suite ran the mocked launcher, lock, contract,
 preemption, and frozen-driver tests.
 
 ## Requirements review
 
 | Gate | Evidence | Result |
 | --- | --- | --- |
-| Gate 0 frozen control | Fresh 546-test CPU suite, 79 focused controls, frozen hashes and state signatures above | Pass |
+| Gate 0 frozen control | Fresh 556-test CPU suite, 79 focused controls, frozen hashes and state signatures above | Pass |
 | Gate 1 component units | Full unit suite plus 12 CUDA component tests | Pass |
-| Gate 2 CPU integration | Full integration suite, fresh-process variable-crop resume, and explicit two-rank Gloo selection | Pass |
-| Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank NCCL resume | Pass on this host |
+| Gate 2 CPU integration | Full integration suite, fresh-process variable-crop resume, and eight two-rank Gloo preflight cases | Pass |
+| Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank engine resume, and 2-rank workflow resume/preflight | Pass on this host |
 | Gate 4 SLURM acceptance | Real allocation and site-dependent checks | UNRUN |
 
 The legacy contract kept the checked-in recipes and paper driver hashes, the

@@ -18,7 +18,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 import a2v2.workflows as workflows
 from a2v2.workflows import train_main
-from a2v2.training import load_checkpoint
+from a2v2.training import load_checkpoint, save_checkpoint
 
 
 ROOT = Path(__file__).parents[2]
@@ -237,6 +237,25 @@ def _data(tmp_path: Path, lengths: tuple[int, ...] = (64, 72, 80)) -> Path:
     return manifests
 
 
+@pytest.fixture(scope="module")
+def preflight_pretrained_checkpoint(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, Path]:
+    """Build one real native pretraining checkpoint for distributed preflight."""
+
+    root = tmp_path_factory.mktemp("preflight-pretrained")
+    manifests = _data(root)
+    output = root / "checkpoint"
+    assert train_main([
+        "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
+        "--override", f"task.data={manifests}",
+        "--override", f"checkpoint.save_dir={output}",
+        "--max-updates", "1",
+        "--device", "cpu",
+    ]) == 0
+    return manifests, output / "checkpoint_last.pt"
+
+
 def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path, capsys) -> None:
     """Check cli pretrain resume and finetune flow."""
     manifests = _data(tmp_path)
@@ -307,6 +326,35 @@ def test_cli_pretrain_resume_and_finetune_flow(tmp_path: Path, capsys) -> None:
         "validation/valid/segmented/average_precision/call",
     } <= set(finetuning_tags["scalars"])
     assert "validation/valid/segmented/pr_micro" in finetuning_tags["tensors"]
+
+
+def test_fresh_finetune_consumes_one_preflight_loaded_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    preflight_pretrained_checkpoint: tuple[Path, Path],
+) -> None:
+    """Load pretrained bytes once in preflight and reuse the validated bundle."""
+
+    manifests, pretrained_checkpoint = preflight_pretrained_checkpoint
+    loaded_paths: list[Path] = []
+
+    def tracked_load(path: str | Path, **kwargs: object) -> dict[str, Any]:
+        """Record each workflow checkpoint read while delegating real loading."""
+
+        loaded_paths.append(Path(path).resolve())
+        return load_checkpoint(path, **kwargs)
+
+    monkeypatch.setattr(workflows, "load_checkpoint", tracked_load)
+    assert train_main([
+        "--config", str(ROOT / "configs/cpu_smoke_finetuning.yaml"),
+        "--override", f"task.data={manifests}",
+        "--override", f"checkpoint.save_dir={tmp_path / 'finetune'}",
+        "--pretrained-checkpoint", str(pretrained_checkpoint),
+        "--max-updates", "1",
+        "--device", "cpu",
+    ]) == 0
+
+    assert loaded_paths == [pretrained_checkpoint.resolve()]
 
 
 def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Path, capsys) -> None:
@@ -621,6 +669,139 @@ def test_two_rank_gloo_preflight_aborts_before_model_with_one_error(
             str(tmp_path / "output"),
             mode,
             str(marker_directory),
+            "-",
+            "-",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert list(marker_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "pretrained-missing",
+        "pretrained-corrupt",
+        "pretrained-config",
+        "pretrained-state",
+    ),
+)
+def test_two_rank_gloo_preflight_coordinates_fresh_pretrained_failures(
+    tmp_path: Path,
+    preflight_pretrained_checkpoint: tuple[Path, Path],
+    mode: str,
+) -> None:
+    """Make every rank reject one missing, corrupt, or malformed pretrained file."""
+
+    manifests, valid_checkpoint = preflight_pretrained_checkpoint
+    invalid_checkpoint = tmp_path / f"{mode}.pt"
+    if mode == "pretrained-corrupt":
+        invalid_checkpoint.write_bytes(b"not a torch checkpoint")
+    elif mode in {"pretrained-config", "pretrained-state"}:
+        payload = load_checkpoint(valid_checkpoint)
+        if mode == "pretrained-config":
+            payload["config"] = {"active": {"stage": "pretrain"}}
+        else:
+            payload["model"] = {}
+        save_checkpoint(invalid_checkpoint, payload)
+    marker_directory = tmp_path / "markers"
+    marker_directory.mkdir()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(ROOT / "tests/integration/gloo_preflight.py"),
+            str(manifests),
+            str(manifests),
+            str(tmp_path / "output"),
+            mode,
+            str(marker_directory),
+            str(valid_checkpoint),
+            str(invalid_checkpoint),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert list(marker_directory.iterdir()) == []
+
+
+def test_two_rank_gloo_preflight_rejects_different_pretrained_identities(
+    tmp_path: Path,
+    preflight_pretrained_checkpoint: tuple[Path, Path],
+) -> None:
+    """Reject distinct valid pretrained bytes before either rank builds a model."""
+
+    manifests, first_checkpoint = preflight_pretrained_checkpoint
+    second_checkpoint = tmp_path / "second.pt"
+    second_payload = load_checkpoint(first_checkpoint)
+    second_payload["best_metric"] = 0.125
+    save_checkpoint(second_checkpoint, second_payload)
+    marker_directory = tmp_path / "markers"
+    marker_directory.mkdir()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(ROOT / "tests/integration/gloo_preflight.py"),
+            str(manifests),
+            str(manifests),
+            str(tmp_path / "output"),
+            "pretrained-identity",
+            str(marker_directory),
+            str(first_checkpoint),
+            str(second_checkpoint),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert list(marker_directory.iterdir()) == []
+
+
+def test_two_rank_gloo_preflight_coordinates_divergent_requested_world_size(
+    tmp_path: Path,
+) -> None:
+    """Reject rank-divergent launch contracts through the common control group."""
+
+    manifests = _data(tmp_path)
+    marker_directory = tmp_path / "markers"
+    marker_directory.mkdir()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(ROOT / "tests/integration/gloo_preflight.py"),
+            str(manifests),
+            str(manifests),
+            str(tmp_path / "output"),
+            "requested-world-size",
+            str(marker_directory),
+            "-",
+            "-",
         ],
         cwd=ROOT,
         capture_output=True,

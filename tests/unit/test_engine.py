@@ -201,6 +201,7 @@ def test_training_compiles_after_device_move_before_optimizer_and_ddp(
             dataset=dataset,
             sampler=sampler,
             resume_fingerprint={},
+            pretrained_bundle=None,
             topology=None,
             topology_warnings=(),
         ),

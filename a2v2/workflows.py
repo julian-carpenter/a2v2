@@ -1717,6 +1717,8 @@ def _validate_resume_compatibility(
         else set(saved) - {"training_data.schema"}
     )
     for path in all_paths:
+        if config.stage == "pretrain" and path.startswith("criterion."):
+            continue
         if path not in saved or path not in current or saved[path] != current[path]:
             legacy_update_zero_adagc = (
                 path == "optimization.gradient_clip_method"
@@ -1866,59 +1868,178 @@ def _validate_crop_resume_policy(
     warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
-def _load_pretrained(
-    checkpoint_path: Path,
-) -> tuple[Animal2VecConfig, dict[str, Tensor]]:
-    """Load a native pretraining checkpoint and extract its student encoder."""
+@dataclass(frozen=True)
+class _PretrainedBundle:
+    """Validated fine-tuning encoder inputs loaded before model construction."""
 
-    checkpoint = load_checkpoint(checkpoint_path)
+    config: Animal2VecConfig
+    encoder_state: dict[str, Tensor] | None
+    identity: dict[str, object] | None
+
+
+def _checkpoint_file_identity(
+    checkpoint_path: Path,
+) -> tuple[Path, dict[str, object], tuple[int, int, int, int]]:
+    """Hash one stable checkpoint file without retaining a second byte copy."""
+
+    try:
+        resolved = checkpoint_path.expanduser().resolve(strict=True)
+        before = resolved.stat()
+        digest = hashlib.sha256()
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after = resolved.stat()
+    except OSError as error:
+        raise CheckpointError(
+            f"cannot identify pretrained checkpoint {checkpoint_path}: {error}"
+        ) from error
+    before_signature = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_signature = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_signature != after_signature:
+        raise CheckpointError(
+            f"pretrained checkpoint changed while hashing: {resolved}"
+        )
+    return resolved, {
+        "schema": "a2v2.pretrained-checkpoint.v1",
+        "path": str(resolved),
+        "size": before.st_size,
+        "sha256": digest.hexdigest(),
+    }, before_signature
+
+
+def _load_pretrained_bundle(checkpoint_path: Path) -> _PretrainedBundle:
+    """Load and structurally validate one native pretraining checkpoint once."""
+
+    resolved, identity, file_signature = _checkpoint_file_identity(checkpoint_path)
+    checkpoint = load_checkpoint(resolved)
+    try:
+        after_load = resolved.stat()
+    except OSError as error:
+        raise CheckpointError(
+            f"cannot recheck pretrained checkpoint {resolved}: {error}"
+        ) from error
+    after_load_signature = (
+        after_load.st_dev,
+        after_load.st_ino,
+        after_load.st_size,
+        after_load.st_mtime_ns,
+    )
+    if after_load_signature != file_signature:
+        raise CheckpointError(
+            f"pretrained checkpoint changed while loading: {resolved}"
+        )
     if checkpoint["stage"] != "pretrain":
         raise CheckpointError("--pretrained-checkpoint must point to a pretraining checkpoint")
     stored = checkpoint["config"]
-    if not isinstance(stored, dict) or "active" not in stored:
+    if not isinstance(stored, Mapping) or "active" not in stored:
         raise CheckpointError("pretraining checkpoint lacks a native active config")
-    config = config_from_serialized_dict(stored["active"])
+    if not isinstance(stored["active"], Mapping):
+        raise CheckpointError("pretraining checkpoint active config is malformed")
+    try:
+        config = config_from_serialized_dict(stored["active"])
+    except (ConfigError, KeyError, TypeError, ValueError) as error:
+        raise CheckpointError(
+            f"pretraining checkpoint active config is invalid: {error}"
+        ) from error
+    if config.stage != "pretrain":
+        raise CheckpointError("pretraining checkpoint active config has the wrong stage")
+    model_state = checkpoint.get("model")
+    if not isinstance(model_state, Mapping):
+        raise CheckpointError("pretraining checkpoint model state is malformed")
     # Mathematics: remove the injective prefix "student." from every student
     # state key and discard decoder, teacher, and regression entries.
     # Interpretation: fine-tuning initializes only the shared waveform encoder
     # from a pretraining checkpoint.
-    state = {
-        key.removeprefix("student."): value
-        for key, value in checkpoint["model"].items()
-        if key.startswith("student.")
-    }
+    state: dict[str, Tensor] = {}
+    for key, value in model_state.items():
+        if not isinstance(key, str):
+            raise CheckpointError("pretraining checkpoint model key is not a string")
+        if not key.startswith("student."):
+            continue
+        if not isinstance(value, Tensor):
+            raise CheckpointError(
+                f"pretraining checkpoint student tensor {key} is malformed"
+            )
+        state[key.removeprefix("student.")] = value
     if not state:
         raise CheckpointError("pretraining checkpoint contains no student encoder tensors")
-    return config, state
+    return _PretrainedBundle(config=config, encoder_state=state, identity=identity)
+
+
+def _resolve_pretrained_bundle(
+    config: Animal2VecConfig,
+    *,
+    pretrained_checkpoint: Path | None,
+    resume_checkpoint: Mapping[str, object] | None,
+) -> _PretrainedBundle | None:
+    """Resolve fine-tuning initialization entirely inside training preflight."""
+
+    if config.stage == "pretrain":
+        return None
+    if resume_checkpoint is not None:
+        stored = resume_checkpoint.get("config")
+        if isinstance(stored, Mapping) and "pretrained" in stored:
+            pretrained = stored["pretrained"]
+            if not isinstance(pretrained, Mapping):
+                raise CheckpointError("resume checkpoint pretrained config is malformed")
+            try:
+                pretrained_config = config_from_serialized_dict(pretrained)
+            except (ConfigError, KeyError, TypeError, ValueError) as error:
+                raise CheckpointError(
+                    f"resume checkpoint pretrained config is invalid: {error}"
+                ) from error
+            if pretrained_config.stage != "pretrain":
+                raise CheckpointError(
+                    "resume checkpoint pretrained config has the wrong stage"
+                )
+            return _PretrainedBundle(
+                config=pretrained_config,
+                encoder_state=None,
+                identity=None,
+            )
+    path = pretrained_checkpoint or (
+        Path(config.model.w2v_path) if config.model.w2v_path else None
+    )
+    if path is None:
+        raise CheckpointError(
+            "fine-tuning requires --pretrained-checkpoint or model.w2v_path"
+        )
+    return _load_pretrained_bundle(path)
 
 
 def _make_model(
     config: Animal2VecConfig,
     *,
-    pretrained_checkpoint: Path | None,
-    resume_checkpoint: dict[str, Any] | None,
+    pretrained_bundle: _PretrainedBundle | None,
 ) -> tuple[nn.Module, Animal2VecConfig | None]:
-    """Construct the configured stage and resolve fine-tuning encoder weights."""
+    """Construct the configured stage from inputs already validated in preflight."""
 
     if config.stage == "pretrain":
         return Animal2VecPretrainingModel.from_config(config), None
-    pretrained_config = None
-    encoder_state = None
-    if resume_checkpoint is not None:
-        stored = resume_checkpoint["config"]
-        if isinstance(stored, dict) and "pretrained" in stored:
-            pretrained_config = config_from_serialized_dict(stored["pretrained"])
-    if pretrained_config is None:
-        path = pretrained_checkpoint or (Path(config.model.w2v_path) if config.model.w2v_path else None)
-        if path is None:
-            raise CheckpointError("fine-tuning requires --pretrained-checkpoint or model.w2v_path")
-        pretrained_config, encoder_state = _load_pretrained(path)
-    model = Animal2VecFineTuningModel.from_config(
-        config,
-        pretrained_config=pretrained_config,
-        encoder_state=encoder_state,
-    )
-    return model, pretrained_config
+    if pretrained_bundle is None:
+        raise CheckpointError("fine-tuning preflight lacks pretrained encoder inputs")
+    try:
+        model = Animal2VecFineTuningModel.from_config(
+            config,
+            pretrained_config=pretrained_bundle.config,
+            encoder_state=pretrained_bundle.encoder_state,
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        raise CheckpointError(
+            f"pretrained encoder state is incompatible: {error}"
+        ) from error
+    return model, pretrained_bundle.config
 
 
 def _make_dataset(config: Animal2VecConfig, subset: str | None = None) -> AudioDataset:
@@ -2529,6 +2650,8 @@ class _TrainingPreflight:
     dataset: object
     sampler: TokenBatchSampler
     resume_fingerprint: dict[str, object]
+    active_identity: dict[str, object]
+    pretrained_bundle: _PretrainedBundle | None
     topology: RankTopology
     topology_warnings: tuple[str, ...]
 
@@ -2539,9 +2662,17 @@ def _local_training_preflight(
     device: torch.device,
     distributed: DistributedEnvironment,
     resume_path: Path | None,
+    pretrained_checkpoint: Path | None,
 ) -> _TrainingPreflight:
     """Construct and validate one rank's immutable training inputs."""
 
+    if config.distributed.requested_world_size != distributed.world_size:
+        raise ValueError(
+            "distributed_training.distributed_world_size="
+            f"{config.distributed.requested_world_size} but the launch created "
+            f"{distributed.world_size} process(es); use torchrun with the configured "
+            "worker count or override the field"
+        )
     validate_launcher_contract(
         os.environ,
         config=config_to_dict(config),
@@ -2595,11 +2726,26 @@ def _local_training_preflight(
                     world_size=distributed.world_size,
                 )
             )
+    pretrained_bundle = _resolve_pretrained_bundle(
+        config,
+        pretrained_checkpoint=pretrained_checkpoint,
+        resume_checkpoint=resume_checkpoint,
+    )
+    active_identity: dict[str, object] = {
+        "resume": resume_fingerprint,
+        "pretrained_checkpoint": (
+            pretrained_bundle.identity
+            if pretrained_bundle is not None
+            else None
+        ),
+    }
     return _TrainingPreflight(
         resume_checkpoint=resume_checkpoint,
         dataset=dataset,
         sampler=sampler,
         resume_fingerprint=resume_fingerprint,
+        active_identity=active_identity,
+        pretrained_bundle=pretrained_bundle,
         topology=topology,
         topology_warnings=topology_warnings,
     )
@@ -2623,6 +2769,7 @@ def _coordinated_training_preflight(
     device: torch.device,
     distributed: DistributedEnvironment,
     resume_path: Path | None,
+    pretrained_checkpoint: Path | None,
     group: dist.ProcessGroup | None,
 ) -> _TrainingPreflight:
     """Make every rank accept one preflight result or raise one shared error."""
@@ -2633,6 +2780,7 @@ def _coordinated_training_preflight(
             device=device,
             distributed=distributed,
             resume_path=resume_path,
+            pretrained_checkpoint=pretrained_checkpoint,
         )
 
     local_preflight: _TrainingPreflight | None = None
@@ -2644,6 +2792,7 @@ def _coordinated_training_preflight(
             device=device,
             distributed=distributed,
             resume_path=resume_path,
+            pretrained_checkpoint=pretrained_checkpoint,
         )
     except Exception as error:
         local_error = error
@@ -2656,7 +2805,7 @@ def _coordinated_training_preflight(
             "rank": distributed.rank,
             "error": error_message,
             "fingerprint": (
-                local_preflight.resume_fingerprint
+                local_preflight.active_identity
                 if local_preflight is not None
                 else None
             ),
@@ -2715,7 +2864,7 @@ def _run_training(
     """Run native pretraining or fine-tuning and return the last checkpoint."""
 
     started_at = time.perf_counter()
-    device, rank, world_size, initialized_here = _distributed_device(device_name)
+    device, rank, world_size, _initialized_here = _distributed_device(device_name)
     distributed = _current_distributed_environment(
         rank=rank,
         world_size=world_size,
@@ -2723,14 +2872,6 @@ def _run_training(
     )
     active_preemption_flag = preemption_flag or PreemptionFlag()
     output_locks = owned_output_locks if owned_output_locks is not None else []
-    if config.distributed.requested_world_size != world_size:
-        if initialized_here:
-            dist.destroy_process_group()
-        raise ValueError(
-            "distributed_training.distributed_world_size="
-            f"{config.distributed.requested_world_size} but the launch created {world_size} process(es); "
-            "use torchrun with the configured worker count or override the field"
-        )
     checkpoint_group = _checkpoint_process_group(device, world_size)
     if checkpoint_group is not None and created_checkpoint_groups is not None:
         created_checkpoint_groups.append(checkpoint_group)
@@ -2746,6 +2887,7 @@ def _run_training(
         device=device,
         distributed=distributed,
         resume_path=resume_path,
+        pretrained_checkpoint=pretrained_checkpoint,
         group=checkpoint_group,
     )
     resume_checkpoint = preflight.resume_checkpoint
@@ -2758,8 +2900,7 @@ def _run_training(
             print(json.dumps({"topology_warning": warning}), flush=True)
     model, pretrained_config = _make_model(
         config,
-        pretrained_checkpoint=pretrained_checkpoint,
-        resume_checkpoint=resume_checkpoint,
+        pretrained_bundle=preflight.pretrained_bundle,
     )
     model.to(device)
     _compile_model_in_place(model, config.common)
