@@ -382,7 +382,7 @@ def test_engine_does_not_materialize_loss_per_microbatch(
     tensor_float = torch.Tensor.__float__
 
     def observe_float(value: torch.Tensor) -> float:
-        """Count Python conversion of tensors sharing a forward loss storage."""
+        """Count Python conversion of the exact forward loss tensor objects."""
 
         if any(value is loss for loss in microbatch_losses):
             materialized_microbatch_losses.append(value)
@@ -391,7 +391,7 @@ def test_engine_does_not_materialize_loss_per_microbatch(
     monkeypatch.setattr(torch.Tensor, "__float__", observe_float)
 
     def forward(value: torch.Tensor) -> Result:
-        """Record the storage of one differentiable microbatch loss."""
+        """Record each differentiable forward loss tensor by object identity."""
 
         loss = model(value).square().sum()
         microbatch_losses.append(loss)
