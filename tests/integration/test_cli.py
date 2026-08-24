@@ -357,6 +357,43 @@ def test_fresh_finetune_consumes_one_preflight_loaded_checkpoint(
     assert loaded_paths == [pretrained_checkpoint.resolve()]
 
 
+def test_fresh_finetune_reports_corrupt_pretrained_checkpoint_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reject corrupt pretrained bytes through the concise CLI error boundary."""
+
+    manifests = _data(tmp_path)
+    corrupt_checkpoint = tmp_path / "corrupt-pretrained.pt"
+    corrupt_checkpoint.write_bytes(b"not a torch checkpoint")
+    constructed: list[bool] = []
+
+    def reject_model_construction(*_args: object, **_kwargs: object) -> object:
+        """Fail if corrupt bytes cross the pre-model validation boundary."""
+
+        constructed.append(True)
+        raise AssertionError("model construction must follow pretrained validation")
+
+    monkeypatch.setattr(workflows, "_make_model", reject_model_construction)
+
+    with pytest.raises(SystemExit) as raised:
+        train_main([
+            "--config", str(ROOT / "configs/cpu_smoke_finetuning.yaml"),
+            "--override", f"task.data={manifests}",
+            "--override", f"checkpoint.save_dir={tmp_path / 'finetune'}",
+            "--pretrained-checkpoint", str(corrupt_checkpoint),
+            "--max-updates", "1",
+            "--device", "cpu",
+        ])
+
+    stderr = capsys.readouterr().err
+    assert raised.value.code == 2
+    assert f"cannot load checkpoint {corrupt_checkpoint.resolve()}" in stderr
+    assert "Traceback" not in stderr
+    assert constructed == []
+
+
 def test_cli_stop_at_update_preserves_configured_scheduler_horizon(tmp_path: Path, capsys) -> None:
     """Check cli stop at update preserves configured scheduler horizon."""
     manifests = _data(tmp_path)

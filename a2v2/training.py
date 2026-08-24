@@ -19,6 +19,7 @@ import importlib
 import io
 import math
 import os
+import pickle
 import random
 import re
 from contextlib import nullcontext
@@ -405,7 +406,9 @@ def load_checkpoint(
 
     try:
         payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except CheckpointError:
+        raise
+    except (pickle.UnpicklingError, EOFError, OSError, RuntimeError, ValueError) as exc:
         raise CheckpointError(f"cannot load checkpoint {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise CheckpointError("checkpoint root must be a dictionary")

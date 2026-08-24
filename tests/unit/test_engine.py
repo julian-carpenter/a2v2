@@ -1,9 +1,10 @@
 """Test update-level training semantics without a full Animal2Vec model. The suite isolates
 distributed sample-size reduction and release of deserialized checkpoint tensors."""
 
+import gc
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -196,11 +197,12 @@ def test_training_compiles_after_device_move_before_optimizer_and_ddp(
     monkeypatch.setattr(
         workflows,
         "_coordinated_training_preflight",
-        lambda *_args, **_kwargs: SimpleNamespace(
+        lambda *_args, **_kwargs: workflows._TrainingPreflight(
             resume_checkpoint=None,
             dataset=dataset,
             sampler=sampler,
             resume_fingerprint={},
+            active_identity={},
             pretrained_bundle=None,
             topology=None,
             topology_warnings=(),
@@ -239,6 +241,95 @@ def test_training_compiles_after_device_move_before_optimizer_and_ddp(
         "optimizer",
         "ddp",
     ]
+
+
+def test_training_releases_pretrained_bundle_before_model_device_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drop deserialized encoder tensors as soon as model construction copies them."""
+
+    class ConstructionStopped(RuntimeError):
+        """Stop after checking the pretrained-state lifetime boundary."""
+
+    references: dict[str, weakref.ReferenceType[object]] = {}
+
+    class TrackingModel(nn.Module):
+        """Keep only a copy of the source tensor and inspect reachability at ``to``."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("copied", torch.empty(1))
+
+        def to(self, *_args: object, **_kwargs: object) -> "TrackingModel":
+            """Assert the source bundle is unreachable before device movement."""
+
+            gc.collect()
+            assert references["bundle"]() is None
+            assert references["source_tensor"]() is None
+            assert torch.equal(self.copied, torch.tensor([3.0]))
+            raise ConstructionStopped("observed pretrained-state release")
+
+    model = TrackingModel()
+    config = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    dataset = type(
+        "DatasetSentinel",
+        (),
+        {"sizes": (8,), "__len__": lambda self: 1},
+    )()
+    sampler = workflows.TokenBatchSampler(
+        dataset.sizes,
+        max_tokens=config.dataset.max_tokens,
+    )
+
+    def build_preflight(*_args: object, **_kwargs: object) -> workflows._TrainingPreflight:
+        """Create the only strong references to the loaded source mapping."""
+
+        source_tensor = torch.tensor([3.0])
+        bundle = workflows._PretrainedBundle(
+            config=load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml"),
+            encoder_state={"sentinel": source_tensor},
+            identity={"sha256": "sentinel"},
+        )
+        references["bundle"] = weakref.ref(bundle)
+        references["source_tensor"] = weakref.ref(source_tensor)
+        return workflows._TrainingPreflight(
+            resume_checkpoint=None,
+            dataset=dataset,
+            sampler=sampler,
+            resume_fingerprint={},
+            active_identity={},
+            pretrained_bundle=bundle,
+            topology=None,  # type: ignore[arg-type]
+            topology_warnings=(),
+        )
+
+    def copy_pretrained_state(
+        _config: object,
+        *,
+        pretrained_bundle: workflows._PretrainedBundle | None,
+    ) -> tuple[nn.Module, object]:
+        """Copy the source tensor into model-owned storage without retaining it."""
+
+        assert pretrained_bundle is not None
+        assert pretrained_bundle.encoder_state is not None
+        model.copied.copy_(pretrained_bundle.encoder_state["sentinel"])
+        return model, pretrained_bundle.config
+
+    monkeypatch.setattr(
+        workflows,
+        "_distributed_device",
+        lambda *_: (torch.device("cpu"), 0, 1, False),
+    )
+    monkeypatch.setattr(workflows, "_coordinated_training_preflight", build_preflight)
+    monkeypatch.setattr(workflows, "_make_model", copy_pretrained_state)
+
+    with pytest.raises(ConstructionStopped, match="observed pretrained-state release"):
+        workflows._run_training(
+            config,
+            device_name="cpu",
+            resume_path=None,
+            pretrained_checkpoint=Path("pretrained.pt"),
+        )
 
 
 def test_batch_move_keeps_sample_ids_on_cpu() -> None:
@@ -286,15 +377,15 @@ def test_engine_does_not_materialize_loss_per_microbatch(
         clip_norm=0.0,
         device=torch.device("cpu"),
     )
-    loss_storage: set[int] = set()
-    materialized_microbatch_losses: list[int] = []
+    microbatch_losses: list[torch.Tensor] = []
+    materialized_microbatch_losses: list[torch.Tensor] = []
     tensor_float = torch.Tensor.__float__
 
     def observe_float(value: torch.Tensor) -> float:
         """Count Python conversion of tensors sharing a forward loss storage."""
 
-        if value.data_ptr() in loss_storage:
-            materialized_microbatch_losses.append(value.data_ptr())
+        if any(value is loss for loss in microbatch_losses):
+            materialized_microbatch_losses.append(value)
         return tensor_float(value)
 
     monkeypatch.setattr(torch.Tensor, "__float__", observe_float)
@@ -303,7 +394,7 @@ def test_engine_does_not_materialize_loss_per_microbatch(
         """Record the storage of one differentiable microbatch loss."""
 
         loss = model(value).square().sum()
-        loss_storage.add(loss.data_ptr())
+        microbatch_losses.append(loss)
         return Result(loss, sample_size=1)
 
     result = engine.step(

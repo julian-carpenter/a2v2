@@ -3,6 +3,7 @@ rank-specific RNG replay, safe object serialization, atomic round trips, and sch
 rejection."""
 
 from pathlib import Path
+import pickle
 import random
 
 import numpy as np
@@ -169,6 +170,43 @@ def test_native_checkpoint_round_trip(tmp_path: Path) -> None:
     assert loaded["format_version"] == 1
     assert loaded["update"] == 2
     assert set(loaded["model"]) == set(model.state_dict())
+
+
+@pytest.mark.parametrize("contents", (b"", b"not a torch checkpoint"))
+def test_checkpoint_normalizes_native_decode_failures(
+    tmp_path: Path,
+    contents: bytes,
+) -> None:
+    """Translate truncated and invalid native files at the shared loader boundary."""
+
+    path = tmp_path / "corrupt.pt"
+    path.write_bytes(contents)
+
+    with pytest.raises(CheckpointError, match=r"cannot load checkpoint.*corrupt\.pt") as raised:
+        load_checkpoint(path)
+
+    assert isinstance(raised.value.__cause__, (EOFError, pickle.UnpicklingError))
+
+
+def test_checkpoint_does_not_rewrap_existing_checkpoint_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Preserve an already normalized repository error and its original context."""
+
+    expected = CheckpointError("already normalized")
+
+    def reject_load(*_args: object, **_kwargs: object) -> object:
+        """Raise the pre-normalized sentinel from the torch loader boundary."""
+
+        raise expected
+
+    monkeypatch.setattr(training.torch, "load", reject_load)
+
+    with pytest.raises(CheckpointError) as raised:
+        load_checkpoint(tmp_path / "checkpoint.pt")
+
+    assert raised.value is expected
 
 
 def test_checkpoint_rejects_missing_schema_keys(tmp_path: Path) -> None:

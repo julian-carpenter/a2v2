@@ -37,6 +37,12 @@ after the shared preflight and before DDP wrapping. A two-rank NCCL workflow
 test at the Round 3 head covers training, resume, and a canonical asymmetric
 preflight failure.
 
+Fix Round 4 releases the preflight's deserialized pretrained encoder mapping
+after `_make_model` copies it and before `model.to`. The shared checkpoint
+loader now translates expected archive and pickle decode failures into a
+path-bearing `CheckpointError`; it preserves an existing `CheckpointError`.
+This error boundary does not make pickle input safe.
+
 This verification did not run the paper-scale reproduction or a SLURM
 allocation. It does not validate a site filesystem, scheduler, requeue policy,
 or multi-node transport.
@@ -67,6 +73,11 @@ or multi-node transport.
   `main...origin/main [ahead 28]` had six modified tracked files, this report,
   and one new NCCL workflow file. The containing commit makes the branch 29
   commits ahead of `origin/main`.
+- Fix Round 4 starts from
+  `25b99553b2491ffd174552f367c5415cdff541ff`. Before its containing commit,
+  `main...origin/main [ahead 29]` has five modified test or production files
+  plus this report. The containing commit makes the branch 30 commits ahead
+  of `origin/main`.
 
 ## Host and package state
 
@@ -455,6 +466,92 @@ tiny update found no unused DDP parameter despite
 so the inferred mapping matched this local launch. This test did not exercise
 multi-node rank mapping.
 
+## Fix Round 4: pretrained-state lifetime and corrupt-file errors
+
+### RED evidence
+
+The focused RED command ran the new lifetime, native decode, error-preservation,
+and direct corrupt-fine-tuning CLI cases:
+
+```text
+rtk pytest -q tests/unit/test_engine.py::test_training_releases_pretrained_bundle_before_model_device_move tests/unit/test_checkpoint.py::test_checkpoint_normalizes_native_decode_failures tests/unit/test_checkpoint.py::test_checkpoint_does_not_rewrap_existing_checkpoint_error tests/integration/test_cli.py::test_fresh_finetune_reports_corrupt_pretrained_checkpoint_without_traceback
+```
+
+Outcome: 0 passed and 5 failed. At `model.to`, weak references still reached
+the preflight bundle and its source tensor. Empty and invalid checkpoint bytes
+raised native decode exceptions. The loader also wrapped a pre-existing
+`CheckpointError`, and the CLI did not reach its concise parser error.
+
+### GREEN evidence
+
+`_run_training` passes the bundle straight into `_make_model`, then replaces
+the immutable preflight with a copy whose `pretrained_bundle` is `None` before
+calling `model.to`. The lifetime test lets its coordinator own the only source
+mapping references. Its model factory copies one tensor into model-owned
+storage. At `model.to`, garbage collection clears weak references to both the
+bundle and source tensor while the copied value remains present. The existing
+real fine-tuning test still records one checkpoint load.
+
+`load_checkpoint` re-raises an existing `CheckpointError`. It translates
+`pickle.UnpicklingError`, `EOFError`, and the existing archive
+`OSError`/`RuntimeError`/`ValueError` family into a path-bearing
+`CheckpointError`. A corrupt fresh-pretrained CLI run exits with parser status
+2, prints no traceback, and never calls `_make_model`. The bounded two-rank
+Gloo corrupt-pretrained case still gives both ranks the coordinated pre-model
+failure.
+
+The focused rerun passed all 5 RED cases. This affected command passed 26
+tests:
+
+```text
+rtk pytest -q tests/unit/test_checkpoint.py tests/unit/test_engine.py tests/integration/test_cli.py::test_fresh_finetune_consumes_one_preflight_loaded_checkpoint tests/integration/test_cli.py::test_fresh_finetune_reports_corrupt_pretrained_checkpoint_without_traceback 'tests/integration/test_cli.py::test_two_rank_gloo_preflight_coordinates_fresh_pretrained_failures[pretrained-corrupt]'
+```
+
+The first full CPU run found two test-only failures after 559 passes. The
+documentation policy named five missing nested-function docstrings. An
+existing engine test compared allocator addresses to detect scalar conversion;
+the allocator reused a released first-loss address for the final gradient norm,
+so the test reported a conversion of the wrong tensor. Isolated and
+lifetime-then-engine reproductions passed. The correction compares exact
+tensor objects and retains the intended assertion. The five docstrings and
+identity correction passed this seven-test command:
+
+```text
+rtk pytest -q tests/unit/test_documentation.py::test_python_files_explain_modules_and_named_definitions tests/unit/test_engine.py::test_engine_does_not_materialize_loss_per_microbatch tests/unit/test_engine.py::test_training_releases_pretrained_bundle_before_model_device_move tests/unit/test_checkpoint.py::test_checkpoint_normalizes_native_decode_failures tests/unit/test_checkpoint.py::test_checkpoint_does_not_rewrap_existing_checkpoint_error tests/integration/test_cli.py::test_fresh_finetune_reports_corrupt_pretrained_checkpoint_without_traceback
+```
+
+The final explicit CPU command exited 0 with 561 passes:
+
+```text
+rtk pytest -q tests/unit tests/integration
+```
+
+Round 4 source, package, frozen-control, documentation, and launcher checks
+passed:
+
+```text
+rtk python -m compileall -q a2v2 tests
+rtk python -m pip check
+rtk git diff --check
+rtk bash -n scripts/reproduce_meerkat_slurm.sh scripts/a2v2_slurm_node.sh
+rtk python -m pytest -q tests/unit/test_config.py tests/unit/test_model_state_contract.py tests/integration/test_recipe_configs.py tests/integration/test_reproduction_driver.py
+rtk python -m pytest -q tests/unit/test_repository_layout.py tests/unit/test_documentation.py
+rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/runs/meerkat --phase all --nodes 2 --gpus-per-node 4 --job-id dryrun-4815 --dry-run
+```
+
+The frozen-control command passed 79 tests, and the documentation/layout
+command passed 23. `pip check` printed `No broken requirements found.` The
+other commands exited 0. The dry run rendered the two-node, eight-worker
+pretraining and fine-tuning phases plus one-GPU evaluation without requesting
+an allocation. The checked-in frozen hashes and state signatures remain equal
+to the values below.
+
+Round 4 ran no CUDA command. It changes the lifetime of CPU-deserialized
+checkpoint state and the loader's exception boundary. It leaves CUDA
+execution, collective ordering, model math, and checkpoint bytes untouched.
+The Round 3 bounded NCCL result remains the latest workflow-level CUDA
+evidence.
+
 ## Frozen reproduction control
 
 This focused command reran config round trips, legacy defaults, state
@@ -646,7 +743,7 @@ preemption, and frozen-driver tests.
 
 | Gate | Evidence | Result |
 | --- | --- | --- |
-| Gate 0 frozen control | Fresh 556-test CPU suite, 79 focused controls, frozen hashes and state signatures above | Pass |
+| Gate 0 frozen control | Fresh 561-test CPU suite, focused controls, frozen hashes and state signatures above | Pass |
 | Gate 1 component units | Full unit suite plus 12 CUDA component tests | Pass |
 | Gate 2 CPU integration | Full integration suite, fresh-process variable-crop resume, and eight two-rank Gloo preflight cases | Pass |
 | Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank engine resume, and 2-rank workflow resume/preflight | Pass on this host |

@@ -2902,6 +2902,7 @@ def _run_training(
         config,
         pretrained_bundle=preflight.pretrained_bundle,
     )
+    preflight = replace(preflight, pretrained_bundle=None)
     model.to(device)
     _compile_model_in_place(model, config.common)
     if device.type == "cuda":
