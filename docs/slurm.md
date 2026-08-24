@@ -243,13 +243,15 @@ fingerprint, seed, data identity, and checkpoint schema. Hardware and transport
 changes produce numerical-equivalence warnings. Hostname order does not assign
 torchrun ranks.
 
-The shipped modern recipes use strict provenance and stateless crop
-coordinates. That combination validates the selected manifest and sampler
-population before mutable training state is built and is the supported exact
-data-path resume mode. Frozen paper recipes retain compatible legacy cropping;
-multiworker random-crop resume warns and is not bit-exact across process
-restart. Older checkpoints without versioned data provenance remain usable in
-compatible mode, also with a warning.
+The shipped modern recipes use strict v2 provenance and stateless crop
+coordinates. That combination validates the selected manifest, retained
+record identities, sampler population, loss and AMP settings, and tracked
+metric before model construction. Distributed ranks exchange their preflight
+status and fingerprints over the control group before any rank constructs a
+model. Frozen paper recipes retain compatible legacy cropping. Resume warns
+when any batch in the sampler epoch can crop, regardless of worker count, and
+does not claim bit-exact crops across process restart. Older checkpoints
+without v2 data provenance remain usable in compatible mode with a warning.
 
 The launcher resolves the pretraining manifest from the pretraining config's
 `dataset.train_subset`. A neighboring `pretrain.tsv` does not enter the

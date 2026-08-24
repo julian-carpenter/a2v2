@@ -19,7 +19,14 @@ provenance and stateless crop coordinates, then reran variable-length resume in
 fresh processes and on two local Gloo ranks. Exact data-path resume now means
 `dataset.crop_strategy=stateless` together with
 `checkpoint.resume_policy=strict`. Frozen legacy recipes remain compatible,
-but their multiworker random-crop resume is not bit-exact.
+but their legacy random-crop resume is not bit-exact.
+
+In Fix Round 2, we tightened the strict contract after a scoped review. New
+checkpoints carry `a2v2.training-data.v2`: full loss, effective AMP/scaler,
+best-metric, retained-record, manifest, sampler, and task semantics. Legacy
+crop safety scans the complete repeating epoch without consulting worker
+count. Distributed ranks exchange preflight errors and active fingerprints
+before any rank constructs a model.
 
 This verification did not run the paper-scale reproduction or a SLURM
 allocation. It does not validate a site filesystem, scheduler, requeue policy,
@@ -40,6 +47,12 @@ or multi-node transport.
 - Before the fix commit, `main...origin/main [ahead 26]` had 23 modified
   tracked files and one new Gloo worker file. `HEAD` was `9f3c781`; the
   containing fix commit makes the branch 27 commits ahead of `origin/main`.
+- Fix Round 2 starts from
+  `ae86f5a4403ea348710699dfae79b682cfb5d946`. The final handoff names its
+  containing commit. The frozen paper files remained unchanged.
+- Before the Round 2 commit, `main...origin/main [ahead 27]` had nine modified
+  tracked files and one new Gloo worker file. The containing commit makes the
+  branch 28 commits ahead of `origin/main`.
 
 ## Host and package state
 
@@ -147,12 +160,11 @@ after update 2. The two-rank Gloo test uses the same variable-length population
 with one DataLoader worker per rank and compares the same fields after a fresh
 torchrun resume. Both comparisons were exact.
 
-The stronger fingerprint covers the full task, ordered labels, dataset
-mathematics and batching, resolved selected-manifest path and exact ordered
-bytes, filtered sampler population, and ordered-size digest. `num_workers` and
-logging remain execution-only. Strict validation runs before model, optimizer,
-scheduler, or gradient-clipper construction. Compatible legacy checkpoints
-remain usable with a warning when provenance is unavailable.
+Round 1 bound the full task, ordered labels, dataset mathematics and batching,
+resolved selected-manifest path and bytes, filtered population, and ordered
+sizes. It still omitted loss, AMP/scaler, tracked-metric, and retained-record
+identity fields. Fix Round 2 closes those gaps below. `num_workers`, logging,
+and compile settings remain execution fields.
 
 The required fresh final CPU command was:
 
@@ -199,6 +211,115 @@ The first run reported 1 failed and 22 passed because the nested benchmark
 helper lacked a docstring. I added that docstring without changing executable
 logic. The regression test then passed 1/1, and the full focused command passed
 23/23 in 19.21 s.
+
+## Fix Round 2: strict resume and distributed preflight
+
+### RED evidence
+
+The scoped review found four ways the Round 1 strict contract could accept a
+different resumed computation:
+
+- the fingerprint omitted the criterion, FP16/scaler policy, and saved
+  best-metric identity and direction;
+- equal-size filtered populations could share manifest and size digests even
+  when they retained different rows;
+- an exhausted sampler cursor or a changed `num_workers` value could hide a
+  legacy crop elsewhere in the repeating epoch;
+- one distributed rank could fail during manifest or checkpoint preflight
+  while another rank crossed model construction.
+
+This focused RED command produced 10 failures and 2 passing controls:
+
+```text
+rtk python -m pytest -q tests/integration/test_resume.py -k 'every_mathematical_state_mismatch or exact_best_metric_direction or filtered_record_identity or strict_resume_rejects_mismatch or legacy_random_crop_resume_policy or old_checkpoint_provenance'
+```
+
+The failures named the omitted fingerprint paths, missing retained-record
+digest, model-construction sentinel, and absent full-epoch crop warning. The
+task-normalization and old-compatible-policy controls passed.
+
+The two-rank RED run failed both cases:
+
+```text
+rtk python -m pytest -q tests/integration/test_cli.py -k 'two_rank_gloo_preflight'
+```
+
+For the asymmetric manifest case, rank 0 reached the model sentinel while rank
+1 raised `ManifestError`; the harness recorded different terminal errors. For
+the fingerprint case, both ranks reached the model sentinel. The workflow had
+no collective pre-model gate.
+
+### GREEN evidence before the final CPU suite
+
+| Command | Outcome |
+| --- | --- |
+| `rtk python -m pytest -q tests/integration/test_resume.py tests/integration/test_finetuning_step.py -k 'every_mathematical_state_mismatch or exact_best_metric_direction or strict_resume_rejects_mismatch or tracked_metric or shipped_cls'` | 8 passed |
+| `rtk python -m pytest -q tests/integration/test_resume.py -k 'filtered_record_identity or ordered_task_and_manifest or strict_resume_rejects_mismatch or old_checkpoint_provenance'` | 9 passed |
+| `rtk python -m pytest -q tests/integration/test_resume.py -k 'legacy_random_crop_resume_policy or old_checkpoint_provenance' tests/unit/test_sampler.py tests/unit/test_dataset.py -k 'legacy_random_crop_resume_policy or old_checkpoint_provenance or stateless'` | 5 passed |
+| `rtk python -m pytest -q tests/integration/test_cli.py -k 'two_rank_gloo_preflight'` | 2 passed, 16 deselected, 23.89 s |
+| `rtk python -m pytest -q tests/integration/test_resume.py tests/unit/test_engine.py tests/unit/test_sampler.py tests/unit/test_dataset.py` | 77 passed, 4 expected compatible-policy warnings |
+| `rtk python -m pytest -q tests/integration/test_cli.py -k 'resume or preflight'` | Exit 0; 6 selected cases, including fresh-process stateless resume and two-rank Gloo resume/preflight |
+
+The first affected 77-test run reported 76 passes and one fixture failure. A
+construction-order unit test simulated `world_size=2` without an initialized
+process group. `_distributed_device` cannot produce that state. The test
+supplies a completed preflight fixture because it targets the later
+move/compile/optimizer/DDP order. The rerun passed all 77 cases.
+
+The v2 retained-record digest encodes each filtered row's original manifest
+index and line, resolved audio path, and selected size in sampler order. The
+regression constructs the same manifest bytes and equal sizes twice, retaining
+rows `[0, 1]` and `[1, 2]`; the digests differ. Full criterion and effective
+`common.fp16`, `fp16_init_scale`, and `min_loss_scale` fields now enter the
+resume fingerprint. The tracked metric contributes its configured identity
+and the same derived `minimize` or `maximize` mode used by best-checkpoint
+selection. The allowed `max_update` extension remains excluded.
+
+Strict resume requires v2 provenance. Compatible policy validates the fields
+available in older checkpoints and emits a warning. If any batch in the full
+sampler epoch can crop, compatible legacy mode warns for any worker count and
+strict mode requires stateless coordinates.
+
+For `world_size>1`, each rank now completes dataset construction, checkpoint
+read, provenance validation, and topology validation inside a local preflight.
+Ranks exchange status and full active fingerprints over the Gloo control
+group. A local failure produces the lowest-rank canonical error on each rank;
+different successful fingerprints produce one shared mismatch error. Both
+bounded Gloo cases stopped before the model sentinel and exited without a
+hang.
+
+The required fresh Round 2 CPU command was:
+
+```text
+rtk python -m pytest -q tests/unit tests/integration
+```
+
+Outcome: 546 passed, 12 warnings in 7m37s. Eight warnings came from Python
+3.12 for `fork()` in multiworker integration processes. Four tests emitted the
+intentional compatible-policy warning for checkpoints without v2 data
+provenance. The suite produced no failures.
+
+Round 2 source, package, frozen-control, and launcher checks passed:
+
+```text
+rtk python -m compileall -q a2v2 tests
+rtk python -m pip check
+rtk git diff --check
+rtk bash -n scripts/reproduce_meerkat_slurm.sh scripts/a2v2_slurm_node.sh
+rtk python -m pytest -q tests/unit/test_config.py tests/unit/test_model_state_contract.py tests/integration/test_recipe_configs.py tests/integration/test_reproduction_driver.py
+rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/runs/meerkat --phase all --nodes 2 --gpus-per-node 4 --job-id dryrun-4815 --dry-run
+```
+
+The first four commands exited 0, and `pip check` printed `No broken
+requirements found.` The frozen-control command passed 79 tests in 22.46s;
+the recipe, driver, and state-signature hashes remained equal to the values in
+the frozen-control section below. The dry run exited 0 and rendered two nodes,
+four workers per node, world size 8, separate pretraining and fine-tuning
+contracts, checkpoint validation, and one-GPU evaluation. It requested no
+SLURM allocation.
+
+Fix Round 2 changed no CUDA execution path, so it ran no CUDA command. The
+original bounded GPU evidence remains scoped to the earlier revision.
 
 ## Frozen reproduction control
 
@@ -391,7 +512,7 @@ preemption, and frozen-driver tests.
 
 | Gate | Evidence | Result |
 | --- | --- | --- |
-| Gate 0 frozen control | Fresh 535-test CPU suite, focused controls, frozen hashes and state signatures above | Pass |
+| Gate 0 frozen control | Fresh 546-test CPU suite, 79 focused controls, frozen hashes and state signatures above | Pass |
 | Gate 1 component units | Full unit suite plus 12 CUDA component tests | Pass |
 | Gate 2 CPU integration | Full integration suite, fresh-process variable-crop resume, and explicit two-rank Gloo selection | Pass |
 | Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank NCCL resume | Pass on this host |
@@ -414,8 +535,9 @@ release constraints.
 ## Known limits and unrun gates
 
 - Paper-scale pretraining, fine-tuning, resume, and final evaluation: UNRUN.
-- Frozen legacy multiworker random-crop bit-exact resume: unsupported by
-  design; compatible resume warns. No paper-scale legacy resume was launched.
+- Frozen legacy random-crop bit-exact resume: unsupported by design;
+  compatible resume warns for any worker count. No paper-scale legacy resume
+  was launched.
 - The canonical local eight-A100 reproduction command graph ran in dry-run
   tests; no eight-rank training allocation ran.
 - Real one-node SLURM launcher parity: UNRUN.

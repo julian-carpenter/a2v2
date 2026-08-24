@@ -3,6 +3,7 @@ distributed sample-size reduction and release of deserialized checkpoint tensors
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -188,11 +189,21 @@ def test_training_compiles_after_device_move_before_optimizer_and_ddp(
         (),
         {"sizes": (8, 8), "__len__": lambda self: 2},
     )()
-    monkeypatch.setattr(workflows, "_make_dataset", lambda *_: dataset)
+    sampler = workflows.TokenBatchSampler(
+        dataset.sizes,
+        max_tokens=config.dataset.max_tokens,
+    )
     monkeypatch.setattr(
         workflows,
-        "_training_data_resume_provenance",
-        lambda *_: {"schema": "a2v2.training-data.v1"},
+        "_coordinated_training_preflight",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            resume_checkpoint=None,
+            dataset=dataset,
+            sampler=sampler,
+            resume_fingerprint={},
+            topology=None,
+            topology_warnings=(),
+        ),
     )
     monkeypatch.setattr(workflows, "_make_model", lambda *_args, **_kwargs: (model, None))
     monkeypatch.setattr(

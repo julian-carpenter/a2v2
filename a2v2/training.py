@@ -299,6 +299,17 @@ def normalize_checkpoint(payload: Mapping[str, object]) -> dict[str, Any]:
     return normalized
 
 
+def best_checkpoint_metric_mode(metric: str) -> str:
+    """Return the optimization direction used for one tracked metric name."""
+
+    requested = metric.rsplit("/", 1)[-1]
+    canonical = {"ap": "average_precision", "mAP": "average_precision"}.get(
+        requested,
+        requested,
+    )
+    return "minimize" if canonical == "loss" else "maximize"
+
+
 def resume_compatibility_fingerprint(
     active_config: Mapping[str, object],
     *,
@@ -322,6 +333,7 @@ def resume_compatibility_fingerprint(
         add_leaf("optimizer", active_config["optimizer"])
         add_leaf("scheduler", active_config["scheduler"])
         add_leaf("optimization", active_config["optimization"])
+        add_leaf("criterion", active_config["criterion"])
         add_leaf("task", active_config["task"])
         dataset = active_config["dataset"]
         if not isinstance(dataset, Mapping):
@@ -338,10 +350,23 @@ def resume_compatibility_fingerprint(
         # scheduler horizon override, not saved optimizer or clipping state.
         fingerprint.pop("optimization.max_update", None)
         common = active_config["common"]
+        checkpoint = active_config["checkpoint"]
         distributed = active_config["distributed"]
-        if not all(isinstance(group, Mapping) for group in (common, dataset, distributed)):
+        if not all(
+            isinstance(group, Mapping)
+            for group in (common, checkpoint, dataset, distributed)
+        ):
             return None
         fingerprint["common.seed"] = common["seed"]  # type: ignore[index]
+        for field in ("fp16", "fp16_init_scale", "min_loss_scale"):
+            fingerprint[f"common.{field}"] = common[field]  # type: ignore[index]
+        metric = checkpoint["best_checkpoint_metric"]  # type: ignore[index]
+        if not isinstance(metric, str):
+            return None
+        fingerprint["checkpoint.best_checkpoint_metric"] = metric
+        fingerprint["checkpoint.best_checkpoint_metric_mode"] = (
+            best_checkpoint_metric_mode(metric)
+        )
         fingerprint["distributed.requested_world_size"] = distributed[
             "requested_world_size"
         ]  # type: ignore[index]

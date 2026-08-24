@@ -590,6 +590,49 @@ def test_two_rank_gloo_stateless_crop_resume_matches_uninterrupted(
         _assert_tree_equal(resumed[field], continuous[field], field)
 
 
+@pytest.mark.parametrize("mode", ("data-failure", "fingerprint-mismatch"))
+def test_two_rank_gloo_preflight_aborts_before_model_with_one_error(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """Coordinate asymmetric setup failures and divergent data fingerprints."""
+
+    first_root = tmp_path / "first"
+    first_root.mkdir()
+    first_data = _data(first_root)
+    if mode == "data-failure":
+        second_data = tmp_path / "missing"
+    else:
+        second_root = tmp_path / "second"
+        second_root.mkdir()
+        second_data = _data(second_root)
+    marker_directory = tmp_path / "markers"
+    marker_directory.mkdir()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=2",
+            str(ROOT / "tests/integration/gloo_preflight.py"),
+            str(first_data),
+            str(second_data),
+            str(tmp_path / "output"),
+            mode,
+            str(marker_directory),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert list(marker_directory.iterdir()) == []
+
+
 def test_cli_returns_parser_error_for_unknown_override(tmp_path: Path) -> None:
     """Check cli returns parser error for unknown override."""
     try:

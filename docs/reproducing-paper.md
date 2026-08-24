@@ -25,12 +25,13 @@ It retains the same three training commands, resolved MeerKAT recipes,
 fine-tuning activation-checkpoint override, and final evaluation flow.
 
 Those frozen recipes use the legacy crop and compatible-resume defaults. Their
-resume path remains supported, but a process restart with random cropping and
-multiple DataLoader workers is not bit-exact because checkpoints omit
-worker-local RNG and prefetch state. The driver now emits that runtime warning
-when the remaining sampler batches can crop. Use the separate modern recipes,
-which select stateless crops and strict provenance, when exact data-path resume
-is required. The frozen YAML and local driver bytes remain unchanged.
+resume path remains supported. A process restart with random cropping is not
+bit-exact because checkpoints omit the legacy collator's crop-generator state
+and worker prefetch state. The driver emits a runtime warning if any batch in
+the complete sampler epoch can crop, regardless of the restored cursor or
+worker count. Use the separate modern recipes, which select stateless crops
+and strict v2 provenance, when exact data-path resume is required. The frozen
+YAML and local driver bytes remain unchanged.
 
 `scripts/reproduce_meerkat_slurm.sh` provides a separate scheduler entry
 point. It uses the frozen MeerKAT recipes by default, starts one torchrun agent

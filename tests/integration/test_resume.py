@@ -16,6 +16,7 @@ from torch import nn
 import a2v2.training as training
 import a2v2.workflows as workflows
 from a2v2.config import config_to_dict, load_config
+from a2v2.data import AudioDataset
 from a2v2.model import EMATeacher
 from a2v2.training import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint
 from a2v2.training import TrainingEngine
@@ -694,11 +695,54 @@ def test_resume_compatibility_rejects_every_mathematical_state_mismatch() -> Non
             config,
             common=replace(config.common, seed=config.common.seed + 1),
         ),
+        "common.fp16": replace(
+            config,
+            common=replace(config.common, fp16=not config.common.fp16),
+        ),
+        "common.fp16_init_scale": replace(
+            config,
+            common=replace(
+                config.common,
+                fp16_init_scale=config.common.fp16_init_scale * 2,
+            ),
+        ),
+        "common.min_loss_scale": replace(
+            config,
+            common=replace(
+                config.common,
+                min_loss_scale=config.common.min_loss_scale + 1,
+            ),
+        ),
+        "criterion.focal_gamma": replace(
+            config,
+            criterion=replace(
+                config.criterion,
+                focal_gamma=config.criterion.focal_gamma + 1,
+            ),
+        ),
+        "checkpoint.best_checkpoint_metric": replace(
+            config,
+            checkpoint=replace(
+                config.checkpoint,
+                best_checkpoint_metric="metrics/finetune/sequence_f1",
+            ),
+        ),
     }
 
     for path, active in mismatches.items():
         with pytest.raises(training.CheckpointError, match=path.replace(".", r"\.")):
             workflows._validate_resume_compatibility(active, checkpoint)
+
+
+def test_resume_fingerprint_records_exact_best_metric_direction() -> None:
+    """Protect the minimize/maximize rule attached to restored best values."""
+
+    config = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    fingerprint = training.resume_compatibility_fingerprint(config_to_dict(config))
+
+    assert fingerprint is not None
+    assert fingerprint["checkpoint.best_checkpoint_metric"] == "loss"
+    assert fingerprint["checkpoint.best_checkpoint_metric_mode"] == "minimize"
 
 
 def test_strict_resume_fingerprint_binds_ordered_task_and_manifest_semantics(
@@ -789,7 +833,7 @@ def test_strict_resume_fingerprint_binds_ordered_task_and_manifest_semantics(
         config,
         SimpleNamespace(sizes=(64, 79)),
     )
-    with pytest.raises(training.CheckpointError, match=r"sampler\.sizes_sha256"):
+    with pytest.raises(training.CheckpointError, match=r"sampler\.records_sha256"):
         workflows._validate_resume_compatibility(
             config,
             checkpoint,
@@ -797,11 +841,120 @@ def test_strict_resume_fingerprint_binds_ordered_task_and_manifest_semantics(
         )
 
 
-def test_strict_resume_rejects_data_mismatch_before_model_construction(
-    monkeypatch: pytest.MonkeyPatch,
+def test_training_data_provenance_binds_filtered_record_identity(
     tmp_path: Path,
 ) -> None:
-    """Validate provenance before mutable training objects can be restored."""
+    """Distinguish equal-size retained populations selected from the same TSV."""
+
+    audio_root = tmp_path / "wav"
+    label_root = tmp_path / "lbl"
+    audio_root.mkdir()
+    label_root.mkdir()
+    for name in ("a.wav", "b.wav", "c.wav"):
+        (audio_root / name).write_bytes(b"audio")
+    for name in ("a.h5", "b.h5"):
+        (label_root / name).write_bytes(b"label")
+    manifest = tmp_path / "pretrain.tsv"
+    manifest.write_text(
+        f"{audio_root}\na.wav\t64\nb.wav\t64\nc.wav\t64\n",
+        encoding="utf-8",
+    )
+    config = load_config(
+        Path("tests/fixtures/tiny_pretrain.yaml"),
+        overrides=(f"task.data={tmp_path}", "task.min_label_size=1"),
+    )
+    first = AudioDataset(
+        manifest,
+        sample_rate=config.task.sample_rate,
+        conv_layers=config.task.conv_feature_layers,
+        min_label_size=1,
+    )
+    (label_root / "a.h5").unlink()
+    (label_root / "c.h5").write_bytes(b"label")
+    second = AudioDataset(
+        manifest,
+        sample_rate=config.task.sample_rate,
+        conv_layers=config.task.conv_feature_layers,
+        min_label_size=1,
+    )
+
+    assert [record.index for record in first.records] == [0, 1]
+    assert [record.index for record in second.records] == [1, 2]
+    assert first.sizes == second.sizes == (64, 64)
+    first_provenance = workflows._training_data_resume_provenance(config, first)
+    second_provenance = workflows._training_data_resume_provenance(config, second)
+    assert (
+        first_provenance["sampler"]["records_sha256"]
+        != second_provenance["sampler"]["records_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected_path", "mutate"),
+    (
+        (
+            "task.normalize",
+            lambda config: replace(
+                config,
+                task=replace(config.task, normalize=not config.task.normalize),
+            ),
+        ),
+        (
+            "criterion.focal_gamma",
+            lambda config: replace(
+                config,
+                criterion=replace(
+                    config.criterion,
+                    focal_gamma=config.criterion.focal_gamma + 1,
+                ),
+            ),
+        ),
+        (
+            "common.fp16",
+            lambda config: replace(
+                config,
+                common=replace(config.common, fp16=not config.common.fp16),
+            ),
+        ),
+        (
+            "common.fp16_init_scale",
+            lambda config: replace(
+                config,
+                common=replace(
+                    config.common,
+                    fp16_init_scale=config.common.fp16_init_scale * 2,
+                ),
+            ),
+        ),
+        (
+            "common.min_loss_scale",
+            lambda config: replace(
+                config,
+                common=replace(
+                    config.common,
+                    min_loss_scale=config.common.min_loss_scale + 1,
+                ),
+            ),
+        ),
+        (
+            "checkpoint.best_checkpoint_metric",
+            lambda config: replace(
+                config,
+                checkpoint=replace(
+                    config.checkpoint,
+                    best_checkpoint_metric="metrics/finetune/sequence_f1",
+                ),
+            ),
+        ),
+    ),
+)
+def test_strict_resume_rejects_mismatch_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    expected_path: str,
+    mutate: Any,
+) -> None:
+    """Validate task, loss, AMP, and metric semantics before mutable objects."""
 
     manifests = tmp_path / "manifests"
     manifests.mkdir()
@@ -833,10 +986,7 @@ def test_strict_resume_rejects_data_mismatch_before_model_construction(
         "sampler_state": None,
     }
     pristine_checkpoint = deepcopy(checkpoint)
-    active = replace(
-        saved_config,
-        task=replace(saved_config.task, normalize=not saved_config.task.normalize),
-    )
+    active = mutate(saved_config)
     monkeypatch.setattr(
         workflows,
         "_distributed_device",
@@ -852,7 +1002,10 @@ def test_strict_resume_rejects_data_mismatch_before_model_construction(
         ),
     )
 
-    with pytest.raises(training.CheckpointError, match=r"task\.normalize"):
+    with pytest.raises(
+        training.CheckpointError,
+        match=expected_path.replace(".", r"\."),
+    ):
         workflows._run_training(
             active,
             device_name="cpu",
@@ -862,8 +1015,11 @@ def test_strict_resume_rejects_data_mismatch_before_model_construction(
     assert checkpoint == pristine_checkpoint
 
 
-def test_legacy_multiworker_random_crop_resume_policy_warns_or_rejects() -> None:
-    """Do not describe worker-local random crops as exact under strict policy."""
+@pytest.mark.parametrize("num_workers", (0, 3))
+def test_legacy_random_crop_resume_policy_scans_full_epoch_and_ignores_workers(
+    num_workers: int,
+) -> None:
+    """Prevent exhausted cursors or worker-count changes from hiding crop risk."""
 
     base = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
     dataset = SimpleNamespace(sizes=(64, 80))
@@ -871,7 +1027,7 @@ def test_legacy_multiworker_random_crop_resume_policy_warns_or_rejects() -> None
         base,
         dataset=replace(
             base.dataset,
-            num_workers=2,
+            num_workers=num_workers,
             max_tokens=200,
             crop_strategy="legacy",
         ),
@@ -881,6 +1037,7 @@ def test_legacy_multiworker_random_crop_resume_policy_warns_or_rejects() -> None
         max_tokens=compatible.dataset.max_tokens,
         shuffle=False,
     )
+    sampler.next_batch = len(sampler._batches())
     with pytest.warns(RuntimeWarning, match="not bit-exact"):
         workflows._validate_crop_resume_policy(compatible, dataset, sampler)
 
@@ -890,6 +1047,28 @@ def test_legacy_multiworker_random_crop_resume_policy_warns_or_rejects() -> None
     )
     with pytest.raises(training.CheckpointError, match="not bit-exact"):
         workflows._validate_crop_resume_policy(strict, dataset, sampler)
+
+
+def test_old_checkpoint_provenance_warns_in_compatible_and_rejects_in_strict() -> None:
+    """Keep old checkpoints usable without presenting their data path as exact."""
+
+    compatible = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    checkpoint = {
+        "config": {"active": config_to_dict(compatible)},
+        "resume_compatibility": None,
+    }
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"lacks full a2v2\.training-data\.v2 provenance",
+    ):
+        workflows._validate_resume_compatibility(compatible, checkpoint)
+
+    strict = replace(
+        compatible,
+        checkpoint=replace(compatible.checkpoint, resume_policy="strict"),
+    )
+    with pytest.raises(training.CheckpointError, match="strict resume requires"):
+        workflows._validate_resume_compatibility(strict, checkpoint)
 
 
 def test_workflow_allows_only_v1_update_zero_global_to_adagc_transition(

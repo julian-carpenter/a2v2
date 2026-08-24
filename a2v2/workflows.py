@@ -94,6 +94,7 @@ from .training import (
     TrainingEngine,
     UpdateResult,
     average_precision,
+    best_checkpoint_metric_mode,
     build_gradient_clipper,
     build_optimizer,
     build_weight_decay_scheduler,
@@ -1695,17 +1696,16 @@ def _validate_resume_compatibility(
         saved = resume_compatibility_fingerprint(normalized_active)
     if not isinstance(saved, Mapping):
         raise CheckpointError("checkpoint resume compatibility state is malformed")
-    saved_has_provenance = saved.get("training_data.schema") == (
-        "a2v2.training-data.v1"
-    )
+    saved_provenance_schema = saved.get("training_data.schema")
+    saved_has_provenance = saved_provenance_schema == "a2v2.training-data.v2"
     if config.checkpoint.resume_policy == "strict" and not saved_has_provenance:
         raise CheckpointError(
-            "strict resume requires a checkpoint with a2v2.training-data.v1 "
+            "strict resume requires a checkpoint with a2v2.training-data.v2 "
             "provenance; use a new strict checkpoint or compatible policy"
         )
     if config.checkpoint.resume_policy == "compatible" and not saved_has_provenance:
         warnings.warn(
-            "resume checkpoint lacks full training-data provenance; validating "
+            "resume checkpoint lacks full a2v2.training-data.v2 provenance; validating "
             "the available legacy fingerprint only, so data-path resume is not "
             "guaranteed bit-exact",
             RuntimeWarning,
@@ -1714,7 +1714,7 @@ def _validate_resume_compatibility(
     all_paths = sorted(
         set(current) | set(saved)
         if saved_has_provenance
-        else set(saved)
+        else set(saved) - {"training_data.schema"}
     )
     for path in all_paths:
         if path not in saved or path not in current or saved[path] != current[path]:
@@ -1758,8 +1758,49 @@ def _training_data_resume_provenance(
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
+    raw_records = getattr(dataset, "records", None)
+    retained_records: list[dict[str, object]] = []
+    if isinstance(raw_records, Sequence):
+        if len(raw_records) != len(sizes):
+            raise CheckpointError(
+                "training dataset record identities do not match sampler population"
+            )
+        for position, (record, size) in enumerate(
+            zip(raw_records, sizes, strict=True)
+        ):
+            manifest_index = getattr(record, "index", None)
+            manifest_line = getattr(record, "manifest_line", None)
+            audio_path = getattr(record, "audio_path", None)
+            if (
+                type(manifest_index) is not int
+                or type(manifest_line) is not int
+                or not isinstance(audio_path, (str, Path))
+            ):
+                raise CheckpointError(
+                    f"training dataset record {position} lacks a canonical identity"
+                )
+            retained_records.append({
+                "manifest_index": manifest_index,
+                "manifest_line": manifest_line,
+                "audio_path": str(Path(audio_path).expanduser().resolve()),
+                "size": size,
+            })
+    else:
+        # Lightweight dataset adapters used outside the manifest workflow can
+        # still produce deterministic provenance. Native AudioDataset always
+        # takes the stronger branch above with original manifest identities.
+        retained_records = [
+            {"dataset_position": position, "size": size}
+            for position, size in enumerate(sizes)
+        ]
+    records_bytes = json.dumps(
+        retained_records,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
     return {
-        "schema": "a2v2.training-data.v1",
+        "schema": "a2v2.training-data.v2",
         "manifest": {
             "path": str(manifest),
             "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
@@ -1767,6 +1808,7 @@ def _training_data_resume_provenance(
         "sampler": {
             "population": len(sizes),
             "sizes_sha256": hashlib.sha256(sizes_bytes).hexdigest(),
+            "records_sha256": hashlib.sha256(records_bytes).hexdigest(),
         },
     }
 
@@ -1776,15 +1818,17 @@ def _sampler_has_random_crop(
     dataset: object,
     sampler: TokenBatchSampler,
 ) -> bool:
-    """Return whether any remaining batch can choose a nonzero crop offset."""
+    """Return whether any batch in the repeating epoch can crop randomly."""
 
     records = getattr(dataset, "records", None)
     if isinstance(records, Sequence):
         lengths = tuple(int(record.num_samples) for record in records)
     else:
         lengths = tuple(int(size) for size in getattr(dataset, "sizes", ()))
-    batches = sampler._batches()[sampler.next_batch:]
-    for batch in batches:
+    # TokenBatchSampler changes only batch order between epochs, not membership,
+    # so scanning the complete current batch set is conservative for every
+    # future epoch and cannot be bypassed by a restored exhausted cursor.
+    for batch in sampler._batches():
         batch_lengths = [lengths[index] for index in batch]
         uncapped = (
             max(batch_lengths)
@@ -1810,13 +1854,12 @@ def _validate_crop_resume_policy(
 
     if (
         config.dataset.crop_strategy != "legacy"
-        or config.dataset.num_workers == 0
         or not _sampler_has_random_crop(config, dataset, sampler)
     ):
         return
     message = (
-        "legacy random cropping with dataset.num_workers>0 is not bit-exact "
-        "across process restart; set dataset.crop_strategy=stateless"
+        "legacy random cropping is not bit-exact across process restart; "
+        "set dataset.crop_strategy=stateless"
     )
     if config.checkpoint.resume_policy == "strict":
         raise CheckpointError(message)
@@ -2153,7 +2196,12 @@ def _tracked_metric(config: Animal2VecConfig, metrics: dict[str, float]) -> tupl
             f"best checkpoint metric {config.checkpoint.best_checkpoint_metric!r} is unavailable; "
             f"choose one of {available}"
         )
-    return name, metrics[name], name != "loss"
+    return (
+        name,
+        metrics[name],
+        best_checkpoint_metric_mode(config.checkpoint.best_checkpoint_metric)
+        == "maximize",
+    )
 
 
 def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, object]:
@@ -2473,6 +2521,186 @@ def _prepare_output_directory(
 
 # Training orchestration
 
+@dataclass(frozen=True)
+class _TrainingPreflight:
+    """Read-only training inputs validated before model construction."""
+
+    resume_checkpoint: dict[str, Any] | None
+    dataset: object
+    sampler: TokenBatchSampler
+    resume_fingerprint: dict[str, object]
+    topology: RankTopology
+    topology_warnings: tuple[str, ...]
+
+
+def _local_training_preflight(
+    config: Animal2VecConfig,
+    *,
+    device: torch.device,
+    distributed: DistributedEnvironment,
+    resume_path: Path | None,
+) -> _TrainingPreflight:
+    """Construct and validate one rank's immutable training inputs."""
+
+    validate_launcher_contract(
+        os.environ,
+        config=config_to_dict(config),
+        slurm=_active_slurm_environment(),
+        distributed=distributed,
+    )
+    topology = _capture_rank_topology(distributed, device)
+    resume_checkpoint = (
+        load_checkpoint(resume_path, map_location=device)
+        if resume_path is not None
+        else None
+    )
+    dataset = _make_dataset(config)
+    if len(dataset) == 0:  # type: ignore[arg-type]
+        raise ValueError("training manifest contains no usable examples")
+    sizes = getattr(dataset, "sizes", None)
+    if not isinstance(sizes, Sequence):
+        raise CheckpointError("training dataset lacks ordered sampler sizes")
+    sampler = TokenBatchSampler(
+        sizes,
+        max_tokens=config.dataset.max_tokens,
+        seed=config.common.seed,
+        shuffle=True,
+        required_batch_size_multiple=config.dataset.required_batch_size_multiple,
+    )
+    if resume_checkpoint is not None and resume_checkpoint["sampler_state"] is not None:
+        sampler.load_state_dict(resume_checkpoint["sampler_state"])
+    training_data = _training_data_resume_provenance(config, dataset)
+    resume_fingerprint = resume_compatibility_fingerprint(
+        config_to_dict(config),
+        training_data=training_data,
+    )
+    if resume_fingerprint is None:
+        raise CheckpointError("could not fingerprint active training data")
+    topology_warnings: tuple[str, ...] = ()
+    if resume_checkpoint is not None:
+        _validate_resume_compatibility(
+            config,
+            resume_checkpoint,
+            training_data=training_data,
+        )
+        _validate_crop_resume_policy(config, dataset, sampler)
+        saved_topology = resume_checkpoint.get("topology")
+        if saved_topology is not None:
+            if not isinstance(saved_topology, Mapping):
+                raise CheckpointError("checkpoint topology state is malformed")
+            topology_warnings = tuple(
+                validate_resume_topology(
+                    saved_topology,
+                    current=topology,
+                    world_size=distributed.world_size,
+                )
+            )
+    return _TrainingPreflight(
+        resume_checkpoint=resume_checkpoint,
+        dataset=dataset,
+        sampler=sampler,
+        resume_fingerprint=resume_fingerprint,
+        topology=topology,
+        topology_warnings=topology_warnings,
+    )
+
+
+def _fingerprint_digest(fingerprint: Mapping[str, object]) -> str:
+    """Return a compact deterministic identifier for a gathered fingerprint."""
+
+    encoded = json.dumps(
+        fingerprint,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _coordinated_training_preflight(
+    config: Animal2VecConfig,
+    *,
+    device: torch.device,
+    distributed: DistributedEnvironment,
+    resume_path: Path | None,
+    group: dist.ProcessGroup | None,
+) -> _TrainingPreflight:
+    """Make every rank accept one preflight result or raise one shared error."""
+
+    if distributed.world_size <= 1:
+        return _local_training_preflight(
+            config,
+            device=device,
+            distributed=distributed,
+            resume_path=resume_path,
+        )
+
+    local_preflight: _TrainingPreflight | None = None
+    local_error: Exception | None = None
+    error_message: str | None = None
+    try:
+        local_preflight = _local_training_preflight(
+            config,
+            device=device,
+            distributed=distributed,
+            resume_path=resume_path,
+        )
+    except Exception as error:
+        local_error = error
+        error_message = f"{type(error).__name__}: {error}"
+
+    statuses: list[object] = [None] * distributed.world_size
+    dist.all_gather_object(
+        statuses,
+        {
+            "rank": distributed.rank,
+            "error": error_message,
+            "fingerprint": (
+                local_preflight.resume_fingerprint
+                if local_preflight is not None
+                else None
+            ),
+        },
+        group=group,
+    )
+    fingerprints: list[Mapping[str, object]] = []
+    for expected_rank, status in enumerate(statuses):
+        if not isinstance(status, Mapping) or status.get("rank") != expected_rank:
+            raise CheckpointError(
+                "distributed training preflight failed on rank "
+                f"{expected_rank}: malformed rank status"
+            ) from local_error
+        reported_error = status.get("error")
+        if reported_error is not None:
+            if not isinstance(reported_error, str):
+                reported_error = "malformed error status"
+            raise CheckpointError(
+                "distributed training preflight failed on rank "
+                f"{expected_rank}: {reported_error}"
+            ) from local_error
+        fingerprint = status.get("fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            raise CheckpointError(
+                "distributed training preflight failed on rank "
+                f"{expected_rank}: missing active fingerprint"
+            ) from local_error
+        fingerprints.append(fingerprint)
+
+    baseline = fingerprints[0]
+    for mismatch_rank, fingerprint in enumerate(fingerprints[1:], start=1):
+        if fingerprint != baseline:
+            raise CheckpointError(
+                "distributed training preflight fingerprint mismatch between "
+                f"rank 0 ({_fingerprint_digest(baseline)}) and rank "
+                f"{mismatch_rank} ({_fingerprint_digest(fingerprint)})"
+            )
+    if local_preflight is None:
+        raise CheckpointError(
+            "distributed training preflight reported success without local inputs"
+        )
+    return local_preflight
+
+
 def _run_training(
     config: Animal2VecConfig,
     *,
@@ -2493,7 +2721,6 @@ def _run_training(
         world_size=world_size,
         device=device,
     )
-    current_topology = _capture_rank_topology(distributed, device)
     active_preemption_flag = preemption_flag or PreemptionFlag()
     output_locks = owned_output_locks if owned_output_locks is not None else []
     if config.distributed.requested_world_size != world_size:
@@ -2504,12 +2731,6 @@ def _run_training(
             f"{config.distributed.requested_world_size} but the launch created {world_size} process(es); "
             "use torchrun with the configured worker count or override the field"
         )
-    validate_launcher_contract(
-        os.environ,
-        config=config_to_dict(config),
-        slurm=_active_slurm_environment(),
-        distributed=distributed,
-    )
     checkpoint_group = _checkpoint_process_group(device, world_size)
     if checkpoint_group is not None and created_checkpoint_groups is not None:
         created_checkpoint_groups.append(checkpoint_group)
@@ -2520,45 +2741,21 @@ def _run_training(
     random.seed(config.common.seed + rank)
     np.random.seed(config.common.seed + rank)
     torch.manual_seed(config.common.seed + rank)
-    resume_checkpoint = load_checkpoint(resume_path, map_location=device) if resume_path is not None else None
-    dataset = _make_dataset(config)
-    if len(dataset) == 0:
-        raise ValueError("training manifest contains no usable examples")
-    sampler = TokenBatchSampler(
-        dataset.sizes,
-        max_tokens=config.dataset.max_tokens,
-        seed=config.common.seed,
-        shuffle=True,
-        required_batch_size_multiple=config.dataset.required_batch_size_multiple,
+    preflight = _coordinated_training_preflight(
+        config,
+        device=device,
+        distributed=distributed,
+        resume_path=resume_path,
+        group=checkpoint_group,
     )
-    if resume_checkpoint is not None and resume_checkpoint["sampler_state"] is not None:
-        sampler.load_state_dict(resume_checkpoint["sampler_state"])
-    training_data = _training_data_resume_provenance(config, dataset)
-    training_resume_fingerprint = resume_compatibility_fingerprint(
-        config_to_dict(config),
-        training_data=training_data,
-    )
-    if training_resume_fingerprint is None:
-        raise CheckpointError("could not fingerprint active training data")
-    if resume_checkpoint is not None:
-        _validate_resume_compatibility(
-            config,
-            resume_checkpoint,
-            training_data=training_data,
-        )
-        _validate_crop_resume_policy(config, dataset, sampler)
-        saved_topology = resume_checkpoint.get("topology")
-        if saved_topology is not None:
-            if not isinstance(saved_topology, Mapping):
-                raise CheckpointError("checkpoint topology state is malformed")
-            topology_warnings = validate_resume_topology(
-                saved_topology,
-                current=current_topology,
-                world_size=world_size,
-            )
-            if rank == 0:
-                for warning in topology_warnings:
-                    print(json.dumps({"topology_warning": warning}), flush=True)
+    resume_checkpoint = preflight.resume_checkpoint
+    dataset = preflight.dataset
+    sampler = preflight.sampler
+    training_resume_fingerprint = preflight.resume_fingerprint
+    current_topology = preflight.topology
+    if rank == 0:
+        for warning in preflight.topology_warnings:
+            print(json.dumps({"topology_warning": warning}), flush=True)
     model, pretrained_config = _make_model(
         config,
         pretrained_checkpoint=pretrained_checkpoint,
