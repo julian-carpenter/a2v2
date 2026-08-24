@@ -1,0 +1,128 @@
+# Opt-in MeerKAT-scale pretraining example for the modern Transformer path.
+# This recipe starts a new checkpoint family. It cannot load legacy MLP or
+# no-CLS encoder weights because GEGLU and CLS add new parameter shapes.
+# Replace task.data before launch. Install a2v2[bnb] for AdamW8bit.
+
+# Compile the module in place before DDP. Partial-graph mode permits the
+# deterministic NumPy mask builder and dynamic masked-token selection.
+common:
+  fp16: true
+  log_interval: 384
+  tensorboard_logdir: tb
+  fp16_init_scale: 1
+  min_loss_scale: 1e-6
+  torch_compile: true
+  torch_compile_backend: inductor
+  torch_compile_mode: default
+  torch_compile_fullgraph: false
+  torch_compile_dynamic: false
+
+# Save native checkpoint v2 state, including AdaGC and decay clocks.
+checkpoint:
+  save_dir: checkpoints/modern_rope_cls_geglu_pretrain
+  save_interval: 10
+
+# Keep the published MeerKAT sample rate and convolution geometry.
+task:
+  data: /path/to/manifest_files
+  sample_rate: 8000
+  normalize: true
+  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1
+  enable_padding: false
+
+# Preserve the published token budget and pretraining split.
+dataset:
+  num_workers: 32
+  max_tokens: 408_000
+  required_batch_size_multiple: 1
+  train_subset: pretrain
+  disable_validation: true
+
+# The launcher must create four global workers unless you override this guard.
+distributed_training:
+  distributed_world_size: 4
+
+# AdaGC uses clip_norm as its global warm-up threshold for the first 100
+# successful optimizer updates, then clips each tensor from its norm history.
+optimization:
+  update_freq: [5]
+  max_update: 384230
+  clip_norm: 1
+  lr: [0.0001]
+  gradient_clip_method: adagc
+  adagc_beta: 0.99
+  adagc_relative_clip: 1.04
+  adagc_warmup_updates: 100
+
+# AdamW8bit requires the optional bnb extra and a CUDA device. The cosine
+# weight-decay clock reaches zero at max_update and ignores failed AMP steps.
+optimizer:
+  _name: adamw8bit
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1e-6
+  weight_decay: 0.01
+  min_8bit_size: 4096
+  weight_decay_schedule: cosine
+  weight_decay_end: 0.0
+
+# The learning-rate clock uses the same successful-update counter.
+lr_scheduler:
+  warmup_updates: 10000
+
+# RoPE, strict Flash, CLS, packed GEGLU, and DeepScaleLM define a new encoder
+# architecture. Fine-tuning must use the paired recipe and this checkpoint.
+model:
+  depth: 16
+  embed_dim: 1024
+  num_heads: 16
+  clone_batch: 12
+  ema_decay: 0.9997
+  ema_end_decay: 1
+  ema_anneal_end_step: 300000
+  average_top_k_layers: 16
+  instance_norm_target_layer: true
+  layer_norm_target_layer: false
+  layer_norm_targets: false
+  layerdrop: 0
+  norm_eps: 1e-5
+  source_mixup: 0.5
+  mixup_prob: 1.0
+  same_mixup: true
+  mixing_window_length: 0.05
+  gain_mode: A_weighting
+  loss_beta: 0
+  loss_scale: null
+  checkpoint_activations: true
+  position_encoding: rope
+  attention_backend: flash
+  rope_theta: 10000.0
+  use_cls_token: true
+  cls_loss_weight: 1.0
+  classification_head: frame
+  ffn_type: geglu
+  initialization: deepscale_lm
+  modalities:
+    audio:
+      sinc_input: true
+      apply_window_to_root: false
+      use_pswish: true
+      sinc_norm: layer_norm
+      conv_pos_depth: 5
+      conv_pos_width: 95
+      conv_pos_groups: 16
+      prenet_depth: 8
+      mask_prob: 1.5
+      mask_length: 2
+      mask_noise_std: 0.01
+      mask_dropout: 0
+      use_alibi_encoder: false
+      prenet_dropout: 0.1
+      learned_alibi_scale: true
+      learned_alibi_scale_per_head: true
+      decoder:
+        input_dropout: 0.1
+        decoder_dim: 768
+        decoder_groups: 16
+        decoder_kernel: 7
+        decoder_layers: 4

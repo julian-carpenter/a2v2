@@ -38,6 +38,8 @@ under the same project identity without renaming the Animal2Vec 1.0 control.
 - [Code reading guide](docs/code-guide.md)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Installation](#installation)
+- [Opt-in modern recipes](#opt-in-modern-recipes)
+- [SLURM launch](#slurm-launch)
 - [Data and manifest preparation](#data-and-manifest-preparation)
 - [Downloading the official artifacts](#downloading-the-official-artifacts)
 - [Converting official Fairseq weights](#converting-official-fairseq-weights)
@@ -247,6 +249,19 @@ experiment storage.
 - Stable DDP bucket/traversal settings for bitwise resume.
 - Structured per-rank elapsed-time and CUDA-memory summaries.
 
+### Opt-in modern Transformer and training modes
+
+- RoPE or ALiBi position encoding with explicit resolution rules.
+- PyTorch SDPA with selectable fallback or strict Flash enforcement.
+- Direct CLS regression during pretraining and sequence-level CLS fine-tuning.
+- Packed GEGLU feed-forward blocks and DeepScaleLM residual scaling.
+- AdaGC with checkpointed per-parameter norm history.
+- AdamW plus optional bitsandbytes Adam8bit and AdamW8bit.
+- Cosine weight-decay annealing on the successful-update clock.
+- In-place `torch.compile` policy with recorded graph settings.
+- The existing non-reentrant activation-checkpointing option.
+- Separate SLURM launchers with torchrun topology and preemption contracts.
+
 ### Checkpoints and exact resume
 
 - Versioned native checkpoint schema.
@@ -321,10 +336,12 @@ animal2vec2.0/
 │   ├── README.md
 │   ├── MeerKAT/
 │   ├── hyenas/
+│   ├── modern/
 │   ├── cpu_smoke_pretraining.yaml
 │   └── cpu_smoke_finetuning.yaml
 ├── docs/
 │   ├── code-guide.md
+│   ├── slurm.md
 │   ├── checkpoint-conversion.md
 │   ├── reproducing-paper.md
 │   ├── gpu-verification-20260723.md
@@ -433,6 +450,19 @@ For development and tests:
 python -m pip install -e '.[test]'
 ```
 
+The two modern examples select bitsandbytes AdamW8bit. Install its pinned
+optional dependency with:
+
+```bash
+python -m pip install -e '.[bnb]'
+```
+
+The `bitsandbytes>=0.49,<0.50` wheel range lacks a CUDA 13.3 binary. The
+verified CUDA 13.3 host used the wheel's CUDA 13.0 binary with
+`BNB_CUDA_VERSION=130`. Use that override after confirming driver support for
+the packaged CUDA 13.0 binary, or build bitsandbytes from source. Other CUDA
+wheel targets need no override.
+
 Confirm that the three console commands exist:
 
 ```bash
@@ -456,6 +486,101 @@ source change.
 Keep Fairseq out of the native environment. If a raw official checkpoint
 embeds unavailable Python objects, create a plain tensor/config export in a
 separate external environment as described under conversion.
+
+## Opt-in modern recipes
+
+The paired modern examples live outside the frozen reproduction directories:
+
+| Stage | Recipe |
+| --- | --- |
+| Pretraining with frame and CLS regression | `configs/modern/rope_cls_geglu_pretrain.yaml` |
+| Sequence-level fine-tuning | `configs/modern/rope_cls_geglu_finetune.yaml` |
+
+Both files define the same 16-layer, 1,024-dimensional encoder with an
+eight-layer prenet, RoPE, strict Flash attention, a CLS token, packed GEGLU,
+and DeepScaleLM. They also select activation checkpointing, AdaGC, AdamW8bit,
+cosine weight-decay annealing, and partial-graph `torch.compile`.
+
+Train the pretraining example after replacing its manifest path:
+
+```bash
+BNB_CUDA_VERSION=130 \
+torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
+  --config configs/modern/rope_cls_geglu_pretrain.yaml \
+  --override task.data=/datasets/MeerKAT/manifests \
+  --override checkpoint.save_dir=/checkpoints/modern-pretrain \
+  --device cuda
+```
+
+Pass the resulting native checkpoint to the paired fine-tuning recipe:
+
+```bash
+BNB_CUDA_VERSION=130 \
+torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
+  --config configs/modern/rope_cls_geglu_finetune.yaml \
+  --pretrained-checkpoint /checkpoints/modern-pretrain/checkpoint_last.pt \
+  --override task.data=/datasets/MeerKAT/manifests \
+  --override checkpoint.save_dir=/checkpoints/modern-finetune \
+  --device cuda
+```
+
+Remove `BNB_CUDA_VERSION` on a CUDA target covered by the installed wheel.
+Strict Flash raises an error when PyTorch cannot dispatch the Flash kernel;
+select `model.attention_backend=sdpa` for kernel fallback. Read the
+[configuration guide](configs/README.md) before changing architecture fields.
+
+CLS and GEGLU add checkpoint tensors, and DeepScaleLM changes residual
+equations. The modern pair cannot reinterpret published Animal2Vec 1.0
+weights. Fine-tuning construction checks the CLS requirement and strict state
+loading checks every key and shape.
+
+## SLURM launch
+
+`scripts/reproduce_meerkat_slurm.sh` runs one torchrun agent per node and one
+worker per allocated GPU. The commands below use the frozen MeerKAT recipes.
+The SLURM path remains separate from the byte-identical local paper driver.
+
+Submit pretraining:
+
+```bash
+sbatch scripts/reproduce_meerkat_slurm.sh \
+  /datasets/MeerKAT/manifests /shared/runs/meerkat \
+  --phase pretrain --nodes 2 --gpus-per-node 4
+```
+
+Submit fine-tuning after pretraining has produced its handoff checkpoint:
+
+```bash
+sbatch scripts/reproduce_meerkat_slurm.sh \
+  /datasets/MeerKAT/manifests /shared/runs/meerkat \
+  --phase finetune --nodes 2 --gpus-per-node 4
+```
+
+Submit pretraining, fine-tuning, and one-GPU final evaluation as one staged
+batch job:
+
+```bash
+sbatch scripts/reproduce_meerkat_slurm.sh \
+  /datasets/MeerKAT/manifests /shared/runs/meerkat \
+  --phase all --nodes 2 --gpus-per-node 4
+```
+
+Render the full command graph without SLURM, CUDA, manifests, or checkpoints:
+
+```bash
+bash scripts/reproduce_meerkat_slurm.sh \
+  /datasets/MeerKAT/manifests /shared/runs/meerkat \
+  --phase all --nodes 2 --gpus-per-node 4 \
+  --job-id dryrun-4815 --dry-run
+```
+
+Add account, partition, wall-time, and site module directives through your
+submit environment. The launcher requests `SIGUSR1` with five minutes of lead
+time and returns exit 75 after it validates a new coordinated checkpoint. It
+does not call `scontrol requeue`; the site or submitter owns retry policy.
+Read the [SLURM guide](docs/slurm.md) for rendezvous, locking, resume,
+completion markers, troubleshooting, and the unrun real-cluster acceptance
+gate.
 
 ## Data and manifest preparation
 

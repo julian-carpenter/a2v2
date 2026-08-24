@@ -58,9 +58,70 @@ overrides, under `run/config`. Archive that event directory with checkpoints.
 depth, data volume, and update count so a developer can test the end-to-end
 Animal2Vec 1.0 flow on a CPU. Their outputs do not reproduce paper metrics.
 
-## Future A2V2 configurations
+## Opt-in modern examples
 
-Place new experiment families under `configs/a2v2/` or a more specific
-subdirectory below it. Keep each new recipe's method name, dataset, and stage
-visible in its path. Document which Animal2Vec 1.0 recipe serves as its control,
-and retain that control recipe without value changes.
+`modern/rope_cls_geglu_pretrain.yaml` and
+`modern/rope_cls_geglu_finetune.yaml` form one checkpoint-compatible encoder
+pair. Both recipes use the MeerKAT sample rate, convolution geometry, width,
+depth, head count, and eight-layer prenet from the published large control.
+They start a separate checkpoint family under `checkpoints/modern_*`.
+
+The pair selects RoPE, strict Flash attention, a learned CLS token, packed
+GEGLU blocks, DeepScaleLM initialization, activation checkpointing, AdaGC,
+AdamW8bit, cosine weight-decay annealing, and `torch.compile`. The pretraining
+recipe adds a CLS regression objective while retaining frame reconstruction.
+The fine-tuning recipe selects a sequence-level CLS classifier.
+
+These files illustrate the modern path. They do not define a paper baseline
+and cannot load the published encoder weights. CLS and GEGLU add parameters
+and change tensor shapes. DeepScaleLM also changes residual equations.
+
+### Architecture and checkpoint choices
+
+| Field | Values and contract |
+| --- | --- |
+| `model.position_encoding` | `legacy` reads the old ALiBi flag. `alibi`, `rope`, and `none` select a strategy. RoPE needs an even head dimension and uses `rope_theta`, which defaults to 10,000. |
+| `model.attention_backend` | `legacy` keeps manual attention for legacy position settings and resolves explicit RoPE or no-position models to SDPA. `manual` gives a reference path. `sdpa` permits PyTorch kernel fallback. `flash` forces the Flash SDPA backend and raises an error when the kernel cannot run. ALiBi uses manual attention. |
+| `model.use_cls_token` | Adds a learned encoder token and a pretraining CLS predictor. The default `false` keeps legacy state keys. |
+| `model.cls_loss_weight` | Scales direct student and EMA-teacher CLS regression. The default 1.0 counts one CLS vector like one masked frame vector. |
+| `model.classification_head` | `frame` emits event-localization logits. `cls` emits one multilabel vector per recording and requires a CLS-enabled pretrained encoder. |
+| `model.ffn_type` | `mlp` preserves the legacy blocks. `geglu` creates a packed value/gate projection with different state shapes. |
+| `model.initialization` | `legacy` preserves the baseline initializer. `deepscale_lm` changes new-model initialization and residual scaling. A loaded checkpoint remains authoritative. |
+
+Keep the architecture fields, `task.sample_rate`,
+`task.conv_feature_layers`, and audio prenet depth equal across a pretraining
+checkpoint and its fine-tuning recipe. Strict state loading rejects missing
+CLS or GEGLU tensors and incompatible shapes.
+
+### Execution and optimization policy
+
+| Field | Values and contract |
+| --- | --- |
+| `model.checkpoint_activations` | Existing execution option. It uses non-reentrant block recomputation with RNG preservation during gradient-enabled training and adds no model tensors. |
+| `common.torch_compile` | Enables in-place module compilation before DDP. The default `false` keeps eager execution. |
+| `common.torch_compile_backend`, `torch_compile_mode`, `torch_compile_dynamic` | Pass values to `nn.Module.compile`. The workflow records them in config and summaries. |
+| `common.torch_compile_fullgraph` | `false` permits graph breaks around deterministic NumPy masking and dynamic selection. `true` serves as a strict diagnostic and can reject layerdrop or masking control. |
+| `optimization.gradient_clip_method` | `global` keeps the legacy clip. `none` disables clipping. `adagc` uses `clip_norm` during warm-up and then clips each parameter tensor against its norm history. |
+| `optimization.adagc_beta`, `adagc_relative_clip`, `adagc_warmup_updates` | Defaults: 0.99, 1.04, and 100 successful updates. AdaGC state advances after an optimizer update succeeds. |
+| `optimizer._name` | Adds `adamw`, `adam8bit`, and `adamw8bit` beside the Fairseq-compatible `adam` control. |
+| `optimizer.min_8bit_size` | Defaults to 4,096. bitsandbytes keeps smaller tensor state in FP32. |
+| `optimizer.weight_decay_schedule` | `constant` keeps the legacy fixed value. `cosine` anneals nonzero groups from `weight_decay` to `weight_decay_end`; an omitted endpoint means 0.0. |
+
+Install the optional optimizer extra with:
+
+```bash
+python -m pip install -e '.[bnb]'
+```
+
+The pinned range is `bitsandbytes>=0.49,<0.50`. Version 0.49.2 does not ship
+a CUDA 13.3 binary. The tested CUDA 13.3 host loaded the packaged CUDA 13.0
+binary with `BNB_CUDA_VERSION=130`. Use that override when the selected
+binary matches the host driver and toolkit contract. A source build provides
+the other CUDA 13.3 route. CUDA versions covered by the wheel need no override.
+
+## Adding another A2V2 family
+
+Place each new family below `configs/a2v2/` or another named subdirectory.
+Keep the method, dataset, and stage visible in the path. Name the Animal2Vec
+1.0 recipe that supplies its control and retain the control file without value
+changes.

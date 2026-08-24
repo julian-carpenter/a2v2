@@ -37,6 +37,10 @@ YAML_HASHES = {
         "5398ae35c32452694f624bbd7df90eadfee74e118de51dcb1d7c74d172f0f59f",
     "configs/hyenas/finetune_mixup_100.yaml":
         "7b657777801b20fdef164a714def35677be579b7cbbd8bca3cbbd16cf96a9681",
+    "configs/modern/rope_cls_geglu_finetune.yaml":
+        "5edf20a0d85f401f14c42e07c6388d87a71109fa7665e0f0381cf84d5b937f93",
+    "configs/modern/rope_cls_geglu_pretrain.yaml":
+        "7a1b1225a61f4bc7025c792562f923f752db1dc0050b319910d18e904bff3ee8",
     "tests/fixtures/tiny_finetune.yaml":
         "166ebbbc14417430a664b02fdaf2f7c327d9923217cff5f00a6b8487aedff0cc",
     "tests/fixtures/tiny_pretrain.yaml":
@@ -258,3 +262,78 @@ def test_finetuning_activation_memory_contract_is_documented() -> None:
     assert _shell_fences(reproduction)
     assert not _has_finetune_800000_shell_assignment(reproduction)
     assert "substantially more measured headroom" not in reproduction
+
+
+def test_modern_features_and_slurm_contract_are_documented() -> None:
+    """Keep opt-in features, launch commands, and site gates discoverable."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    configs = (ROOT / "configs/README.md").read_text(encoding="utf-8")
+    code_guide = (ROOT / "docs/code-guide.md").read_text(encoding="utf-8")
+    reproduction = (ROOT / "docs/reproducing-paper.md").read_text(
+        encoding="utf-8",
+    )
+    slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
+
+    for required in (
+        "configs/modern/rope_cls_geglu_pretrain.yaml",
+        "configs/modern/rope_cls_geglu_finetune.yaml",
+        "pip install -e '.[bnb]'",
+        "[SLURM guide](docs/slurm.md)",
+        "--phase pretrain",
+        "--phase finetune",
+        "--phase all",
+        "--dry-run",
+    ):
+        assert required in readme
+
+    for required in (
+        "Architecture and checkpoint choices",
+        "Execution and optimization policy",
+        "position_encoding",
+        "attention_backend",
+        "use_cls_token",
+        "classification_head",
+        "gradient_clip_method",
+        "weight_decay_schedule",
+        "torch_compile_fullgraph",
+        "checkpoint_activations",
+        "BNB_CUDA_VERSION=130",
+    ):
+        assert required in configs
+
+    for required in (
+        "RoPE and ALiBi",
+        "Strict Flash and SDPA",
+        "CLS pretraining and sequence fine-tuning",
+        "Packed GEGLU and DeepScaleLM",
+        "AdaGC",
+        "Cosine weight-decay clock",
+        "Checkpoint format v1 and v2",
+        "Graph breaks",
+        "A100 microbenchmark",
+    ):
+        assert required in code_guide
+
+    for required in (
+        "scripts/reproduce_meerkat_paper.sh",
+        "scripts/reproduce_meerkat_slurm.sh",
+        "byte-identical",
+        "unrun real-site gate",
+    ):
+        assert required in reproduction
+
+    for required in (
+        "one torchrun agent per node",
+        "a2v2.stage-completion.v1",
+        "SIGUSR1",
+        "300 seconds",
+        "exit 75",
+        "site policy",
+        "A2V2_RUN_ID",
+        "c10d",
+        "One-node parity",
+        "Two-node acceptance matrix",
+        "Unrun real-site gate",
+    ):
+        assert required in slurm

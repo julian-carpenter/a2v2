@@ -1,9 +1,9 @@
 # A2V2 code guide
 
 The current A2V2 runtime contains the complete Animal2Vec 1.0 reproduction
-baseline in five implementation files under `a2v2/`, plus one public API file.
-These six files form the stable control implementation against which future
-A2V2 methods can be compared. Each implementation file uses large section
+baseline in five implementation files under `a2v2/`, one SLURM contract
+module, and one public API file. The baseline branches form the stable control
+against which new A2V2 methods can be compared. Each implementation file uses large section
 banners to preserve the navigation benefits of smaller modules. Search for a
 banner title or use an editor's symbol outline to move within a file.
 
@@ -19,6 +19,9 @@ a2v2.config
 a2v2.training
       ↓
 a2v2.workflows
+
+a2v2.slurm supplies pure launch, topology, lock, and marker contracts to
+a2v2.workflows and the shell launchers.
 ```
 
 `a2v2.__init__` re-exports the common configuration, model, and inference
@@ -204,7 +207,7 @@ reflection-padding backward kernel uses nondeterministic atomics on the
 verified environment, so this implementation preserves the equivalent
 deterministic operation.
 
-### Attention and ALiBi
+### Attention, RoPE and ALiBi
 
 `alibi_slopes` creates the geometric head slopes from the ALiBi paper.
 `alibi_bias` builds
@@ -216,6 +219,79 @@ B[h,i,j] = -slope[h] |i-j|.
 `MultiheadAttention` packs Q, K, and V in one projection to retain checkpoint
 layout. It adds ALiBi before masking, assigns negative infinity to padded keys,
 normalizes attention weights in float32, and returns to the surrounding dtype.
+
+#### RoPE and ALiBi
+
+`resolve_position_encoding` preserves the legacy rule: `legacy` reads
+`audio.use_alibi_encoder`. Explicit `alibi`, `rope`, and `none` bypass
+that old flag. RoPE rotates packed Q and K after projection. It calculates
+sine and cosine values in FP32 from integer position IDs and needs an even
+head dimension.
+
+The masked student gathers frame position IDs with the same `ids_keep` tensor
+that gathers features. A CLS-enabled encoder assigns ID zero to CLS and shifts
+frame IDs by one. The new ALiBi CLS path gives the CLS row and column zero bias
+while frame pairs retain their temporal distance. The CLS-disabled ALiBi path
+keeps the legacy calculation.
+
+#### Strict Flash and SDPA
+
+`resolve_attention_backend` keeps `legacy` manual attention for legacy
+position settings. An explicit RoPE or no-position model with a legacy backend
+resolves to `sdpa`. The `sdpa` branch calls
+`scaled_dot_product_attention` and lets PyTorch choose Flash,
+memory-efficient, or math kernels. The `flash` branch enables the Flash SDPA
+backend alone and raises an actionable setup error when the kernel rejects the
+device, dtype, shape, or mask. Test and benchmark reports can call a run
+Flash after strict mode succeeds. ALiBi stays on manual attention because
+its dense learned bias does not fit the selected Flash contract.
+
+#### CLS pretraining and sequence fine-tuning
+
+`AudioEncoder` adds one learned `[1, 1, D]` token when
+`use_cls_token=true`. It prepends the token after convolutional positional
+encoding. Frame masks and decoder restoration retain their frame axis; context
+padding adds one valid CLS column.
+
+The pretraining teacher encodes full frames plus CLS. The student encodes CLS
+plus retained frames. A conditional predictor compares the final student CLS
+state with the normalized EMA-teacher CLS target:
+
+```text
+loss = masked_frame_loss + cls_loss_weight * cls_loss
+sample_size = masked_frame_count + cls_count
+```
+
+The default weight is 1.0. Frame target normalization excludes CLS, so the
+added token does not alter frame time statistics. A CLS-disabled model creates
+no token or predictor and retains legacy state keys.
+
+`classification_head=cls` averages selected top-layer CLS states and emits
+`[B, C]` logits. Fine-tuning reduces frame labels to recording occurrence
+before mixup and reports `sample_size=B`. Event fusion rejects sequence
+logits because they contain no timing axis. The sequence evaluator reports
+multilabel precision, recall, F1, accuracy, and average precision.
+
+#### Packed GEGLU and DeepScaleLM
+
+`ffn_type=geglu` replaces each MLP input projection with one packed
+`2 * int(D * mlp_ratio)` projection. The block splits value and gate halves,
+applies GELU to the gate, multiplies both halves, and projects back to `D`.
+GEGLU changes parameter shapes and requires a matching checkpoint.
+
+`initialization=deepscale_lm` uses total Transformer depth
+`N = prenet_depth + depth`, with `N >= 2`:
+
+```text
+lambda = sqrt(1 - 2/N)
+beta = sqrt(2/N)
+residual(x, branch) = lambda * x + beta * branch
+```
+
+The initializer handles Q, K, V, attention output, and FFN roles. It leaves the
+audio frontend under its acoustic rules. Checkpoint loading overwrites
+initialization, while strict tensor keys and shapes enforce architecture
+compatibility.
 
 ### Masking and decoder
 
@@ -338,6 +414,47 @@ ALiBi scales, and P-Swish parameters from weight decay.
 It supports linear warmup and cosine cycles. Diagnostic early stops do not
 change its full configured horizon.
 
+#### AdaGC
+
+`build_gradient_clipper` selects `global`, `none`, or `adagc`. AdaGC
+runs after AMP unscale and distributed sample-size normalization. For updates
+before `adagc_warmup_updates`, it uses `clip_norm` as a global threshold and
+records each tensor's clipped norm minimum. Later updates clip each tensor
+against the prior norm EMA, then update that EMA from the clipped norm.
+
+Defaults are `adagc_beta=0.99`, `adagc_relative_clip=1.04`, and
+`adagc_warmup_updates=100`. AdaGC stores one CPU FP32 scalar per named
+trainable parameter. AMP overflow and rank-wide optimizer failure leave its
+update counter and EMA state unchanged. Resume requires AdaGC state after
+update zero.
+
+#### 8-bit optimizers
+
+`build_optimizer` adds PyTorch AdamW plus bitsandbytes Adam8bit and AdamW8bit.
+The two 8-bit paths import bitsandbytes after device and
+`min_8bit_size` validation. They require CUDA and the
+`bitsandbytes>=0.49,<0.50` extra. The builder reports missing APIs, version
+mismatch, unloaded CUDA libraries, and constructor failures as setup errors.
+All optimizers use the same ordered decay and no-decay parameter groups.
+
+The 0.49.2 wheel lacks a CUDA 13.3 binary. Bounded CUDA tests on the recorded
+13.3 host used `BNB_CUDA_VERSION=130` to load the packaged CUDA 13.0 binary.
+A source build covers CUDA 13.3 without that wheel override.
+
+#### Cosine weight-decay clock
+
+`CosineWeightDecayScheduler` uses the successful optimizer-update clock:
+
+```text
+w(u) = w_end + 0.5 * (w_0 - w_end) * (1 + cos(pi * min(u,U) / U))
+```
+
+`weight_decay_schedule=constant` creates no scheduler and preserves the
+legacy default. The opt-in cosine schedule uses
+`optimizer.weight_decay_end=0.0` when the endpoint is absent. Groups that
+start at zero stay zero. A v2 checkpoint stores `last_update`; restore
+recomputes the live value against the active, allowed `max_update` horizon.
+
 ### Checkpoints and random state
 
 `capture_rng_state` records Python, NumPy, CPU PyTorch, and every CUDA generator.
@@ -355,6 +472,20 @@ group.
 
 `save_checkpoint` writes a temporary file and performs an atomic replacement.
 `validate_checkpoint` enforces the versioned plain-container schema.
+
+#### Checkpoint format v1 and v2
+
+The reader accepts checkpoint format v1 and supplies legacy defaults for
+stateful fields that v1 lacks. New saves use format v2. A v2 payload stores
+gradient-clipper state, weight-decay scheduler state, distributed topology, and
+the resume-compatibility fingerprint beside the model, optimizer, LR
+scheduler, scaler, sampler, EMA teacher, and RNG state.
+
+V1 can resume the legacy global or no-clipping path. It cannot resume AdaGC
+after update zero because no norm history exists. Older v2 and local
+checkpoints with `topology=None` remain readable. Architecture compatibility
+still comes from serialized active and pretrained configs plus strict tensor
+keys and shapes.
 
 ### Metrics and training engine
 
@@ -397,6 +528,33 @@ schedule, teacher, validation, sampler, or checkpoint cadence.
 ## `a2v2/workflows.py`
 
 This file composes all lower-level pieces and owns external side effects.
+
+### Compile policy and Graph breaks
+
+The workflow moves the model to its device, calls `Module.compile` in place
+when enabled, and then builds the clipper, optimizer, and DDP wrapper. In-place
+compilation keeps parameter identities and state keys. Compile settings stay
+in execution provenance and do not enter the mathematical resume fingerprint.
+
+`torch_compile_fullgraph=false` permits graph breaks around deterministic
+NumPy mask creation, dynamic `nonzero` selection, stable sample-ID scalar
+access, and mask-count validation. A complete modern pretraining update in the
+recorded CUDA run produced seven graph breaks and ten unique graphs.
+`fullgraph=true` can reject NumPy layerdrop and serves as a diagnostic for
+pure Transformer regions. A two-length dynamic fine-tuning test recorded one
+unique graph.
+
+The bounded A100 microbenchmark measured one warmed-up FP16 shape:
+`B=2`, `T=128`, `D=64`, four heads, two layers, GEGLU, strict Flash, and
+activation checkpointing. Eager took 10.3072 ms per iteration and compiled
+took 3.7094 ms for five measured iterations after two warm-ups. That
+`2.7787x` ratio describes this microbenchmark on one A100-SXM4-40GB. It makes
+no paper-scale or general throughput claim.
+
+Activation checkpointing remains the existing
+`model.checkpoint_activations` option. It uses non-reentrant PyTorch
+checkpointing with RNG preservation during gradient-enabled training and
+creates no model parameter or buffer.
 
 ### Events and evaluation
 

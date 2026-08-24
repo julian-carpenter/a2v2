@@ -15,6 +15,33 @@ topology, masking, freeze boundaries, and required paths beside their exact
 values. The [code guide](code-guide.md) defines repository terminology and
 maps the principal equations to their source implementations.
 
+## Local control and separate SLURM path
+
+`scripts/reproduce_meerkat_paper.sh` remains the canonical local eight-A100
+control. The modern Transformer work and SLURM support kept that file
+byte-identical at SHA-256
+`485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18`.
+It retains the same three training commands, resolved MeerKAT recipes,
+fine-tuning activation-checkpoint override, and final evaluation flow.
+
+`scripts/reproduce_meerkat_slurm.sh` provides a separate scheduler entry
+point. It uses the frozen MeerKAT recipes by default, starts one torchrun agent
+per node, runs one worker per GPU, creates phase-specific rendezvous IDs, and
+runs final evaluation as a one-node, one-GPU step. It does not change the local
+driver or establish paper equivalence for a new topology.
+
+The SLURM implementation passed Bash syntax, deterministic dry-run, mocked
+scheduler, two-rank Gloo safe-point, frozen-driver, and full CPU tests. No real
+`sbatch`, multi-node SLURM step, or scheduler preemption ran on the
+development node. The unrun real-site gate covers one-node parity and at least
+two nodes with two GPUs each for transport, shared-filesystem semantics,
+checkpoint/resume, lock contention, and preemption/requeue behavior. Record
+the site, software versions, allocation, date, and results before claiming
+cluster validation.
+
+Read [the SLURM guide](slurm.md) for commands, marker and lock contracts,
+handoff rules, recovery, and the acceptance matrix.
+
 ## One-fold approximate reproduction on eight A100 GPUs
 
 For the practical eight-GPU run requested for this repository, use the

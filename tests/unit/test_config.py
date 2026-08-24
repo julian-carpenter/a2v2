@@ -3,6 +3,7 @@ covers restricted convolution expressions, defaults, overrides, AMP values, DDP
 settings, and unknown fields."""
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,87 @@ from a2v2.workflows import _ddp_bucket_cap_mb_list, _ddp_find_unused_parameters
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_modern_example_configs_select_compatible_architecture_and_policies() -> None:
+    """Load the paired modern recipes with one checkpoint-compatible encoder."""
+
+    pretrain = load_config(ROOT / "configs/modern/rope_cls_geglu_pretrain.yaml")
+    finetune = load_config(ROOT / "configs/modern/rope_cls_geglu_finetune.yaml")
+
+    assert pretrain.stage == "pretrain"
+    assert finetune.stage == "finetune"
+    for config in (pretrain, finetune):
+        assert config_module.resolve_position_encoding(config.model) == "rope"
+        assert config_module.resolve_attention_backend(config.model) == "flash"
+        assert config.model.use_cls_token is True
+        assert config.model.ffn_type == "geglu"
+        assert config.model.initialization == "deepscale_lm"
+        assert config.model.checkpoint_activations is True
+        assert config.common.torch_compile is True
+        assert config.common.torch_compile_fullgraph is False
+        assert config.optimization.gradient_clip_method == "adagc"
+        assert config.optimization.adagc_beta == 0.99
+        assert config.optimization.adagc_relative_clip == 1.04
+        assert config.optimization.adagc_warmup_updates == 100
+        assert config.optimizer.name == "adamw8bit"
+        assert config.optimizer.min_8bit_size == 4096
+        assert config.optimizer.weight_decay_schedule == "cosine"
+        assert config.optimizer.weight_decay == 0.01
+        assert config.optimizer.weight_decay_end == 0.0
+
+    assert pretrain.model.classification_head == "frame"
+    assert pretrain.model.cls_loss_weight == 1.0
+    assert finetune.model.classification_head == "cls"
+    assert (
+        pretrain.model.depth,
+        pretrain.model.embed_dim,
+        pretrain.model.num_heads,
+        pretrain.model.audio.prenet_depth,
+        pretrain.model.position_encoding,
+        pretrain.model.attention_backend,
+        pretrain.model.rope_theta,
+        pretrain.model.use_cls_token,
+        pretrain.model.ffn_type,
+        pretrain.model.initialization,
+        pretrain.task.sample_rate,
+        pretrain.task.normalize,
+        pretrain.task.conv_feature_layers,
+    ) == (
+        finetune.model.depth,
+        finetune.model.embed_dim,
+        finetune.model.num_heads,
+        finetune.model.audio.prenet_depth,
+        finetune.model.position_encoding,
+        finetune.model.attention_backend,
+        finetune.model.rope_theta,
+        finetune.model.use_cls_token,
+        finetune.model.ffn_type,
+        finetune.model.initialization,
+        finetune.task.sample_rate,
+        finetune.task.normalize,
+        finetune.task.conv_feature_layers,
+    )
+
+
+def test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes() -> None:
+    """Reject edits to the published controls while modern examples evolve."""
+
+    expected = {
+        "configs/MeerKAT/a2v_large_pretrain_best.yaml": "c5eb23d979cd12704f0dd3977fac1b6031cb4cbf7d5868930eaa6c2816f36a29",
+        "configs/MeerKAT/finetune_mixup_001.yaml": "384eed9a25da913258e618425c9526cffdaccdacc2a16f912f8e1719fe15a9e0",
+        "configs/MeerKAT/finetune_mixup_025.yaml": "31daab6409907238af025a480bf236fd2bb82fdd9442a9a1e4d3b0552e0d3f4a",
+        "configs/MeerKAT/finetune_mixup_100.yaml": "c31c2a3df37d2397ae2cd7cbc502aa849bd819af5ac35f9ff930ab35fb192fd0",
+        "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml": "6a40999452b56e95834d2487860ddc11974c9840b9814eafec1f21468de09102",
+        "configs/hyenas/finetune_mixup_100.yaml": "f892d0f9bb52a823a1fe4bcd168aab33a29cbd6bcc395ce0822525b6bc3c07ca",
+        "scripts/reproduce_meerkat_paper.sh": "485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18",
+    }
+
+    observed = {
+        path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+        for path in expected
+    }
+    assert observed == expected
 
 
 def test_modern_options_default_to_legacy_and_round_trip() -> None:

@@ -1,0 +1,132 @@
+# Opt-in MeerKAT-scale sequence fine-tuning example for the modern encoder.
+# This recipe expects the paired RoPE, CLS, GEGLU, and DeepScaleLM pretraining
+# checkpoint. Replace task.data and model.w2v_path before launch.
+# Install a2v2[bnb] for AdamW8bit.
+
+# Compile the module in place. Dynamic shapes cover variable recording lengths;
+# partial-graph mode accepts data-dependent training control.
+common:
+  fp16: true
+  log_interval: 361
+  tensorboard_logdir: tb
+  torch_compile: true
+  torch_compile_backend: inductor
+  torch_compile_mode: default
+  torch_compile_fullgraph: false
+  torch_compile_dynamic: true
+
+# The sequence metrics can select checkpoint_best.pt through multilabel F1.
+checkpoint:
+  save_dir: checkpoints/modern_rope_cls_geglu_finetune
+  save_interval: 10
+  best_checkpoint_metric: metrics/finetune/f1
+
+# CLS fine-tuning reduces each frame-label column to recording occurrence.
+task:
+  data: /path/to/manifest_files
+  sample_rate: 8000
+  normalize: true
+  with_labels: true
+  unique_labels: "['beep', 'synch', 'sn', 'cc', 'ld', 'oth', 'mo', 'al', 'soc', 'agg', 'eating', 'focal']"
+  conv_feature_layers: '[(127, 63, 1)] +[(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1000
+  max_sample_size: 320000
+  min_label_size: 3032
+
+# Keep the published full-data split and batch budget.
+dataset:
+  num_workers: 20
+  max_tokens: 426_667
+  train_subset: train_0
+  valid_subset: valid_0
+  validate_after_updates: 10000
+  validate_interval_updates: 5000
+  validate_interval: 5000
+
+# The launcher must create four global workers unless you override this guard.
+distributed_training:
+  distributed_world_size: 4
+
+# Sequence fine-tuning reports multilabel metrics. Event timing requires the
+# frame head and rejects CLS logits.
+criterion:
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  metric_threshold: 0.175
+  method: avg
+  sigma_s: 0.1
+  iou_threshold: 0.0
+
+# AdaGC uses the same successful-update transaction as the optimizer and both
+# cosine schedulers.
+optimization:
+  update_freq: [9]
+  max_update: 30000
+  clip_norm: 1
+  lr: [0.00003]
+  gradient_clip_method: adagc
+  adagc_beta: 0.99
+  adagc_relative_clip: 1.04
+  adagc_warmup_updates: 100
+
+# AdamW8bit keeps tensors smaller than 4,096 elements in 32-bit state.
+optimizer:
+  _name: adamw8bit
+  adam_betas: [0.9, 0.98]
+  adam_eps: 1e-08
+  weight_decay: 0.01
+  min_8bit_size: 4096
+  weight_decay_schedule: cosine
+  weight_decay_end: 0.0
+
+# Warm up the learning rate, then decay it to the configured floor.
+lr_scheduler:
+  warmup_updates: 2000
+  warmup_init_lr: 1e-10
+  min_lr: 5e-06
+
+# These architecture fields match the paired pretraining recipe. The CLS head
+# emits one multilabel vector per recording.
+model:
+  w2v_path: checkpoints/modern_rope_cls_geglu_pretrain/checkpoint_last.pt
+  depth: 16
+  embed_dim: 1024
+  num_heads: 16
+  freeze_finetune_updates: 10000
+  feature_grad_mult: 0.0
+  average_top_k_layers: 16
+  apply_mask: true
+  mask_prob: 0.825
+  mask_length: 4
+  mask_channel_prob: 0.5
+  mask_channel_length: 64
+  dropout: 0.1
+  activation_dropout: 0.1
+  attention_dropout: 0.2
+  layerdrop: 0.1
+  target_mixup: true
+  source_mixup: 0.5
+  mixup_prob: 1.0
+  same_mixup: true
+  mixing_window_length: 0.05
+  gain_mode: A_weighting
+  checkpoint_activations: true
+  position_encoding: rope
+  attention_backend: flash
+  rope_theta: 10000.0
+  use_cls_token: true
+  cls_loss_weight: 1.0
+  classification_head: cls
+  ffn_type: geglu
+  initialization: deepscale_lm
+  modalities:
+    audio:
+      sinc_input: true
+      apply_window_to_root: false
+      use_pswish: true
+      sinc_norm: layer_norm
+      conv_pos_depth: 5
+      conv_pos_width: 95
+      conv_pos_groups: 16
+      prenet_depth: 8
+      use_alibi_encoder: false
