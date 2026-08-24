@@ -462,11 +462,13 @@ include `--trust-checkpoint`. Both guides call native `.pt` files
 pickle-backed, require a source the caller trusts, and state that the flag does
 not make pickle safe.
 
-The SLURM command surface identifies the `evaluate` phase as the legacy
-SLURM phase evaluator. That path does not load a pretraining config. The modern
-sequence evaluator restores the stored pretraining config from its native
-checkpoint. The installed-command table in `docs/code-guide.md` maps
-`a2v2-evaluate-sequence` to `evaluate_sequence_main`.
+The SLURM command surface separates the evaluator contracts. The launcher
+`evaluate` phase runs the legacy framewise/event evaluator and reports frame
+and event metrics. `a2v2-evaluate-sequence` runs the CLS sequence evaluator
+and reports sequence-level metrics. Both evaluators restore model construction
+from the stored pretraining config in their checkpoint. The installed-command
+table in `docs/code-guide.md` maps `a2v2-evaluate-sequence` to
+`evaluate_sequence_main`.
 
 ### GREEN evidence and controls
 
@@ -520,3 +522,52 @@ The real-site gate remains unrun. This round launches no SLURM allocation,
 `srun` GPU evaluation, paper-scale training, or scheduler requeue test. A
 target site must complete the one-node parity gate and two-node
 acceptance matrix in `docs/slurm.md`.
+
+## Fix Round 3
+
+### RED evidence
+
+The focused contract test required the evaluator names, metric levels, and
+shared use of the stored pretraining config. It also rejected the false claim
+that the legacy evaluator skips that config:
+
+```text
+rtk proxy pytest -q tests/unit/test_documentation.py::test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths
+AssertionError: assert 'launcher `evaluate` phase' in evaluator_contract
+1 failed
+```
+
+### Correction and GREEN evidence
+
+`docs/slurm.md` identifies the launcher `evaluate` phase as the legacy
+framewise/event evaluator, which reports frame and event metrics. It identifies
+`a2v2-evaluate-sequence` as the CLS sequence evaluator, which reports
+sequence-level metrics. The guide states that both evaluators restore model
+construction from the stored pretraining config in their checkpoint.
+
+The corrected contract and frozen reproduction controls passed:
+
+```text
+rtk proxy pytest -q tests/unit/test_documentation.py::test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths
+1 passed
+
+rtk proxy pytest -q tests/unit/test_config.py::test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes
+1 passed
+```
+
+Round 3 changes only documentation and its contract test. Per the review
+request, this round does not rerun the broad CPU suite. `rtk git diff --check`
+also exits 0.
+
+### Prose, commit, and site status
+
+The stop-slop review covers each Round 3 prose line. The edited prose contains
+no em dash, canned contrast, vague claim, or unqualified performance claim.
+
+Commit status: the Fix Round 3 commit includes this report. The parent handoff
+supplies its hash because a commit cannot contain its own hash.
+
+The real-site gate remains unrun. This round launches no SLURM allocation,
+`srun` GPU evaluation, paper-scale training, or scheduler requeue test. A
+target site must complete the one-node parity gate and two-node acceptance
+matrix in `docs/slurm.md`.

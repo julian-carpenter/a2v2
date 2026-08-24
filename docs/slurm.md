@@ -52,9 +52,11 @@ bash scripts/a2v2_slurm_node.sh pretrain --help
 
 The orchestrator accepts `pretrain`, `finetune`, `evaluate`, and `all`.
 It selects inputs by phase. Standalone pretraining does not load fine-tuning
-inputs. Fine-tuning does not load the pretraining YAML. The legacy SLURM phase
-evaluator does not load a pretraining config. The modern sequence evaluator
-restores the stored pretraining config from its native checkpoint.
+inputs. Fine-tuning does not load the pretraining YAML. The launcher `evaluate`
+phase runs the legacy framewise/event evaluator and reports frame and event
+metrics. `a2v2-evaluate-sequence` runs the CLS sequence evaluator and reports
+sequence-level metrics. Both evaluators restore model construction from the
+stored pretraining config in their checkpoint.
 
 ### Pretrain
 

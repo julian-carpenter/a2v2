@@ -506,7 +506,7 @@ def test_modern_cls_guidance_uses_sequence_evaluation_and_no_all_stage_training(
 
 
 def test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths() -> None:
-    """Document trusted pickle loading and the two evaluation config paths."""
+    """Document trusted pickle loading and both evaluator contracts."""
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
@@ -538,10 +538,24 @@ def test_sequence_evaluation_docs_require_trust_and_distinguish_slurm_paths() ->
         assert "source you trust" in documented
         assert "does not make pickle safe" in documented
 
-    normalized_slurm = " ".join(slurm.split())
-    assert "legacy SLURM phase evaluator" in normalized_slurm
-    assert "modern sequence evaluator" in normalized_slurm
-    assert "stored pretraining config" in normalized_slurm
+    command_surface = re.search(
+        r"(?ms)^The orchestrator accepts .*?(?=^### Pretrain)",
+        slurm,
+    )
+    assert command_surface is not None
+    evaluator_contract = " ".join(command_surface.group(0).split())
+    for required in (
+        "launcher `evaluate` phase",
+        "legacy framewise/event evaluator",
+        "frame and event metrics",
+        "`a2v2-evaluate-sequence`",
+        "CLS sequence evaluator",
+        "sequence-level metrics",
+        "Both evaluators restore",
+        "stored pretraining config",
+    ):
+        assert required in evaluator_contract
+    assert "does not load a pretraining config" not in evaluator_contract
     assert (
         "| `a2v2-evaluate-sequence` | `evaluate_sequence_main` |"
         in code_guide
