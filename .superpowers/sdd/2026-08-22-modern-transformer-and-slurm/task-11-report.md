@@ -196,3 +196,182 @@ shared-filesystem visibility and POSIX semantics, exact resume, contention,
 proven-dead lock recovery, scheduler preemption, exit-75 requeue policy,
 phase handoff, and rendezvous behavior. The guide includes the acceptance
 matrix and evidence fields.
+
+## Fix Round 1
+
+### Review findings and scope
+
+Fix Round 1 adds the missing checkpoint-backed CLS evaluator and strengthens
+the documentation and modern-pair compatibility tests. It also repairs the
+Flash sentence in `docs/code-guide.md` and replaces the public `Task 9`
+label in `docs/slurm.md` with the distributed checkpoint runtime name.
+
+Files changed or added in this round:
+
+- `a2v2/workflows.py`;
+- `pyproject.toml`;
+- `tests/integration/test_sequence_evaluation.py`;
+- `tests/unit/test_config.py`;
+- `tests/unit/test_documentation.py`;
+- `README.md`;
+- `docs/code-guide.md`;
+- `docs/slurm.md`; and
+- this report.
+
+No model, optimizer, training-loop, SLURM launcher, published recipe, or local
+paper-driver behavior changed.
+
+### RED evidence
+
+The first valid evaluator integration test failed at the missing public
+function:
+
+```text
+rtk proxy pytest -q tests/integration/test_sequence_evaluation.py -x
+AttributeError: module 'a2v2.workflows' has no attribute 'evaluate_sequence_main'
+1 failed
+```
+
+The modern CLS documentation test failed because the guide named no real
+sequence-evaluation section or command:
+
+```text
+rtk proxy pytest -q tests/unit/test_documentation.py -k 'task11_relative or documented_slurm or a100_claim or modern_cls_guidance or slurm_site_gate'
+test_modern_cls_guidance_uses_sequence_evaluation_and_no_all_stage_training
+assert section is not None
+2 failed, 3 passed
+```
+
+One of those two failures came from an initial dry-run stdout assertion that
+did not match the launcher's documented rendered-command output. The corrected
+test executes the same dry-run and checks `Launching: srun` plus the node
+wrapper path.
+
+A later strict-config test replaced `config.pretrained` with a fine-tuning
+config. Before the stage check, evaluation reached model-state mismatch instead
+of rejecting the stored config authority:
+
+```text
+rtk proxy pytest -q tests/integration/test_sequence_evaluation.py::test_sequence_evaluator_requires_stored_pretraining_config
+AssertionError: assert 'stored pretraining config' in stderr
+1 failed
+```
+
+### Sequence evaluator contract
+
+`a2v2-evaluate-sequence` accepts a native checkpoint, required fine-tuning
+config, repeatable strict overrides, and one selected device. It:
+
+1. requires a native fine-tuning checkpoint;
+2. requires stored `config.active` and `config.pretrained` mappings with
+   fine-tuning and pretraining stages;
+3. requires a stored and supplied CLS classification head;
+4. checks sample rate, normalization, convolution geometry, ordered labels,
+   layer averaging, CLS selection, and focal-loss parameters;
+5. rebuilds the encoder from the checkpoint's stored pretraining config;
+6. loads the complete model state with `strict=True`;
+7. calls the existing `_validate` path, which calls
+   `sequence_classification_metrics`; and
+8. prints sorted JSON sequence metrics.
+
+The evaluator reads no optimizer, scheduler, scaler, sampler, resume
+fingerprint, process group, or saved world-size contract. Tests pass a world
+size override of seven against a checkpoint produced at world size one. A
+SHA-256 check before and after two evaluations proves that the checkpoint bytes
+do not change.
+
+The integration fixture creates two real WAV/HDF5 examples. A zero-logit
+classifier produces 0.5 probabilities. At threshold 0.6 the measured sequence
+F1 is 0.0 and accuracy is 0.5. At threshold 0.4 the measured F1 is 2/3. The
+suite also rejects frame-head configs, frame-head checkpoints, pretraining
+checkpoints, reversed label order, incomplete model state, a stored
+fine-tuning config in the pretrained slot, and an unknown override.
+
+The local CLI help check exited 0 after refreshing the editable installation:
+
+```text
+rtk python -m pip install -e . --no-deps
+rtk proxy a2v2-evaluate-sequence --help
+```
+
+`README.md` and `docs/slurm.md` show a local invocation.
+`docs/slurm.md` also shows:
+
+```text
+srun --nodes=1 --ntasks=1 --gpus=1 a2v2-evaluate-sequence ...
+```
+
+Modern CLS guidance contains no `--phase all` training command.
+
+### Stronger config and documentation tests
+
+The modern config guard now compares sample rate, normalization, convolution
+layers, Transformer depth and width, head count, MLP ratio, norm order,
+affinity, epsilon, positional policy, attention backend, RoPE theta, CLS,
+FFN, initialization, sinc choices, positional-convolution depth, width, and
+groups, prenet depth, and ALiBi choices. It constructs the full pretraining
+student and fine-tuning encoder on the meta device. Their ordered state keys,
+shapes, and dtypes must match. The test records the permitted fine-tuning
+dropout, activation dropout, attention dropout, input dropout, layerdrop,
+drop-path, and activation-checkpointing controls. Changing the fine-tuning MLP
+ratio to 3.0 fails the guard.
+
+Documentation tests now resolve relative Markdown file and heading links,
+execute the README SLURM dry-run, execute launcher and evaluator help, and run
+`bash -n` on both SLURM scripts. They keep the `2.7787x` A100 ratio in the
+same paragraph as its `B=2`, `T=128`, `D=64`, five-iteration,
+two-warm-up, single-A100, and no-general-throughput qualifiers. They also
+require the real-site section to retain the `Unrun real-site gate` heading
+and `did not run` status.
+
+### GREEN evidence and controls
+
+The final focused suite passed:
+
+```text
+rtk pytest -q tests/integration/test_sequence_evaluation.py tests/unit/test_config.py tests/unit/test_documentation.py
+57 passed
+```
+
+The full CPU suite passed:
+
+```text
+rtk pytest -q tests/unit tests/integration
+519 passed
+```
+
+These checks also exited 0:
+
+```text
+rtk python -m compileall -q a2v2 scripts tests
+rtk bash -n scripts/reproduce_meerkat_slurm.sh
+rtk bash -n scripts/a2v2_slurm_node.sh
+rtk git diff --check
+```
+
+The frozen published-recipe and local-driver test passed:
+
+```text
+rtk pytest -q tests/unit/test_config.py::test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes
+1 passed
+```
+
+An unconstrained `rtk pytest -q` also ran. It reported 542 passes and three
+failures in optional bitsandbytes CUDA tests because this host lacks the native
+binary expected by those tests. The requested CPU suite remains green, and
+this round changes no bitsandbytes or CUDA behavior.
+
+### Prose, commit, and site status
+
+The stop-slop review covered every added prose line. The new prose contains no
+em dash, canned contrast, vague performance claim, or detached benchmark
+qualifier. The repository-wide phrase scan found two existing em dashes at
+`docs/code-guide.md:623-624`, outside this round's diff.
+
+Commit status: the Fix Round 1 commit includes this report. The parent handoff
+supplies its hash because a commit cannot contain its own hash.
+
+The real-site gate remains unrun. This round executes no SLURM allocation,
+`srun` GPU evaluation, paper-scale training, or scheduler requeue test. A
+target site still must complete the one-node parity gate and the two-node
+acceptance matrix in `docs/slurm.md`.

@@ -3,8 +3,10 @@ covers restricted convolution expressions, defaults, overrides, AMP values, DDP
 settings, and unknown fields."""
 
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -19,10 +21,83 @@ from a2v2.config import (
     load_config,
     parse_conv_feature_layers,
 )
+from a2v2.model import Animal2VecFineTuningModel, Animal2VecPretrainingModel
 from a2v2.workflows import _ddp_bucket_cap_mb_list, _ddp_find_unused_parameters
 
 
 ROOT = Path(__file__).parents[2]
+
+
+def _modern_encoder_coordinates(config: object) -> dict[str, object]:
+    """Return every recipe field that selects shared encoder behavior or state."""
+
+    model = config.model
+    audio = model.audio
+    task = config.task
+    return {
+        "task.sample_rate": task.sample_rate,
+        "task.normalize": task.normalize,
+        "task.conv_feature_layers": task.conv_feature_layers,
+        "model.depth": model.depth,
+        "model.embed_dim": model.embed_dim,
+        "model.num_heads": model.num_heads,
+        "model.mlp_ratio": model.mlp_ratio,
+        "model.layer_norm_first": model.layer_norm_first,
+        "model.norm_affine": model.norm_affine,
+        "model.norm_eps": model.norm_eps,
+        "model.end_of_block_targets": model.end_of_block_targets,
+        "model.position_encoding": config_module.resolve_position_encoding(model),
+        "model.attention_backend": config_module.resolve_attention_backend(model),
+        "model.rope_theta": model.rope_theta,
+        "model.use_cls_token": model.use_cls_token,
+        "model.ffn_type": model.ffn_type,
+        "model.initialization": model.initialization,
+        "model.audio.sinc_input": audio.sinc_input,
+        "model.audio.apply_window_to_root": audio.apply_window_to_root,
+        "model.audio.use_pswish": audio.use_pswish,
+        "model.audio.sinc_norm": audio.sinc_norm,
+        "model.audio.conv_pos_depth": audio.conv_pos_depth,
+        "model.audio.conv_pos_width": audio.conv_pos_width,
+        "model.audio.conv_pos_groups": audio.conv_pos_groups,
+        "model.audio.prenet_depth": audio.prenet_depth,
+        "model.audio.use_alibi_encoder": audio.use_alibi_encoder,
+        "model.audio.learned_alibi_scale": audio.learned_alibi_scale,
+        "model.audio.learned_alibi_scale_per_head":
+            audio.learned_alibi_scale_per_head,
+    }
+
+
+def _state_signature(state: dict[str, torch.Tensor]) -> tuple[tuple[object, ...], ...]:
+    """Return ordered checkpoint keys, shapes, and dtypes."""
+
+    return tuple(
+        (name, tuple(tensor.shape), tensor.dtype)
+        for name, tensor in state.items()
+    )
+
+
+def _assert_modern_encoder_compatibility(pretrain: object, finetune: object) -> None:
+    """Require matching structural coordinates and constructed encoder state."""
+
+    assert _modern_encoder_coordinates(pretrain) == _modern_encoder_coordinates(
+        finetune
+    )
+    native_linspace = torch.linspace
+    with patch(
+        "a2v2.model.torch.linspace",
+        side_effect=lambda *args, **kwargs: native_linspace(
+            *args, **kwargs, device="cpu"
+        ),
+    ):
+        with torch.device("meta"):
+            pretrained_model = Animal2VecPretrainingModel.from_config(pretrain)
+            finetuned_model = Animal2VecFineTuningModel.from_config(
+                finetune,
+                pretrained_config=pretrain,
+            )
+    assert _state_signature(
+        pretrained_model.student.state_dict()
+    ) == _state_signature(finetuned_model.encoder.state_dict())
 
 
 def test_modern_example_configs_select_compatible_architecture_and_policies() -> None:
@@ -55,35 +130,24 @@ def test_modern_example_configs_select_compatible_architecture_and_policies() ->
     assert pretrain.model.classification_head == "frame"
     assert pretrain.model.cls_loss_weight == 1.0
     assert finetune.model.classification_head == "cls"
-    assert (
-        pretrain.model.depth,
-        pretrain.model.embed_dim,
-        pretrain.model.num_heads,
-        pretrain.model.audio.prenet_depth,
-        pretrain.model.position_encoding,
-        pretrain.model.attention_backend,
-        pretrain.model.rope_theta,
-        pretrain.model.use_cls_token,
-        pretrain.model.ffn_type,
-        pretrain.model.initialization,
-        pretrain.task.sample_rate,
-        pretrain.task.normalize,
-        pretrain.task.conv_feature_layers,
-    ) == (
-        finetune.model.depth,
-        finetune.model.embed_dim,
-        finetune.model.num_heads,
-        finetune.model.audio.prenet_depth,
-        finetune.model.position_encoding,
-        finetune.model.attention_backend,
-        finetune.model.rope_theta,
-        finetune.model.use_cls_token,
-        finetune.model.ffn_type,
-        finetune.model.initialization,
-        finetune.task.sample_rate,
-        finetune.task.normalize,
-        finetune.task.conv_feature_layers,
+    _assert_modern_encoder_compatibility(pretrain, finetune)
+
+    # Fine-tuning may replace only these execution-time regularizers when it
+    # rebuilds the encoder from the checkpoint's pretraining config.
+    assert finetune.model.dropout == 0.1
+    assert finetune.model.attention_dropout == 0.2
+    assert finetune.model.activation_dropout == 0.1
+    assert finetune.model.dropout_input == 0.0
+    assert finetune.model.layerdrop == 0.1
+    assert finetune.model.drop_path == 0.0
+    assert finetune.model.checkpoint_activations is True
+
+    incompatible = replace(
+        finetune,
+        model=replace(finetune.model, mlp_ratio=3.0),
     )
+    with pytest.raises(AssertionError):
+        _assert_modern_encoder_compatibility(pretrain, incompatible)
 
 
 def test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes() -> None:

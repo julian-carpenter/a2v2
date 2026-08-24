@@ -3,12 +3,14 @@
 This top-level module composes the lower-level configuration, data, model, and
 training files. Its sections cover event fusion and scoring, checkpoint-backed
 inference, conversion of archived Fairseq checkpoints, training orchestration,
-and the three installed commands.
+and the installed training, conversion, inference, and sequence-evaluation
+commands.
 
-The public command functions are ``train_main``, ``infer_main``, and
-``convert_checkpoint_main``. Keeping orchestration in one file makes side
-effects such as distributed initialization, checkpoint writes, validation, and
-event-file output visible without mixing them into model mathematics.
+The public command functions are ``train_main``, ``infer_main``,
+``evaluate_sequence_main``, and ``convert_checkpoint_main``. Keeping
+orchestration in one file makes side effects such as distributed
+initialization, checkpoint writes, validation, and event-file output visible
+without mixing them into model mathematics.
 """
 
 from __future__ import annotations
@@ -2857,6 +2859,164 @@ def train_main(argv: Sequence[str] | None = None) -> int:
         return preempted.exit_code
     except (ConfigError, CheckpointError, OutputLockError, ValueError) as exc:
         parser.error(str(exc))
+    return 0
+
+
+# =============================================================================
+# SEQUENCE-EVALUATION COMMAND
+# =============================================================================
+
+def build_sequence_evaluation_parser() -> argparse.ArgumentParser:
+    """Create the checkpoint-backed sequence-evaluation parser."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate a native CLS fine-tuning checkpoint on one validation "
+            "manifest and print JSON sequence metrics."
+        )
+    )
+    parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="apply one strict fine-tuning config override; repeat as needed",
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="single evaluation device, such as cpu, cuda, or cuda:1",
+    )
+    return parser
+
+
+def _sequence_evaluation_coordinates(
+    config: Animal2VecConfig,
+) -> dict[str, object]:
+    """Return checkpoint semantics that state tensor shapes cannot protect."""
+
+    return {
+        "task.sample_rate": config.task.sample_rate,
+        "task.normalize": config.task.normalize,
+        "task.conv_feature_layers": config.task.conv_feature_layers,
+        "task.unique_labels": config.task.unique_labels,
+        "model.average_top_k_layers": config.model.average_top_k_layers,
+        "model.classification_head": config.model.classification_head,
+        "model.use_cls_token": config.model.use_cls_token,
+        "criterion.use_focal_loss": config.criterion.use_focal_loss,
+        "criterion.focal_alpha": config.criterion.focal_alpha,
+        "criterion.focal_gamma": config.criterion.focal_gamma,
+    }
+
+
+def _load_sequence_evaluation_checkpoint(
+    path: Path,
+    config: Animal2VecConfig,
+) -> tuple[Animal2VecFineTuningModel, int]:
+    """Rebuild and strictly restore one native CLS fine-tuning checkpoint."""
+
+    checkpoint = load_checkpoint(path, map_location="cpu")
+    if checkpoint.get("stage") != "finetune":
+        raise CheckpointError(
+            "sequence evaluation requires a native fine-tuning checkpoint; "
+            f"received stage={checkpoint.get('stage')!r}"
+        )
+    stored_configs = checkpoint.get("config")
+    if not isinstance(stored_configs, Mapping):
+        raise CheckpointError(
+            "sequence evaluation requires checkpoint config.active and "
+            "config.pretrained mappings"
+        )
+    active_payload = stored_configs.get("active")
+    pretrained_payload = stored_configs.get("pretrained")
+    if not isinstance(active_payload, Mapping) or not isinstance(
+        pretrained_payload, Mapping
+    ):
+        raise CheckpointError(
+            "sequence evaluation requires checkpoint config.active and "
+            "config.pretrained mappings"
+        )
+    stored_active = config_from_serialized_dict(active_payload)
+    pretrained = config_from_serialized_dict(pretrained_payload)
+    if stored_active.stage != "finetune":
+        raise CheckpointError(
+            "checkpoint config.active is not a fine-tuning config"
+        )
+    if pretrained.stage != "pretrain":
+        raise CheckpointError(
+            "checkpoint config.pretrained is not a stored pretraining config"
+        )
+    if stored_active.model.classification_head != "cls":
+        raise CheckpointError(
+            "sequence evaluation requires a CLS fine-tuning checkpoint with "
+            "model.classification_head=cls"
+        )
+
+    expected = _sequence_evaluation_coordinates(stored_active)
+    received = _sequence_evaluation_coordinates(config)
+    mismatches = [
+        f"{name}: checkpoint={expected[name]!r}, config={received[name]!r}"
+        for name in expected
+        if expected[name] != received[name]
+    ]
+    if mismatches:
+        raise CheckpointError(
+            "sequence evaluation config does not match checkpoint semantics: "
+            + "; ".join(mismatches)
+        )
+
+    model = Animal2VecFineTuningModel.from_config(
+        config,
+        pretrained_config=pretrained,
+    )
+    model_state = checkpoint.get("model")
+    if not isinstance(model_state, Mapping):
+        raise CheckpointError("checkpoint model state must be a mapping")
+    try:
+        model.load_state_dict(model_state, strict=True)
+    except RuntimeError as exc:
+        raise CheckpointError(
+            f"strict model-state load failed for sequence evaluation: {exc}"
+        ) from exc
+    return model, int(checkpoint.get("update", 0))
+
+
+def evaluate_sequence_main(argv: Sequence[str] | None = None) -> int:
+    """Evaluate one native CLS checkpoint and print JSON sequence metrics."""
+
+    parser = build_sequence_evaluation_parser()
+    arguments = parser.parse_args(argv)
+    try:
+        config = load_config(arguments.config, arguments.override)
+        if config.stage != "finetune":
+            raise ConfigError(
+                "sequence evaluation requires a fine-tuning config"
+            )
+        if config.model.classification_head != "cls":
+            raise ConfigError(
+                "sequence evaluation requires model.classification_head=cls"
+            )
+        device = torch.device(arguments.device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ConfigError(
+                f"CUDA device {arguments.device!r} is unavailable"
+            )
+        model, update = _load_sequence_evaluation_checkpoint(
+            arguments.checkpoint,
+            config,
+        )
+        model.to(device)
+        metrics = _validate(
+            model,
+            config,
+            device=device,
+            update=update,
+        )
+    except (ConfigError, CheckpointError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    print(json.dumps(metrics, sort_keys=True), flush=True)
     return 0
 
 

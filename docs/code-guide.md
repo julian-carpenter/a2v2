@@ -242,9 +242,9 @@ resolves to `sdpa`. The `sdpa` branch calls
 `scaled_dot_product_attention` and lets PyTorch choose Flash,
 memory-efficient, or math kernels. The `flash` branch enables the Flash SDPA
 backend alone and raises an actionable setup error when the kernel rejects the
-device, dtype, shape, or mask. Test and benchmark reports can call a run
-Flash after strict mode succeeds. ALiBi stays on manual attention because
-its dense learned bias does not fit the selected Flash contract.
+device, dtype, shape, or mask. A test or benchmark report may identify a run
+as Flash-backed after strict mode succeeds. ALiBi stays on manual attention
+because its dense learned bias does not fit the selected Flash contract.
 
 #### CLS pretraining and sequence fine-tuning
 
@@ -269,8 +269,9 @@ no token or predictor and retains legacy state keys.
 `classification_head=cls` averages selected top-layer CLS states and emits
 `[B, C]` logits. Fine-tuning reduces frame labels to recording occurrence
 before mixup and reports `sample_size=B`. Event fusion rejects sequence
-logits because they contain no timing axis. The sequence evaluator reports
-multilabel precision, recall, F1, accuracy, and average precision.
+logits because they contain no timing axis. `a2v2-evaluate-sequence` restores
+a native CLS fine-tuning checkpoint and reports multilabel precision, recall,
+F1, accuracy, and average precision.
 
 #### Packed GEGLU and DeepScaleLM
 

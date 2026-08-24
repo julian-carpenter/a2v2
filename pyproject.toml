@@ -34,6 +34,7 @@ bnb = ["bitsandbytes>=0.49,<0.50"]
 [project.scripts]
 a2v2-train = "a2v2.workflows:train_main"
 a2v2-infer = "a2v2.workflows:infer_main"
+a2v2-evaluate-sequence = "a2v2.workflows:evaluate_sequence_main"
 a2v2-convert-checkpoint = "a2v2.workflows:convert_checkpoint_main"
 
 # The repository-root package is intentional; no hidden src/ layer is used.

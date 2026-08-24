@@ -93,6 +93,41 @@ phases, then call the sequence-classification evaluator. The all-stage dry-run
 can render a CLS command graph. Its final event-evaluation step will reject
 sequence logits.
 
+### Modern CLS sequence evaluation
+
+Run modern CLS pretraining and fine-tuning as separate phases. Evaluate the
+resulting native fine-tuning checkpoint on one device:
+
+```bash
+a2v2-evaluate-sequence \
+  /shared/runs/modern-cls/finetune/checkpoint_last.pt \
+  --config configs/modern/rope_cls_geglu_finetune.yaml \
+  --override task.data=/datasets/MeerKAT/manifests \
+  --override dataset.valid_subset=valid_0 \
+  --device cuda
+```
+
+Use one SLURM task and one GPU for the same command inside an allocation:
+
+```bash
+srun --nodes=1 --ntasks=1 --gpus=1 \
+  a2v2-evaluate-sequence \
+  /shared/runs/modern-cls/finetune/checkpoint_last.pt \
+  --config configs/modern/rope_cls_geglu_finetune.yaml \
+  --override task.data=/datasets/MeerKAT/manifests \
+  --override dataset.valid_subset=valid_0 \
+  --device cuda
+```
+
+The command requires a strict fine-tuning config with
+`model.classification_head=cls`. It restores encoder construction from the
+checkpoint's stored pretraining config. It checks label order, sample rate,
+normalization, convolution geometry, layer averaging, CLS selection, and focal
+loss parameters, then uses a strict model-state load. Data path, validation
+subset, worker count, batch budget, metric threshold, and selected device
+remain evaluation choices. The evaluator neither restores optimizer state nor
+requires the original training world size.
+
 ### Dry run
 
 ```bash
@@ -269,7 +304,7 @@ contract for coordinated recovery.
 
 ## Output locking and recovery
 
-Task 9 gives each training output directory one
+The distributed checkpoint runtime gives each training output directory one
 `.a2v2-output.lock`. Rank zero creates the directory and acquires the lock
 after distributed initialization; peers synchronize and verify shared
 visibility. The lock binds job ID, `A2V2_RUN_ID`, hostname, PID, and an owner

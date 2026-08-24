@@ -11,6 +11,7 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -179,6 +180,48 @@ def _shell_fences(markdown: str) -> list[str]:
     )
 
 
+def _heading_slug(heading: str) -> str:
+    """Return the GitHub-style anchor used by maintained documentation."""
+
+    slug = heading.strip().lower()
+    slug = re.sub(r"[^\w\- ]", "", slug)
+    return re.sub(r" +", "-", slug)
+
+
+def _markdown_anchors(markdown: str) -> set[str]:
+    """Return heading anchors defined in one Markdown document."""
+
+    return {
+        _heading_slug(match.group(1))
+        for match in re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", markdown)
+    }
+
+
+def _assert_relative_links_resolve(path: Path) -> None:
+    """Require every relative Markdown link and fragment to resolve."""
+
+    markdown = path.read_text(encoding="utf-8")
+    links = re.findall(r"(?<!!)\[[^\]]+\]\(([^)]+)\)", markdown)
+    for target in links:
+        target = target.split(maxsplit=1)[0].strip("<>")
+        if re.match(r"^(?:https?://|mailto:)", target):
+            continue
+        relative, _, fragment = target.partition("#")
+        destination = path if not relative else (path.parent / relative).resolve()
+        assert destination.exists(), f"{path.relative_to(ROOT)}: missing {target}"
+        if fragment and destination.suffix.lower() == ".md":
+            anchors = _markdown_anchors(destination.read_text(encoding="utf-8"))
+            assert fragment in anchors, (
+                f"{path.relative_to(ROOT)}: missing fragment {target}"
+            )
+
+
+def _flatten_shell_command(fence: str) -> str:
+    """Collapse one backslash-continued shell fence into a command line."""
+
+    return re.sub(r"\\\r?\n\s*", " ", fence).strip()
+
+
 def _has_finetune_800000_shell_assignment(markdown: str) -> bool:
     """Flag executable shell-fence assignments of the obsolete budget."""
 
@@ -337,3 +380,134 @@ def test_modern_features_and_slurm_contract_are_documented() -> None:
         "Unrun real-site gate",
     ):
         assert required in slurm
+
+
+def test_task11_relative_markdown_links_resolve() -> None:
+    """Keep Task 11 links tied to existing files and headings."""
+
+    for relative in (
+        "README.md",
+        "configs/README.md",
+        "docs/code-guide.md",
+        "docs/reproducing-paper.md",
+        "docs/slurm.md",
+    ):
+        _assert_relative_links_resolve(ROOT / relative)
+
+
+def test_documented_slurm_help_dry_run_and_shell_syntax_execute() -> None:
+    """Execute the documented safe launcher paths and parse both Bash scripts."""
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    dry_runs = [
+        _flatten_shell_command(fence)
+        for fence in _shell_fences(readme)
+        if "--dry-run" in fence
+        and "scripts/reproduce_meerkat_slurm.sh" in fence
+    ]
+    assert len(dry_runs) == 1
+    completed = subprocess.run(
+        ["bash", "-c", dry_runs[0]],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "Launching: srun" in completed.stdout
+    assert "scripts/a2v2_slurm_node.sh" in completed.stdout
+
+    help_result = subprocess.run(
+        [
+            "bash",
+            "scripts/reproduce_meerkat_slurm.sh",
+            "/datasets/MeerKAT/manifests",
+            "/shared/runs/meerkat",
+            "--help",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--dry-run" in help_result.stdout
+
+    sequence_help = subprocess.run(
+        ["a2v2-evaluate-sequence", "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert sequence_help.returncode == 0, sequence_help.stderr
+    assert "--override SECTION.KEY=VALUE" in sequence_help.stdout
+
+    for script in (
+        "scripts/reproduce_meerkat_slurm.sh",
+        "scripts/a2v2_slurm_node.sh",
+    ):
+        syntax = subprocess.run(
+            ["bash", "-n", script],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+
+def test_a100_claim_keeps_its_scope_and_measurement_qualifiers() -> None:
+    """Keep the reported compile ratio attached to its bounded evidence."""
+
+    code_guide = (ROOT / "docs/code-guide.md").read_text(encoding="utf-8")
+    paragraph = re.search(
+        r"The bounded A100 microbenchmark.*?(?=\n\n)",
+        code_guide,
+        re.DOTALL,
+    )
+    assert paragraph is not None
+    evidence = paragraph.group(0)
+    for qualifier in (
+        "B=2",
+        "T=128",
+        "D=64",
+        "five measured iterations",
+        "two warm-ups",
+        "2.7787x",
+        "one A100-SXM4-40GB",
+        "no paper-scale or general throughput claim",
+    ):
+        assert qualifier in evidence
+
+
+def test_modern_cls_guidance_uses_sequence_evaluation_and_no_all_stage_training() -> None:
+    """Keep CLS guidance on its supported two-stage and sequence-evaluation path."""
+
+    slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"(?ms)^### Modern CLS sequence evaluation\n(.*?)(?=^###?\s|\Z)",
+        slurm,
+    )
+    assert section is not None
+    guidance = section.group(1)
+    assert "a2v2-evaluate-sequence" in guidance
+    assert "srun --nodes=1 --ntasks=1 --gpus=1" in guidance
+    assert "--phase all" not in guidance
+    assert "Task 9" not in slurm
+
+
+def test_slurm_site_gate_remains_explicitly_unrun() -> None:
+    """Keep the real-site acceptance gate separate from local validation."""
+
+    slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
+    gate = re.search(
+        r"(?ms)^## Unrun real-site gate\n(.*?)(?=^##\s|\Z)",
+        slurm,
+    )
+    assert gate is not None
+    assert "did not run" in gate.group(1)

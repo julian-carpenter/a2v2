@@ -463,17 +463,19 @@ verified CUDA 13.3 host used the wheel's CUDA 13.0 binary with
 the packaged CUDA 13.0 binary, or build bitsandbytes from source. Other CUDA
 wheel targets need no override.
 
-Confirm that the three console commands exist:
+Confirm that the four console commands exist:
 
 ```bash
 a2v2-train --help
 a2v2-infer --help
+a2v2-evaluate-sequence --help
 a2v2-convert-checkpoint --help
 ```
 
-Python callers can invoke `train_main`, `infer_main`, or
-`convert_checkpoint_main` from `a2v2.workflows`. Multi-process launches
-should pass the installed training script to `torchrun`, as shown below.
+Python callers can invoke `train_main`, `infer_main`,
+`evaluate_sequence_main`, or `convert_checkpoint_main` from
+`a2v2.workflows`. Multi-process launches should pass the installed training
+script to `torchrun`, as shown below.
 
 ### Verified A100 environment
 
@@ -523,6 +525,21 @@ torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
   --override checkpoint.save_dir=/checkpoints/modern-finetune \
   --device cuda
 ```
+
+Evaluate its validation manifest on one device:
+
+```bash
+a2v2-evaluate-sequence \
+  /checkpoints/modern-finetune/checkpoint_last.pt \
+  --config configs/modern/rope_cls_geglu_finetune.yaml \
+  --override task.data=/datasets/MeerKAT/manifests \
+  --override dataset.valid_subset=valid_0 \
+  --device cuda
+```
+
+The evaluator restores the encoder architecture from the checkpoint's
+pretraining config, uses a strict model-state load, and prints sequence
+metrics as JSON. It does not restore training topology or optimizer state.
 
 Remove `BNB_CUDA_VERSION` on a CUDA target covered by the installed wheel.
 Strict Flash raises an error when PyTorch cannot dispatch the Flash kernel;
