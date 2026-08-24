@@ -3,7 +3,9 @@
 This file contains the stateful machinery around the models. It implements the
 Fairseq-compatible Adam variant, the update-indexed cosine schedule, complete
 random-state checkpoints, frame metrics, automatic mixed precision, gradient
-accumulation, distributed synchronization, and exact resume.
+accumulation, distributed synchronization, and checkpoint resume. Exact
+data-path resume also requires strict provenance and stateless cropping in the
+workflow.
 
 An ``update`` means one optimizer step, not one micro-batch. The distinction
 controls learning-rate schedules, EMA updates, checkpoint numbering, and
@@ -299,6 +301,8 @@ def normalize_checkpoint(payload: Mapping[str, object]) -> dict[str, Any]:
 
 def resume_compatibility_fingerprint(
     active_config: Mapping[str, object],
+    *,
+    training_data: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Select mathematical and batching fields that must match on resume."""
 
@@ -318,22 +322,31 @@ def resume_compatibility_fingerprint(
         add_leaf("optimizer", active_config["optimizer"])
         add_leaf("scheduler", active_config["scheduler"])
         add_leaf("optimization", active_config["optimization"])
+        add_leaf("task", active_config["task"])
+        dataset = active_config["dataset"]
+        if not isinstance(dataset, Mapping):
+            return None
+        add_leaf(
+            "dataset",
+            {
+                key: value
+                for key, value in dataset.items()
+                if key != "num_workers"
+            },
+        )
         # The established CLI permits extending max_update on resume. It is a
         # scheduler horizon override, not saved optimizer or clipping state.
         fingerprint.pop("optimization.max_update", None)
         common = active_config["common"]
-        dataset = active_config["dataset"]
         distributed = active_config["distributed"]
         if not all(isinstance(group, Mapping) for group in (common, dataset, distributed)):
             return None
         fingerprint["common.seed"] = common["seed"]  # type: ignore[index]
-        fingerprint["dataset.max_tokens"] = dataset["max_tokens"]  # type: ignore[index]
-        fingerprint["dataset.required_batch_size_multiple"] = dataset[
-            "required_batch_size_multiple"
-        ]  # type: ignore[index]
         fingerprint["distributed.requested_world_size"] = distributed[
             "requested_world_size"
         ]  # type: ignore[index]
+        if training_data is not None:
+            add_leaf("training_data", training_data)
     except (KeyError, TypeError):
         return None
     return fingerprint
@@ -1649,8 +1662,9 @@ class TrainingEngine:
         *,
         stage: str,
         config: Mapping[str, object],
+        resume_compatibility: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        """Create a complete, versioned, exactly resumable checkpoint payload."""
+        """Create a complete, versioned training-state checkpoint payload."""
 
         if self._terminal_optimizer_failure is not None:
             raise DistributedOptimizerStepError(
@@ -1680,7 +1694,9 @@ class TrainingEngine:
             # Task 9 fills the remaining reserved v2 runtime slot.
             "topology": None,
             "resume_compatibility": (
-                resume_compatibility_fingerprint(config["active"])
+                dict(resume_compatibility)
+                if resume_compatibility is not None
+                else resume_compatibility_fingerprint(config["active"])
                 if isinstance(config.get("active"), Mapping)
                 else None
             ),

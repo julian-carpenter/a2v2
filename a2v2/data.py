@@ -24,8 +24,9 @@ from pathlib import Path
 from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import Dataset, Sampler
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 import h5py
+import hashlib
 import math
 import random
 import soundfile as sf
@@ -311,6 +312,15 @@ class AudioItem(TypedDict):
     source: Tensor
     target: Tensor | None
     path: str
+    crop_seed: NotRequired[int]
+
+
+@dataclass(frozen=True)
+class SampleCoordinate:
+    """Dataset index plus a crop seed fixed by its ordered sampler occurrence."""
+
+    index: int
+    crop_seed: int
 
 
 def read_manifest(path: str | Path, *, require_labels: bool = False) -> tuple[ManifestRecord, ...]:
@@ -398,7 +408,9 @@ class AudioDataset(Dataset[AudioItem]):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> AudioItem:
+    def __getitem__(self, index: int | SampleCoordinate) -> AudioItem:
+        coordinate = index if isinstance(index, SampleCoordinate) else None
+        index = coordinate.index if coordinate is not None else index
         record = self.records[index]
         channels, actual_rate = load_audio(record.audio_path)
         if actual_rate != self.sample_rate:
@@ -425,7 +437,15 @@ class AudioDataset(Dataset[AudioItem]):
                 num_labels=len(self.labels),
                 focal_label_index=focal_index,
             )
-        return {"id": index, "source": source, "target": target, "path": str(record.audio_path)}
+        item: AudioItem = {
+            "id": index,
+            "source": source,
+            "target": target,
+            "path": str(record.audio_path),
+        }
+        if coordinate is not None:
+            item["crop_seed"] = coordinate.crop_seed
+        return item
 
 
 def collate_audio(
@@ -435,13 +455,16 @@ def collate_audio(
     pad: bool,
     conv_layers: Sequence[ConvLayerSpec],
     generator: torch.Generator | None = None,
+    crop_strategy: str = "legacy",
 ) -> dict[str, Tensor | list[str]]:
     """Crop or pad variable waveforms and keep frame labels aligned.
 
-    Random crop offsets come from the supplied generator, allowing training to
-    recreate the same batches after checkpoint resume.
+    Legacy crop offsets use the supplied or process-local generator. Stateless
+    offsets use sampler-provided per-item seeds that survive process restart.
     """
 
+    if crop_strategy not in {"legacy", "stateless"}:
+        raise ValueError("crop_strategy must be legacy or stateless")
     if not items:
         raise ValueError("cannot collate an empty batch")
     lengths = [int(item["source"].shape[-1]) for item in items]
@@ -472,7 +495,23 @@ def collate_audio(
         # integer range [0, S_i-S_batch].
         # Interpretation: random crops cover all legal windows, and a supplied
         # generator makes the choice repeatable after resume.
-        offset = int(torch.randint(difference + 1, (1,), generator=generator).item()) if difference > 0 else 0
+        if difference > 0 and crop_strategy == "stateless":
+            if "crop_seed" not in item:
+                raise ValueError(
+                    "stateless crop requires sampler-provided crop coordinates"
+                )
+            item_generator = torch.Generator().manual_seed(item["crop_seed"])
+            offset = int(torch.randint(
+                difference + 1,
+                (1,),
+                generator=item_generator,
+            ).item())
+        else:
+            offset = int(torch.randint(
+                difference + 1,
+                (1,),
+                generator=generator,
+            ).item()) if difference > 0 else 0
         offsets[batch_index] = offset
         available = min(source.shape[-1], target_samples)
         sources[batch_index, :available] = source[offset: offset + available]
@@ -663,3 +702,45 @@ class DistributedBatchSampler(Sampler[list[int]]):
     def __len__(self) -> int:
         remaining = max(0, len(self.sampler) - self.sampler.next_batch)
         return remaining // self.world_size
+
+
+class StatelessCropBatchSampler(Sampler[list[SampleCoordinate]]):
+    """Attach resume-invariant crop seeds to rank-selected sample occurrences."""
+
+    def __init__(
+        self,
+        batch_sampler: Sampler[list[int]],
+        *,
+        token_sampler: TokenBatchSampler,
+        seed: int,
+    ) -> None:
+        self.batch_sampler = batch_sampler
+        self.token_sampler = token_sampler
+        self.seed = int(seed)
+
+    def __iter__(self) -> Iterator[list[SampleCoordinate]]:
+        epoch = self.token_sampler.epoch
+        start = self.token_sampler.next_batch
+        if isinstance(self.batch_sampler, DistributedBatchSampler):
+            rank = self.batch_sampler.rank
+            stride = self.batch_sampler.world_size
+        else:
+            rank = 0
+            stride = 1
+        for local_occurrence, batch in enumerate(self.batch_sampler):
+            global_occurrence = start + local_occurrence * stride + rank
+            coordinates: list[SampleCoordinate] = []
+            for batch_position, index in enumerate(batch):
+                encoded = (
+                    f"{self.seed}:{epoch}:{global_occurrence}:"
+                    f"{rank}:{batch_position}:{index}"
+                ).encode("ascii")
+                crop_seed = int.from_bytes(
+                    hashlib.sha256(encoded).digest()[:8],
+                    byteorder="big",
+                ) & ((1 << 63) - 1)
+                coordinates.append(SampleCoordinate(index, crop_seed))
+            yield coordinates
+
+    def __len__(self) -> int:
+        return len(self.batch_sampler)

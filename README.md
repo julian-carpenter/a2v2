@@ -5,7 +5,8 @@ learning. Its first resident method is a compatibility-focused rewrite of
 Animal2Vec 1.0. It implements the published architecture, self-supervised
 pretraining objective, supervised fine-tuning path, official checkpoint
 conversion, long-recording inference, event evaluation, mixed precision,
-distributed training, and exact native checkpoint resume without Fairseq.
+distributed training, and native checkpoint resume without Fairseq. See the
+opt-in strict policy below for exact data-path resume.
 
 The published recipes under `configs/MeerKAT/` and `configs/hyenas/` are
 **Animal2Vec 1.0 reproduction baselines**. They are frozen controls intended
@@ -230,11 +231,12 @@ experiment storage.
 - Dense frame targets from interval annotations.
 - Token-budget batching.
 - Required batch-size multiples.
-- Deterministic cropping.
+- Legacy worker-random cropping and opt-in stateless cropping.
 - Distributed assignment of complete batches.
 - Rank-aware, checkpointable sampler position.
 - Correct distinction between prefetched and training-consumed batches.
-- Deterministic DataLoader generator ownership across epochs and resume.
+- Deterministic DataLoader ownership, with sampler-coordinate crop seeds in
+  strict stateless runs.
 
 ### Optimization and distributed training
 
@@ -274,6 +276,20 @@ experiment storage.
 - Multi-rank RNG gathering into one rank-0 checkpoint.
 - Device-safe RNG restore after arbitrary `map_location`.
 - Exact uninterrupted-versus-resumed comparison utility.
+
+New checkpoints fingerprint the complete mathematical task and dataset
+configuration, the resolved training-manifest path and ordered bytes, and the
+ordered sampler population and sizes. `checkpoint.resume_policy: strict`
+requires that provenance before model, optimizer, scheduler, or clipper
+construction. `dataset.crop_strategy: stateless` derives each crop from the
+checkpointed sampler epoch and ordered occurrence, so DataLoader worker
+prefetch cannot change the resumed crop.
+
+The defaults remain `resume_policy: compatible` and `crop_strategy: legacy`
+for old checkpoints and frozen recipes. Compatible mode warns when a
+checkpoint lacks full provenance. A legacy random crop with multiple workers
+also warns because a restarted process can choose a different window. Do not
+describe that combination as bit-exact.
 
 ### Official weight conversion
 
@@ -501,7 +517,8 @@ The paired modern examples live outside the frozen reproduction directories:
 Both files define the same 16-layer, 1,024-dimensional encoder with an
 eight-layer prenet, RoPE, strict Flash attention, a CLS token, packed GEGLU,
 and DeepScaleLM. They also select activation checkpointing, AdaGC, AdamW8bit,
-cosine weight-decay annealing, and partial-graph `torch.compile`.
+cosine weight-decay annealing, partial-graph `torch.compile`, stateless crop
+coordinates, and strict resume provenance.
 
 Train the pretraining example after replacing its manifest path:
 
@@ -561,6 +578,8 @@ loading checks every key and shape.
 `scripts/reproduce_meerkat_slurm.sh` runs one torchrun agent per node and one
 worker per allocated GPU. The commands below use the frozen MeerKAT recipes.
 The SLURM path remains separate from the byte-identical local paper driver.
+Its pretraining RunContract resolves the manifest named by the selected
+config's `dataset.train_subset`; it does not assume `pretrain.tsv`.
 
 Submit pretraining:
 

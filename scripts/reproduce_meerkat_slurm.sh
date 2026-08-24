@@ -414,7 +414,6 @@ done
     || die "A2V2_EVAL_WORKERS must be a non-negative integer"
 
 VALID_SUBSET="valid_${FOLD}"
-PRETRAIN_MANIFEST="${MANIFEST_DIR}/pretrain.tsv"
 TRAIN_MANIFEST="${MANIFEST_DIR}/${TRAIN_SUBSET}.tsv"
 VALID_MANIFEST="${MANIFEST_DIR}/${VALID_SUBSET}.tsv"
 PRETRAIN_OVERRIDES=(
@@ -424,6 +423,25 @@ PRETRAIN_OVERRIDES=(
     "dataset.max_tokens=${PRETRAIN_MAX_TOKENS}"
     "optimization.update_freq=[${PRETRAIN_UPDATE_FREQ}]"
 )
+PRETRAIN_SUBSET="pretrain"
+if [[ "${PHASE}" == pretrain || "${PHASE}" == all ]]; then
+    PRETRAIN_SUBSET_COMMAND=(
+        env
+        "PYTHONPATH=${REPOSITORY_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+        "${CONTRACT_PYTHON}"
+        -c "${SLURM_HELPER_CODE}"
+        train-subset
+        --config "${PRETRAIN_CONFIG}"
+    )
+    for override in "${PRETRAIN_OVERRIDES[@]}"; do
+        PRETRAIN_SUBSET_COMMAND+=(--override "${override}")
+    done
+    PRETRAIN_SUBSET="$("${PRETRAIN_SUBSET_COMMAND[@]}")" \
+        || die "could not resolve dataset.train_subset from the pretraining config"
+    [[ -n "${PRETRAIN_SUBSET}" && "${PRETRAIN_SUBSET}" != */* ]] \
+        || die "pretraining dataset.train_subset must be one manifest stem"
+fi
+PRETRAIN_MANIFEST="${MANIFEST_DIR}/${PRETRAIN_SUBSET}.tsv"
 FINETUNE_OVERRIDES=(
     "task.data=${MANIFEST_DIR}"
     "dataset.train_subset=${TRAIN_SUBSET}"
@@ -486,7 +504,7 @@ if [[ "${PHASE}" == pretrain || "${PHASE}" == all ]]; then
         --phase pretrain
         --pretrain-output-directory "${PRETRAIN_DIR}"
         --pretrain-config "${PRETRAIN_CONFIG}"
-        --pretrain-manifest-entry "pretrain.tsv=${PRETRAIN_MANIFEST}"
+        --pretrain-manifest-entry "${PRETRAIN_SUBSET}.tsv=${PRETRAIN_MANIFEST}"
     )
     for override in "${PRETRAIN_OVERRIDES[@]}"; do
         LAUNCH_CONTRACT_COMMAND+=(--pretrain-override "${override}")

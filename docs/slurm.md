@@ -243,6 +243,18 @@ fingerprint, seed, data identity, and checkpoint schema. Hardware and transport
 changes produce numerical-equivalence warnings. Hostname order does not assign
 torchrun ranks.
 
+The shipped modern recipes use strict provenance and stateless crop
+coordinates. That combination validates the selected manifest and sampler
+population before mutable training state is built and is the supported exact
+data-path resume mode. Frozen paper recipes retain compatible legacy cropping;
+multiworker random-crop resume warns and is not bit-exact across process
+restart. Older checkpoints without versioned data provenance remain usable in
+compatible mode, also with a warning.
+
+The launcher resolves the pretraining manifest from the pretraining config's
+`dataset.train_subset`. A neighboring `pretrain.tsv` does not enter the
+pretraining RunContract when another subset is configured.
+
 Pretraining follows this order:
 
 1. Use `--pretrain-resume` when supplied.
@@ -447,7 +459,7 @@ path.
 | NCCL data path | Complete bounded pretraining and fine-tuning updates. | Common loss/sample-size reductions, no rank hang, one rank-zero checkpoint writer. |
 | Gloo control path | Trigger checkpoint and validation control traffic. | Common success result and bounded completion on all ranks. |
 | Shared filesystem | Create manifests, lock, checkpoint candidate, atomic replacement, and completion marker. | All nodes observe exact bytes, inode changes, hard-link exclusivity, advisory lock behavior, and directory persistence. |
-| Exact resume | Save v2 state, stop, relaunch with the same world size, and run the next update. | Matching model, optimizer, AdaGC, decay, sampler, rank-local RNG, and topology state. |
+| Exact resume | Use strict provenance and stateless crops, save v2 state, stop, relaunch with the same world size, and run the next update. | Matching model, optimizer, AdaGC, decay, sampler, rank-local RNG, topology, manifest, crop, and loss state. |
 | Contention | Point a second live job at one phase directory. | Second job fails closed and cannot alter checkpoint or lock bytes. |
 | Proven-dead recovery | Stop a same-host owner and use its fingerprint. | Recovery succeeds once; stale owner cannot release the new lock. |
 | Preemption | Send `SIGUSR1` during prelaunch and during an active step. | Latched request, fresh validated checkpoint after an active step, no marker on interrupted work, exit 75. |

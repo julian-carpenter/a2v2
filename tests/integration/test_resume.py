@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import replace
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -698,6 +699,197 @@ def test_resume_compatibility_rejects_every_mathematical_state_mismatch() -> Non
     for path, active in mismatches.items():
         with pytest.raises(training.CheckpointError, match=path.replace(".", r"\.")):
             workflows._validate_resume_compatibility(active, checkpoint)
+
+
+def test_strict_resume_fingerprint_binds_ordered_task_and_manifest_semantics(
+    tmp_path: Path,
+) -> None:
+    """Reject changed labels, subset, manifest bytes, population, or sizes."""
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    manifest = manifests / "train.tsv"
+    manifest.write_text("/audio\na.wav\t64\nb.wav\t80\n", encoding="utf-8")
+    config = load_config(
+        Path("tests/fixtures/tiny_finetune.yaml"),
+        overrides=(
+            f"task.data={manifests}",
+            "checkpoint.resume_policy=strict",
+        ),
+    )
+    dataset = SimpleNamespace(sizes=(64, 80))
+    provenance = workflows._training_data_resume_provenance(config, dataset)
+    saved = training.resume_compatibility_fingerprint(
+        config_to_dict(config),
+        training_data=provenance,
+    )
+    assert saved is not None
+    checkpoint = {
+        "config": {"active": config_to_dict(config)},
+        "resume_compatibility": saved,
+    }
+
+    assert saved["task.unique_labels"] == list(config.task.unique_labels)
+    assert saved["training_data.manifest.sha256"]
+    assert saved["training_data.sampler.population"] == 2
+
+    mutations = {
+        "task.unique_labels": replace(
+            config,
+            task=replace(
+                config.task,
+                unique_labels=tuple(reversed(config.task.unique_labels)),
+            ),
+        ),
+        "dataset.train_subset": replace(
+            config,
+            dataset=replace(config.dataset, train_subset="alternate"),
+        ),
+    }
+    (manifests / "alternate.tsv").write_bytes(manifest.read_bytes())
+    moved_manifests = tmp_path / "moved-manifests"
+    moved_manifests.mkdir()
+    (moved_manifests / "train.tsv").write_bytes(manifest.read_bytes())
+    mutations["task.data"] = replace(
+        config,
+        task=replace(config.task, data=moved_manifests),
+    )
+    for expected_path, active in mutations.items():
+        active_provenance = workflows._training_data_resume_provenance(
+            active, dataset
+        )
+        with pytest.raises(training.CheckpointError, match=expected_path.replace(".", r"\.")):
+            workflows._validate_resume_compatibility(
+                active,
+                checkpoint,
+                training_data=active_provenance,
+            )
+
+    manifest.write_text("/audio\na.wav\t64\nc.wav\t80\n", encoding="utf-8")
+    changed_manifest = workflows._training_data_resume_provenance(config, dataset)
+    with pytest.raises(training.CheckpointError, match=r"manifest\.sha256"):
+        workflows._validate_resume_compatibility(
+            config,
+            checkpoint,
+            training_data=changed_manifest,
+        )
+
+    manifest.write_text("/audio\na.wav\t64\nb.wav\t80\n", encoding="utf-8")
+    changed_sizes = workflows._training_data_resume_provenance(
+        config,
+        SimpleNamespace(sizes=(64, 79, 80)),
+    )
+    with pytest.raises(training.CheckpointError, match=r"sampler\.population"):
+        workflows._validate_resume_compatibility(
+            config,
+            checkpoint,
+            training_data=changed_sizes,
+        )
+    changed_size_values = workflows._training_data_resume_provenance(
+        config,
+        SimpleNamespace(sizes=(64, 79)),
+    )
+    with pytest.raises(training.CheckpointError, match=r"sampler\.sizes_sha256"):
+        workflows._validate_resume_compatibility(
+            config,
+            checkpoint,
+            training_data=changed_size_values,
+        )
+
+
+def test_strict_resume_rejects_data_mismatch_before_model_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Validate provenance before mutable training objects can be restored."""
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    (manifests / "pretrain.tsv").write_text(
+        "/audio\na.wav\t64\n", encoding="utf-8"
+    )
+    saved_config = load_config(
+        Path("tests/fixtures/tiny_pretrain.yaml"),
+        overrides=(
+            f"task.data={manifests}",
+            "checkpoint.resume_policy=strict",
+        ),
+    )
+    class DatasetSentinel:
+        """Expose only the read-only population used before model construction."""
+
+        sizes = (64,)
+
+        def __len__(self) -> int:
+            return 1
+
+    dataset = DatasetSentinel()
+    provenance = workflows._training_data_resume_provenance(saved_config, dataset)
+    checkpoint = {
+        "resume_compatibility": training.resume_compatibility_fingerprint(
+            config_to_dict(saved_config), training_data=provenance
+        ),
+        "topology": None,
+        "sampler_state": None,
+    }
+    pristine_checkpoint = deepcopy(checkpoint)
+    active = replace(
+        saved_config,
+        task=replace(saved_config.task, normalize=not saved_config.task.normalize),
+    )
+    monkeypatch.setattr(
+        workflows,
+        "_distributed_device",
+        lambda *_: (torch.device("cpu"), 0, 1, False),
+    )
+    monkeypatch.setattr(workflows, "_make_dataset", lambda *_: dataset)
+    monkeypatch.setattr(workflows, "load_checkpoint", lambda *_args, **_kwargs: checkpoint)
+    monkeypatch.setattr(
+        workflows,
+        "_make_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("model construction must not run")
+        ),
+    )
+
+    with pytest.raises(training.CheckpointError, match=r"task\.normalize"):
+        workflows._run_training(
+            active,
+            device_name="cpu",
+            resume_path=tmp_path / "resume.pt",
+            pretrained_checkpoint=None,
+        )
+    assert checkpoint == pristine_checkpoint
+
+
+def test_legacy_multiworker_random_crop_resume_policy_warns_or_rejects() -> None:
+    """Do not describe worker-local random crops as exact under strict policy."""
+
+    base = load_config(Path("tests/fixtures/tiny_pretrain.yaml"))
+    dataset = SimpleNamespace(sizes=(64, 80))
+    compatible = replace(
+        base,
+        dataset=replace(
+            base.dataset,
+            num_workers=2,
+            max_tokens=200,
+            crop_strategy="legacy",
+        ),
+    )
+    sampler = workflows.TokenBatchSampler(
+        dataset.sizes,
+        max_tokens=compatible.dataset.max_tokens,
+        shuffle=False,
+    )
+    with pytest.warns(RuntimeWarning, match="not bit-exact"):
+        workflows._validate_crop_resume_policy(compatible, dataset, sampler)
+
+    strict = replace(
+        compatible,
+        checkpoint=replace(compatible.checkpoint, resume_policy="strict"),
+    )
+    with pytest.raises(training.CheckpointError, match="not bit-exact"):
+        workflows._validate_crop_resume_policy(strict, dataset, sampler)
 
 
 def test_workflow_allows_only_v1_update_zero_global_to_adagc_transition(

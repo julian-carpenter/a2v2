@@ -782,6 +782,60 @@ def test_all_and_standalone_launches_share_each_phase_contract_identity(
     assert all_contracts["pretrain"] != all_contracts["finetune"]
 
 
+def test_pretrain_contract_uses_configured_train_subset_manifest(
+    tmp_path: Path,
+) -> None:
+    """Bind pretraining to dataset.train_subset, not a neighboring legacy TSV."""
+
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    legacy_manifest = manifests / "pretrain.tsv"
+    selected_manifest = manifests / "alternate.tsv"
+    legacy_manifest.write_text("legacy\n", encoding="utf-8")
+    selected_manifest.write_text("selected-v1\n", encoding="utf-8")
+    config = tmp_path / "alternate-pretrain.yaml"
+    source = (
+        ROOT / "configs/MeerKAT/a2v_large_pretrain_best.yaml"
+    ).read_text(encoding="utf-8")
+    assert "train_subset: pretrain" in source
+    config.write_text(
+        source.replace("train_subset: pretrain", "train_subset: alternate"),
+        encoding="utf-8",
+    )
+
+    def identity() -> tuple[str, str]:
+        """Return rendered contract and selected-manifest fingerprints."""
+
+        completed = _run_shell(
+            SLURM_DRIVER,
+            str(manifests),
+            str(tmp_path / "output"),
+            "--phase", "pretrain",
+            "--pretrain-config", str(config),
+            "--dry-run",
+            "--nodes", "1",
+            "--gpus-per-node", "1",
+            "--job-id", "4815",
+            "--master-addr", "node01",
+        )
+        assert completed.returncode == 0, completed.stderr
+        command = next(
+            command
+            for command in _rendered_commands(completed.stdout)
+            if str(NODE_LAUNCHER) in command
+        )
+        return (
+            _option_value(command, "--contract-fingerprint"),
+            _option_value(command, "--manifest-fingerprint"),
+        )
+
+    baseline = identity()
+    legacy_manifest.write_text("legacy-changed\n", encoding="utf-8")
+    assert identity() == baseline
+    selected_manifest.write_text("selected-v2\n", encoding="utf-8")
+    assert identity() != baseline
+
+
 @pytest.mark.parametrize(
     ("phase", "manifest_names", "unrelated_config_option", "checkpoint"),
     (

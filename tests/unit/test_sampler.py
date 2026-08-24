@@ -4,7 +4,11 @@ cursors, and exact resume."""
 
 import pytest
 
-from a2v2.data import DistributedBatchSampler, TokenBatchSampler
+from a2v2.data import (
+    DistributedBatchSampler,
+    StatelessCropBatchSampler,
+    TokenBatchSampler,
+)
 
 
 def test_token_budget_sampler_packs_by_maximum_length() -> None:
@@ -60,6 +64,34 @@ def test_sampler_resume_yields_remaining_batches() -> None:
     resumed = TokenBatchSampler([5, 6, 10, 11, 20], max_tokens=24, shuffle=False)
     resumed.load_state_dict(state)
     assert list(resumed) == [[2, 3], [4]]
+
+
+def test_stateless_crop_coordinates_match_after_sampler_resume() -> None:
+    """Bind each crop to its absolute ordered occurrence, not worker RNG."""
+
+    sizes = [5, 6, 10, 11, 20]
+    base = TokenBatchSampler(sizes, max_tokens=24, seed=9, shuffle=False)
+    wrapped = StatelessCropBatchSampler(base, token_sampler=base, seed=31)
+    iterator = iter(wrapped)
+    first = next(iterator)
+    state = base.state_dict()
+    uninterrupted_next = next(iterator)
+
+    resumed_base = TokenBatchSampler(
+        sizes, max_tokens=24, seed=9, shuffle=False
+    )
+    resumed_base.load_state_dict(state)
+    resumed = StatelessCropBatchSampler(
+        resumed_base,
+        token_sampler=resumed_base,
+        seed=31,
+    )
+
+    assert next(iter(resumed)) == uninterrupted_next
+    assert all(item.crop_seed >= 0 for item in first + uninterrupted_next)
+    assert len({item.crop_seed for item in first + uninterrupted_next}) == len(
+        first + uninterrupted_next
+    )
 
 
 def test_sampler_resume_after_last_yield_starts_the_next_epoch() -> None:

@@ -4,11 +4,22 @@ Date: 2026-08-24 UTC
 
 ## Acceptance result
 
-The bounded local gates passed against code revision
-`5fe1656e4844e94405bc2e1b9cf87f24ef965624`. The run covered the full CPU
-suite, one-A100 CUDA components and training, strict Flash attention, compile,
-CLS and AdaGC paths, bitsandbytes 8-bit optimizer resume, two-rank Gloo, and
-two- and four-rank NCCL exact resume. The local and mocked SLURM checks passed.
+The original bounded gates ran against code revision
+`5fe1656e4844e94405bc2e1b9cf87f24ef965624`. Commit
+`9f3c7810bb12a2abbf4bd3a907c4c077b8ba915b` records them. They covered the
+full CPU suite, one-A100 CUDA components and training, strict Flash attention,
+compile, CLS and AdaGC paths, bitsandbytes 8-bit optimizer resume, two-rank
+Gloo, and two- and four-rank NCCL state resume. The local and mocked SLURM
+checks passed.
+
+A later whole-change review disproved the report's broad multiworker
+exact-resume claim. The original integration input used equal lengths and did
+not execute random cropping. Fix Round 1 added strict, versioned data
+provenance and stateless crop coordinates, then reran variable-length resume in
+fresh processes and on two local Gloo ranks. Exact data-path resume now means
+`dataset.crop_strategy=stateless` together with
+`checkpoint.resume_policy=strict`. Frozen legacy recipes remain compatible,
+but their multiworker random-crop resume is not bit-exact.
 
 This verification did not run the paper-scale reproduction or a SLURM
 allocation. It does not validate a site filesystem, scheduler, requeue policy,
@@ -23,9 +34,12 @@ or multi-node transport.
 - Initial state: `main...origin/main [ahead 25]`, with an empty short status
 - Task 12 adds this report and `tests/gpu/benchmark_attention.py`. The
   containing commit records those two files.
-
-The final handoff names the containing commit because a Git commit cannot
-store its own hash in its contents.
+- Fix Round 1 starts from
+  `9f3c7810bb12a2abbf4bd3a907c4c077b8ba915b`. The final handoff names its
+  containing commit because a commit cannot contain its own hash.
+- Before the fix commit, `main...origin/main [ahead 26]` had 23 modified
+  tracked files and one new Gloo worker file. `HEAD` was `9f3c781`; the
+  containing fix commit makes the branch 27 commits ahead of `origin/main`.
 
 ## Host and package state
 
@@ -86,7 +100,93 @@ Outcome: both commands exited 0; `pip check` printed
 | `rtk git status --short` | Empty before Task 12 files |
 
 The eight CPU warnings came from Python 3.12's warning about `fork()` from a
-multithreaded process in two multiworker CLI resume tests. No CPU test failed.
+multithreaded process in two multiworker CLI resume tests. No CPU test failed,
+but the equal-length resume fixture could not test crop exactness.
+
+## Fix Round 1: resume, CLS, and RunContract corrections
+
+### RED evidence
+
+The reviewer reproduced a variable-length, `num_workers>0` divergence at
+update 2: uninterrupted loss `2.6233898163`, restarted loss `2.5281476974`;
+the first state mismatch was `student.alibi_scale`. The root cause was crop
+offset selection from process-local DataLoader worker RNG. Sampler position
+was checkpointed, but worker RNG and prefetch progress were not.
+
+Focused tests also reproduced the other findings before their fixes:
+
+- config tests raised `AttributeError` for the absent crop/resume policies and
+  showed that `optimizer.min_8bit_size=0` loaded successfully;
+- removing the new divisibility or RoPE even-head config guard made its focused
+  rejection test fail; restoring both guards returned the test to GREEN;
+- strict provenance tests failed because no manifest/sampler provenance helper
+  existed;
+- the shipped CLS validation completed, then best-metric selection raised
+  because `metrics/finetune/f1` was absent from the sequence metrics;
+- changing an unrelated `pretrain.tsv` changed the pretraining RunContract
+  even when the selected config named `alternate.tsv`.
+
+### GREEN evidence before the final full-suite rerun
+
+| Command | Outcome |
+| --- | --- |
+| `rtk python -m pytest -q tests/unit/test_config.py -k 'modern_example_configs or modern_options_default or modern_option_validation or crop_and_resume'` | 4 passed |
+| `rtk python -m pytest -q tests/unit/test_sampler.py tests/unit/test_dataset.py -k stateless` | 2 passed |
+| `rtk python -m pytest -q tests/integration/test_resume.py -k 'strict_resume or legacy_multiworker'` | 3 passed |
+| `rtk python -m pytest -vv tests/integration/test_cli.py -k stateless_multiworker_crop_resume` | 1 passed in 28.39 s |
+| `rtk python -m pytest -vv tests/integration/test_cli.py -k two_rank_gloo_stateless_crop` | 1 passed in 38.55 s |
+| `rtk python -m pytest -q tests/integration/test_finetuning_step.py -k cls_validation_reports_sequence` | 1 passed in 5.81 s |
+| `rtk python -m pytest -q tests/integration/test_slurm_launcher.py -k pretrain_contract_uses_configured` | 1 passed in 45.67 s |
+| `rtk python -m pytest -q tests/unit/test_config.py tests/unit/test_dataset.py tests/unit/test_sampler.py tests/unit/test_engine.py tests/unit/test_slurm.py tests/integration/test_resume.py` | 154 passed, 4 expected compatible-policy warnings |
+
+The fresh-process crop test uses twelve unequal waveform lengths from 96 to
+184 samples, two DataLoader workers, a 400-sample token budget, strict
+provenance, and stateless cropping. It compares model, teacher, optimizer,
+scheduler, scaler, update, epoch, batch cursor, RNG, sampler, and best metric
+after update 2. The two-rank Gloo test uses the same variable-length population
+with one DataLoader worker per rank and compares the same fields after a fresh
+torchrun resume. Both comparisons were exact.
+
+The stronger fingerprint covers the full task, ordered labels, dataset
+mathematics and batching, resolved selected-manifest path and exact ordered
+bytes, filtered sampler population, and ordered-size digest. `num_workers` and
+logging remain execution-only. Strict validation runs before model, optimizer,
+scheduler, or gradient-clipper construction. Compatible legacy checkpoints
+remain usable with a warning when provenance is unavailable.
+
+The required fresh final CPU command was:
+
+```text
+rtk python -m pytest -q tests/unit tests/integration
+```
+
+Outcome: 535 passed, 12 warnings in 452.17 s. Eight warnings were Python
+3.12's existing multi-threaded `fork()` warning. Four were the intentional
+compatible-policy warning from tests that exercise checkpoints without
+versioned data provenance. No test failed.
+
+Fix Round 1 ran no CUDA command. The corrections affect config loading, CPU
+collation and sampler coordinates, checkpoint provenance, metric routing, and
+launcher identity. The earlier bounded CUDA, Flash, compile, AdaGC,
+bitsandbytes, and NCCL evidence remains recorded above; this fix round makes no
+new hardware claim.
+
+Post-fix source and package checks also exited 0:
+
+```text
+rtk python -m compileall -q a2v2 tests
+rtk python -m pip check
+rtk git diff --check
+rtk bash -n scripts/reproduce_meerkat_slurm.sh
+rtk bash -n scripts/a2v2_slurm_node.sh
+rtk bash scripts/reproduce_meerkat_slurm.sh /datasets/MeerKAT/manifests /shared/runs/meerkat --phase all --nodes 2 --gpus-per-node 4 --job-id dryrun-4815 --dry-run
+```
+
+`pip check` printed `No broken requirements found.` The canonical dry run
+selected `pretrain.tsv` from the unchanged frozen default and rendered the same
+two-node/eight-worker phase topology. The alternate-subset regression test
+proved that a configured `alternate.tsv` changes the pretraining contract,
+while an unrelated neighboring `pretrain.tsv` does not.
 
 After Task 12 added the benchmark harness, this focused command exposed one
 new documentation failure:
@@ -291,9 +391,9 @@ preemption, and frozen-driver tests.
 
 | Gate | Evidence | Result |
 | --- | --- | --- |
-| Gate 0 frozen control | 526-test CPU suite, focused 78-test control suite, hashes and state signatures above | Pass |
+| Gate 0 frozen control | Fresh 535-test CPU suite, focused controls, frozen hashes and state signatures above | Pass |
 | Gate 1 component units | Full unit suite plus 12 CUDA component tests | Pass |
-| Gate 2 CPU integration | Full integration suite and explicit two-rank Gloo selection | Pass |
+| Gate 2 CPU integration | Full integration suite, fresh-process variable-crop resume, and explicit two-rank Gloo selection | Pass |
 | Gate 3 bounded CUDA | Strict Flash, activation checkpointing, compile, CLS/GEGLU, AdaGC, both 8-bit optimizers, 2/4-rank NCCL resume | Pass on this host |
 | Gate 4 SLURM acceptance | Real allocation and site-dependent checks | UNRUN |
 
@@ -305,18 +405,17 @@ AdaGC transaction state, decay scheduling, compile wiring, and SLURM contract
 validation. The full CPU run supplied this coverage; the CUDA and distributed
 commands exercised the hardware branches.
 
-The task prohibited subagents, so no independent reviewer ran. I applied the
-`requesting-code-review` checklist to the complete `origin/main..5fe1656`
-inventory, the plan and design requirements, compatibility risks, error paths,
-tests, documentation, and production readiness. `git diff --check` found no
-whitespace error. A targeted scan found no new `eval`, `shell=True`, TODO,
-FIXME, HACK, or XXX marker in production files. I found no evidence-backed
-Critical or Important issue. The environment and unrun gates below remain
+The task prohibited subagents. The initial self-review missed the
+variable-length multiworker crop case and the other Fix Round 1 findings. The
+follow-up review supplied those counterexamples; the RED and GREEN evidence
+above records their disposition. The environment and unrun gates below remain
 release constraints.
 
 ## Known limits and unrun gates
 
 - Paper-scale pretraining, fine-tuning, resume, and final evaluation: UNRUN.
+- Frozen legacy multiworker random-crop bit-exact resume: unsupported by
+  design; compatible resume warns. No paper-scale legacy resume was launched.
 - The canonical local eight-A100 reproduction command graph ran in dry-run
   tests; no eight-rank training allocation ran.
 - Real one-node SLURM launcher parity: UNRUN.

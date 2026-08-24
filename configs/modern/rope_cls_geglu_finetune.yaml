@@ -19,7 +19,8 @@ common:
 checkpoint:
   save_dir: checkpoints/modern_rope_cls_geglu_finetune
   save_interval: 10
-  best_checkpoint_metric: metrics/finetune/f1
+  best_checkpoint_metric: metrics/finetune/sequence_f1
+  resume_policy: strict
 
 # CLS fine-tuning reduces each frame-label column to recording occurrence.
 task:
@@ -36,6 +37,7 @@ task:
 # Keep the published full-data split and batch budget.
 dataset:
   num_workers: 20
+  crop_strategy: stateless
   max_tokens: 426_667
   train_subset: train_0
   valid_subset: valid_0

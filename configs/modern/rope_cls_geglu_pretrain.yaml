@@ -21,6 +21,7 @@ common:
 checkpoint:
   save_dir: checkpoints/modern_rope_cls_geglu_pretrain
   save_interval: 10
+  resume_policy: strict
 
 # Keep the published MeerKAT sample rate and convolution geometry.
 task:
@@ -34,6 +35,7 @@ task:
 # Preserve the published token budget and pretraining split.
 dataset:
   num_workers: 32
+  crop_strategy: stateless
   max_tokens: 408_000
   required_batch_size_multiple: 1
   train_subset: pretrain

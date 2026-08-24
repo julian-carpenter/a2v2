@@ -3,6 +3,7 @@ assertions connect the configured update number to which backbone parameters rec
 gradients."""
 
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -234,6 +235,15 @@ def test_cls_validation_reports_sequence_multilabel_metrics(
 ) -> None:
     """Report clip decisions and AP without invoking event segmentation."""
 
+    shipped_pretrain = load_config(
+        ROOT / "configs/modern/rope_cls_geglu_pretrain.yaml"
+    )
+    shipped_finetune = load_config(
+        ROOT / "configs/modern/rope_cls_geglu_finetune.yaml"
+    )
+    assert shipped_pretrain.stage == "pretrain"
+    assert shipped_finetune.stage == "finetune"
+
     pretrain = load_config(
         ROOT / "tests/fixtures/tiny_pretrain.yaml",
         overrides=("model.use_cls_token=true",),
@@ -245,6 +255,13 @@ def test_cls_validation_reports_sequence_multilabel_metrics(
             "dataset.required_batch_size_multiple=1",
             "model.use_cls_token=true",
             "model.classification_head=cls",
+        ),
+    )
+    finetune = replace(
+        finetune,
+        checkpoint=replace(
+            finetune.checkpoint,
+            best_checkpoint_metric=shipped_finetune.checkpoint.best_checkpoint_metric,
         ),
     )
     model = Animal2VecFineTuningModel.from_config(
@@ -318,3 +335,13 @@ def test_cls_validation_reports_sequence_multilabel_metrics(
     assert "validation/valid/sequence/f1" in events.Tags()["scalars"]
     assert "validation/valid/sequence/pr_micro" in events.Tags()["tensors"]
     assert "validation/valid/frame/f1" not in events.Tags()["scalars"]
+    metric_name, current, maximize = workflows._tracked_metric(
+        finetune,
+        metrics,
+    )
+    assert metric_name == "sequence_f1"
+    assert current == pytest.approx(0.5)
+    assert maximize is True
+    best_metric = None
+    improved = best_metric is None or current > best_metric
+    assert improved is True

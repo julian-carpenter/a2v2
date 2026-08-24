@@ -482,9 +482,27 @@ gradient-clipper state, weight-decay scheduler state, distributed topology, and
 the resume-compatibility fingerprint beside the model, optimizer, LR
 scheduler, scaler, sampler, EMA teacher, and RNG state.
 
+New training saves add `a2v2.training-data.v1` provenance to that fingerprint:
+the full mathematical task and dataset settings except `num_workers`, the
+resolved training-manifest path, a SHA-256 of its ordered bytes, and the
+filtered sampler population and ordered-size digest. Strict resume validates
+these fields after reading the dataset but before constructing the model,
+optimizer, scheduler, or gradient clipper. Logging, worker count, and other
+execution-only choices remain outside the mathematical comparison.
+
+`dataset.crop_strategy=stateless` wraps each rank-selected batch with a crop
+coordinate containing the sampler epoch, absolute batch occurrence, rank,
+position, and sample index. The collator hashes that coordinate into a
+per-item seed. Worker creation, prefetch depth, and process restart therefore
+cannot change a crop. The legacy strategy keeps the archived process-local RNG
+behavior. A compatible legacy multiworker resume warns when cropping can
+occur; strict mode rejects that combination.
+
 V1 can resume the legacy global or no-clipping path. It cannot resume AdaGC
 after update zero because no norm history exists. Older v2 and local
-checkpoints with `topology=None` remain readable. Architecture compatibility
+checkpoints with `topology=None` remain readable under the compatible policy,
+with a warning that full data-path exactness is unavailable. Strict policy
+fails closed when versioned provenance is absent. Architecture compatibility
 still comes from serialized active and pretrained configs plus strict tensor
 keys and shapes.
 

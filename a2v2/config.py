@@ -66,6 +66,7 @@ class CheckpointConfig:
     save_interval_updates: int = 0
     keep_last_epochs: int = 1
     best_checkpoint_metric: str = "loss"
+    resume_policy: str = "compatible"
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class DatasetConfig:
     validate_after_updates: int = 0
     disable_validation: bool = False
     required_batch_size_multiple: int = 8
+    crop_strategy: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -475,6 +477,14 @@ def _non_negative_int(value: object, field_name: str) -> int:
     return value
 
 
+def _positive_int(value: object, field_name: str) -> int:
+    """Validate a strictly positive integer without accepting booleans."""
+
+    if type(value) is not int or value <= 0:
+        raise ConfigError(f"{field_name} must be a positive integer")
+    return value
+
+
 def _serialized_defaults(config_type: type[Any], values: Mapping[str, Any]) -> dict[str, Any]:
     """Supply current dataclass defaults to fields absent from old checkpoints."""
 
@@ -510,6 +520,8 @@ def resolve_attention_backend(model: ModelConfig) -> str:
 
 def _validate_modern_options(
     common: CommonConfig,
+    checkpoint: CheckpointConfig,
+    dataset: DatasetConfig,
     optimization: OptimizationConfig,
     optimizer: OptimizerConfig,
     model: ModelConfig,
@@ -525,6 +537,8 @@ def _validate_modern_options(
     )
     _strict_bool(common.torch_compile_fullgraph, "common.torch_compile_fullgraph")
     _strict_optional_bool(common.torch_compile_dynamic, "common.torch_compile_dynamic")
+    _enum(checkpoint.resume_policy, "checkpoint.resume_policy", {"compatible", "strict"})
+    _enum(dataset.crop_strategy, "dataset.crop_strategy", {"legacy", "stateless"})
     _enum(model.position_encoding, "model.position_encoding", {"legacy", "alibi", "rope", "none"})
     _enum(model.attention_backend, "model.attention_backend", {"legacy", "manual", "sdpa", "flash"})
     _finite_float(model.rope_theta, "model.rope_theta", minimum=0.0, exclusive_minimum=True)
@@ -545,7 +559,7 @@ def _validate_modern_options(
     )
     _non_negative_int(optimization.adagc_warmup_updates, "optimization.adagc_warmup_updates")
     _enum(optimizer.name, "optimizer._name", {"adam", "adamw", "adam8bit", "adamw8bit"})
-    _non_negative_int(optimizer.min_8bit_size, "optimizer.min_8bit_size")
+    _positive_int(optimizer.min_8bit_size, "optimizer.min_8bit_size")
     _enum(optimizer.weight_decay_schedule, "optimizer.weight_decay_schedule", {"constant", "cosine"})
     if optimizer.weight_decay_end is not None:
         _finite_float(optimizer.weight_decay_end, "optimizer.weight_decay_end", minimum=0.0)
@@ -556,6 +570,16 @@ def _validate_modern_options(
         raise ConfigError("model.position_encoding=legacy requires attention_backend=legacy or manual")
     if model.classification_head == "cls" and not model.use_cls_token:
         raise ConfigError("model.classification_head=cls requires model.use_cls_token=true")
+    if type(model.num_heads) is not int or model.num_heads <= 0:
+        raise ConfigError("model.num_heads must be a positive integer")
+    if type(model.embed_dim) is not int or model.embed_dim <= 0:
+        raise ConfigError("model.embed_dim must be a positive integer")
+    if model.embed_dim % model.num_heads:
+        raise ConfigError("model.embed_dim must be divisible by model.num_heads")
+    if resolve_position_encoding(model) == "rope" and (
+        model.embed_dim // model.num_heads
+    ) % 2:
+        raise ConfigError("RoPE attention head dimension must be even")
 
 
 # =============================================================================
@@ -621,7 +645,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
     checkpoint_raw = _mapping(raw, "checkpoint")
     _check_keys("checkpoint", checkpoint_raw, {
         "save_dir", "save_interval", "save_interval_updates", "keep_last_epochs",
-        "best_checkpoint_metric",
+        "best_checkpoint_metric", "resume_policy",
     })
     checkpoint = CheckpointConfig(
         save_dir=Path(checkpoint_raw.get("save_dir", "checkpoints")),
@@ -629,6 +653,11 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         save_interval_updates=int(checkpoint_raw.get("save_interval_updates", 0)),
         keep_last_epochs=int(checkpoint_raw.get("keep_last_epochs", 1)),
         best_checkpoint_metric=str(checkpoint_raw.get("best_checkpoint_metric", "loss")),
+        resume_policy=_enum(
+            checkpoint_raw.get("resume_policy", "compatible"),
+            "checkpoint.resume_policy",
+            {"compatible", "strict"},
+        ),
     )
 
     task_raw = _mapping(raw, "task")
@@ -662,6 +691,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         "num_workers", "max_tokens", "train_subset", "valid_subset", "validate_interval",
         "validate_interval_updates", "validate_after_updates", "disable_validation",
         "required_batch_size_multiple", "skip_invalid_size_inputs_valid_test",
+        "crop_strategy",
     })
     dataset = DatasetConfig(
         num_workers=int(dataset_raw.get("num_workers", 0)),
@@ -673,6 +703,11 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         validate_after_updates=int(dataset_raw.get("validate_after_updates", 0)),
         disable_validation=bool(dataset_raw.get("disable_validation", False)),
         required_batch_size_multiple=int(dataset_raw.get("required_batch_size_multiple", 8)),
+        crop_strategy=_enum(
+            dataset_raw.get("crop_strategy", "legacy"),
+            "dataset.crop_strategy",
+            {"legacy", "stateless"},
+        ),
     )
 
     distributed_raw = _mapping(raw, "distributed_training")
@@ -786,7 +821,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         betas=(float(betas[0]), float(betas[1])),
         eps=float(effective_optimizer.get("adam_eps", 1e-8)),
         weight_decay=float(effective_optimizer.get("weight_decay", 0.0)),
-        min_8bit_size=_non_negative_int(
+        min_8bit_size=_positive_int(
             effective_optimizer.get("min_8bit_size", 4096),
             "optimizer.min_8bit_size",
         ),
@@ -889,7 +924,7 @@ def config_from_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         audio=audio,
         **model_kwargs,
     )
-    _validate_modern_options(common, optimization, optimizer, model)
+    _validate_modern_options(common, checkpoint, dataset, optimization, optimizer, model)
     # Mathematics: stage = finetune iff labels are requested or the criterion
     # name marks a fine-tuning criterion; all remaining recipes are pretraining.
     # Interpretation: one validated field chooses the model and workflow while
@@ -995,7 +1030,7 @@ def config_from_serialized_dict(raw: Mapping[str, object]) -> Animal2VecConfig:
         stage = str(raw["stage"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError(f"invalid serialized native configuration: {exc}") from exc
-    _validate_modern_options(common, optimization, optimizer, model)
+    _validate_modern_options(common, checkpoint, dataset, optimization, optimizer, model)
     return Animal2VecConfig(
         common=common,
         checkpoint=checkpoint,

@@ -1346,6 +1346,16 @@ def _manifest_cli(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _train_subset_cli(arguments: argparse.Namespace) -> int:
+    """Print the train subset resolved from one config and override sequence."""
+
+    from .config import load_config
+
+    config = load_config(arguments.config, arguments.override)
+    print(config.dataset.train_subset)
+    return 0
+
+
 def _launcher_contracts_cli(arguments: argparse.Namespace) -> int:
     """Render the selected stable stage identities in one Python process."""
 
@@ -1462,6 +1472,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--entry", action="append", default=[], required=True)
     manifest.add_argument("--allow-missing", action="store_true")
+    train_subset = subparsers.add_parser("train-subset")
+    train_subset.add_argument("--config", required=True, type=Path)
+    train_subset.add_argument("--override", action="append", default=[])
     launcher = subparsers.add_parser("launcher-contracts")
     launcher.add_argument("--job-id", required=True)
     launcher.add_argument("--nodes", required=True, type=int)
@@ -1510,6 +1523,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _contract_cli(arguments)
         if arguments.command == "manifest":
             return _manifest_cli(arguments)
+        if arguments.command == "train-subset":
+            return _train_subset_cli(arguments)
         if arguments.command == "launcher-contracts":
             return _launcher_contracts_cli(arguments)
         return _completion_cli(

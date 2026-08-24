@@ -3,6 +3,8 @@ The suite checks checkpoint continuity, DataLoader prefetch accounting, schedule
 horizons, overrides, and distributed launch validation."""
 
 import json
+import subprocess
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -455,6 +457,129 @@ def test_cli_multiworker_resume_matches_uninterrupted_state(tmp_path: Path) -> N
     assert train_main(arguments(resumed_dir, 1)) == 0
     resume_point = resumed_dir / "checkpoint_last.pt"
     assert train_main(arguments(resumed_dir, 2) + ["--resume", str(resume_point)]) == 0
+
+    continuous = load_checkpoint(continuous_dir / "checkpoint_last.pt")
+    resumed = load_checkpoint(resumed_dir / "checkpoint_last.pt")
+    for field in (
+        "model", "teacher", "optimizer", "scheduler", "scaler", "update",
+        "epoch", "batch_in_epoch", "rng_state", "sampler_state", "best_metric",
+    ):
+        _assert_tree_equal(resumed[field], continuous[field], field)
+
+
+def test_cli_stateless_multiworker_crop_resume_matches_after_process_restart(
+    tmp_path: Path,
+) -> None:
+    """Resume exact random crops independently of worker process RNG state."""
+
+    manifests = _data(
+        tmp_path,
+        (96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184),
+    )
+
+    def arguments(output_dir: Path, stop: int) -> list[str]:
+        """Return one bounded strict stateless training invocation."""
+
+        return [
+            "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
+            "--override", f"task.data={manifests}",
+            "--override", f"checkpoint.save_dir={output_dir}",
+            "--override", "checkpoint.resume_policy=strict",
+            "--override", "dataset.crop_strategy=stateless",
+            "--override", "dataset.max_tokens=400",
+            "--override", "dataset.num_workers=2",
+            "--stop-at-update", str(stop),
+            "--device", "cpu",
+        ]
+
+    def run_child(arguments: list[str]) -> None:
+        """Run one stage in a fresh interpreter and require success."""
+
+        code = (
+            "import sys; from a2v2.workflows import train_main; "
+            "raise SystemExit(train_main(sys.argv[1:]))"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code, *arguments],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    continuous_dir = tmp_path / "stateless-continuous"
+    run_child(arguments(continuous_dir, 2))
+
+    resumed_dir = tmp_path / "stateless-resumed"
+    run_child(arguments(resumed_dir, 1))
+    resume_point = resumed_dir / "checkpoint_last.pt"
+    run_child(arguments(resumed_dir, 2) + ["--resume", str(resume_point)])
+
+    continuous = load_checkpoint(continuous_dir / "checkpoint_last.pt")
+    resumed = load_checkpoint(resumed_dir / "checkpoint_last.pt")
+    for field in (
+        "model", "teacher", "optimizer", "scheduler", "scaler", "update",
+        "epoch", "batch_in_epoch", "rng_state", "sampler_state", "best_metric",
+    ):
+        _assert_tree_equal(resumed[field], continuous[field], field)
+
+
+def test_two_rank_gloo_stateless_crop_resume_matches_uninterrupted(
+    tmp_path: Path,
+) -> None:
+    """Keep distributed crop coordinates exact across a torchrun restart."""
+
+    manifests = _data(
+        tmp_path,
+        (96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184),
+    )
+
+    def arguments(output_dir: Path, stop: int) -> list[str]:
+        """Return bounded two-rank Gloo training arguments."""
+
+        return [
+            "--config", str(ROOT / "configs/cpu_smoke_pretraining.yaml"),
+            "--override", f"task.data={manifests}",
+            "--override", f"checkpoint.save_dir={output_dir}",
+            "--override", "checkpoint.resume_policy=strict",
+            "--override", "dataset.crop_strategy=stateless",
+            "--override", "dataset.max_tokens=400",
+            "--override", "dataset.num_workers=1",
+            "--override", "distributed_training.distributed_world_size=2",
+            "--override", "distributed_training.ddp_backend=gloo",
+            "--stop-at-update", str(stop),
+            "--device", "cpu",
+        ]
+
+    def run_torchrun(arguments: list[str]) -> None:
+        """Launch two local CPU ranks in a fresh process group."""
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc-per-node=2",
+                str(ROOT / "tests/integration/gloo_crop_resume.py"),
+                *arguments,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    continuous_dir = tmp_path / "gloo-continuous"
+    run_torchrun(arguments(continuous_dir, 2))
+    resumed_dir = tmp_path / "gloo-resumed"
+    run_torchrun(arguments(resumed_dir, 1))
+    resume_point = resumed_dir / "checkpoint_last.pt"
+    run_torchrun(arguments(resumed_dir, 2) + ["--resume", str(resume_point)])
 
     continuous = load_checkpoint(continuous_dir / "checkpoint_last.pt")
     resumed = load_checkpoint(resumed_dir / "checkpoint_last.pt")

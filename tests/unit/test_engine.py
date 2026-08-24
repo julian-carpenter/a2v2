@@ -183,6 +183,17 @@ def test_training_compiles_after_device_move_before_optimizer_and_ddp(
         raise ConstructionStopped("observed DDP construction")
 
     monkeypatch.setattr(workflows, "_distributed_device", lambda *_: (torch.device("cpu"), 0, 2, False))
+    dataset = type(
+        "DatasetSentinel",
+        (),
+        {"sizes": (8, 8), "__len__": lambda self: 2},
+    )()
+    monkeypatch.setattr(workflows, "_make_dataset", lambda *_: dataset)
+    monkeypatch.setattr(
+        workflows,
+        "_training_data_resume_provenance",
+        lambda *_: {"schema": "a2v2.training-data.v1"},
+    )
     monkeypatch.setattr(workflows, "_make_model", lambda *_args, **_kwargs: (model, None))
     monkeypatch.setattr(
         workflows,

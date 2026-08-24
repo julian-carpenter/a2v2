@@ -39,9 +39,9 @@ YAML_HASHES = {
     "configs/hyenas/finetune_mixup_100.yaml":
         "7b657777801b20fdef164a714def35677be579b7cbbd8bca3cbbd16cf96a9681",
     "configs/modern/rope_cls_geglu_finetune.yaml":
-        "5edf20a0d85f401f14c42e07c6388d87a71109fa7665e0f0381cf84d5b937f93",
+        "d0bb4b2ef448439a2fd6f2a757cbcbd92c5d454bbe450fddad76c9d29ce57ba7",
     "configs/modern/rope_cls_geglu_pretrain.yaml":
-        "7a1b1225a61f4bc7025c792562f923f752db1dc0050b319910d18e904bff3ee8",
+        "8dfb8804acf087283bb99ca90e0ad53337fae01684de2f2a766a180e9c9553aa",
     "tests/fixtures/tiny_finetune.yaml":
         "166ebbbc14417430a664b02fdaf2f7c327d9923217cff5f00a6b8487aedff0cc",
     "tests/fixtures/tiny_pretrain.yaml":

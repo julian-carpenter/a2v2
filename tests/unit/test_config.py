@@ -109,6 +109,8 @@ def test_modern_example_configs_select_compatible_architecture_and_policies() ->
     assert pretrain.stage == "pretrain"
     assert finetune.stage == "finetune"
     for config in (pretrain, finetune):
+        assert config.dataset.crop_strategy == "stateless"
+        assert config.checkpoint.resume_policy == "strict"
         assert config_module.resolve_position_encoding(config.model) == "rope"
         assert config_module.resolve_attention_backend(config.model) == "flash"
         assert config.model.use_cls_token is True
@@ -200,6 +202,8 @@ def test_modern_options_default_to_legacy_and_round_trip() -> None:
         assert config.optimization.adagc_relative_clip == 1.04
         assert config.optimization.adagc_warmup_updates == 100
         assert config.optimizer.min_8bit_size == 4096
+        assert config.dataset.crop_strategy == "legacy"
+        assert config.checkpoint.resume_policy == "compatible"
         assert config.optimizer.weight_decay_schedule == "constant"
         assert config.optimizer.weight_decay_end is None
         assert restored == config
@@ -325,6 +329,7 @@ def test_modern_option_validation_rejects_incompatible_combinations() -> None:
         ("optimization", "adagc_relative_clip", 0.0),
         ("optimization", "adagc_warmup_updates", -1),
         ("optimizer", "min_8bit_size", -1),
+        ("optimizer", "min_8bit_size", 0),
         ("optimizer", "weight_decay_schedule", "linear"),
     )
     for section, field, value in invalid_values:
@@ -343,6 +348,33 @@ def test_modern_option_validation_rejects_incompatible_combinations() -> None:
     cls_model["classification_head"] = "cls"
     with pytest.raises(ConfigError, match=r"classification_head=cls.*use_cls_token"):
         config_from_dict(missing_cls_token)
+
+    indivisible_heads = deepcopy(base_raw)
+    indivisible_model = indivisible_heads["model"]
+    assert isinstance(indivisible_model, dict)
+    indivisible_model["embed_dim"] = 10
+    indivisible_model["num_heads"] = 4
+    with pytest.raises(ConfigError, match=r"embed_dim.*divisible.*num_heads"):
+        config_from_dict(indivisible_heads)
+
+    odd_rope_head = deepcopy(base_raw)
+    odd_rope_model = odd_rope_head["model"]
+    assert isinstance(odd_rope_model, dict)
+    odd_rope_model["embed_dim"] = 12
+    odd_rope_model["num_heads"] = 4
+    odd_rope_model["position_encoding"] = "rope"
+    with pytest.raises(ConfigError, match=r"RoPE.*head dimension.*even"):
+        config_from_dict(odd_rope_head)
+
+
+def test_crop_and_resume_strategies_are_strict_enums() -> None:
+    """Reject misspelled data-resume safety policies at config load."""
+
+    path = ROOT / "tests/fixtures/tiny_pretrain.yaml"
+    with pytest.raises(ConfigError, match=r"dataset\.crop_strategy"):
+        load_config(path, overrides=("dataset.crop_strategy=randomish",))
+    with pytest.raises(ConfigError, match=r"checkpoint\.resume_policy"):
+        load_config(path, overrides=("checkpoint.resume_policy=best-effort",))
 
 
 def test_checkpoint_activations_defaults_overrides_and_round_trips() -> None:

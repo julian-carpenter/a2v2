@@ -24,11 +24,21 @@ byte-identical at SHA-256
 It retains the same three training commands, resolved MeerKAT recipes,
 fine-tuning activation-checkpoint override, and final evaluation flow.
 
+Those frozen recipes use the legacy crop and compatible-resume defaults. Their
+resume path remains supported, but a process restart with random cropping and
+multiple DataLoader workers is not bit-exact because checkpoints omit
+worker-local RNG and prefetch state. The driver now emits that runtime warning
+when the remaining sampler batches can crop. Use the separate modern recipes,
+which select stateless crops and strict provenance, when exact data-path resume
+is required. The frozen YAML and local driver bytes remain unchanged.
+
 `scripts/reproduce_meerkat_slurm.sh` provides a separate scheduler entry
 point. It uses the frozen MeerKAT recipes by default, starts one torchrun agent
 per node, runs one worker per GPU, creates phase-specific rendezvous IDs, and
 runs final evaluation as a one-node, one-GPU step. It does not change the local
 driver or establish paper equivalence for a new topology.
+The pretraining RunContract reads `dataset.train_subset` from the resolved
+pretraining config and fingerprints that manifest only.
 
 The SLURM implementation passed Bash syntax, deterministic dry-run, mocked
 scheduler, two-rank Gloo safe-point, frozen-driver, and full CPU tests. No real

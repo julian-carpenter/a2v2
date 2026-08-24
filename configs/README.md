@@ -71,6 +71,10 @@ GEGLU blocks, DeepScaleLM initialization, activation checkpointing, AdaGC,
 AdamW8bit, cosine weight-decay annealing, and `torch.compile`. The pretraining
 recipe adds a CLS regression objective while retaining frame reconstruction.
 The fine-tuning recipe selects a sequence-level CLS classifier.
+Both modern recipes opt into `dataset.crop_strategy: stateless` and
+`checkpoint.resume_policy: strict`. Those settings bind random crop windows to
+checkpointed sampler occurrences and require versioned manifest and sampler
+provenance on resume.
 
 These files illustrate the modern path. They do not define a paper baseline
 and cannot load the published encoder weights. CLS and GEGLU add parameters
@@ -106,6 +110,12 @@ CLS or GEGLU tensors and incompatible shapes.
 | `optimizer._name` | Adds `adamw`, `adam8bit`, and `adamw8bit` beside the Fairseq-compatible `adam` control. |
 | `optimizer.min_8bit_size` | Defaults to 4,096. bitsandbytes keeps smaller tensor state in FP32. |
 | `optimizer.weight_decay_schedule` | `constant` keeps the legacy fixed value. `cosine` anneals nonzero groups from `weight_decay` to `weight_decay_end`; an omitted endpoint means 0.0. |
+| `dataset.crop_strategy` | `legacy` preserves worker-local random crops. `stateless` derives per-occurrence crop seeds from sampler coordinates and supports exact process restart. |
+| `checkpoint.resume_policy` | `compatible` accepts older fingerprints with a warning. `strict` requires versioned task, manifest, and sampler provenance before mutable training objects are built. |
+
+`optimizer.min_8bit_size` must be positive. The resolved `model.embed_dim`
+must be divisible by `model.num_heads`, and RoPE requires an even per-head
+dimension; config loading rejects violations before model construction.
 
 Install the optional optimizer extra with:
 

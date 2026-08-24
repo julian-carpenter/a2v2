@@ -9,7 +9,13 @@ import pytest
 import soundfile as sf
 import torch
 
-from a2v2.data import AudioDataset, ManifestError, collate_audio, read_manifest
+from a2v2.data import (
+    AudioDataset,
+    ManifestError,
+    SampleCoordinate,
+    collate_audio,
+    read_manifest,
+)
 
 
 LAYERS = ((8, 7, 1), (16, 4, 2), (16, 4, 2))
@@ -110,6 +116,37 @@ def test_collate_crops_waveforms_and_targets_with_same_offset(tmp_path: Path) ->
     assert batch["target"].shape == (2, 14, 2)
     assert batch["crop_offsets"].shape == (2,)
     assert "padding_mask" not in batch
+
+
+def test_stateless_crop_uses_item_coordinate_not_process_rng(tmp_path: Path) -> None:
+    """Produce the same random crop after unrelated process-RNG draws."""
+
+    dataset = AudioDataset(
+        _manifest(tmp_path), sample_rate=8000, conv_layers=LAYERS,
+        normalize=False, labels=("call", "focal"),
+    )
+    items = [
+        dataset[SampleCoordinate(index=0, crop_seed=101)],
+        dataset[SampleCoordinate(index=1, crop_seed=202)],
+    ]
+    first = collate_audio(
+        items,
+        max_sample_size=56,
+        pad=False,
+        conv_layers=LAYERS,
+        crop_strategy="stateless",
+    )
+    torch.rand(1_000)
+    second = collate_audio(
+        items,
+        max_sample_size=56,
+        pad=False,
+        conv_layers=LAYERS,
+        crop_strategy="stateless",
+    )
+
+    assert torch.equal(first["crop_offsets"], second["crop_offsets"])
+    assert torch.equal(first["source"], second["source"])
 
 
 def test_collate_right_pads_audio_targets_and_mask(tmp_path: Path) -> None:
