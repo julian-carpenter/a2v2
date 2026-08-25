@@ -183,6 +183,85 @@ phase headers and append across invocations. The output directory also retains
 package, GPU, manifest, recipe, and batch and activation-memory profile
 provenance.
 
+## Modern eight-A100 benchmark
+
+`scripts/animal2vec2_benchmark.sh` is the performance-oriented companion to
+the frozen Animal2Vec 1.0 control. It follows the same preflight, eight-rank
+NCCL probe, one-update burn-in, checkpoint validation, full pretraining,
+fine-tuning, and final-evaluation sequence. It does not modify or replace
+`scripts/reproduce_meerkat_paper.sh`.
+
+Launch fold 0 from the repository root:
+
+```bash
+bash scripts/animal2vec2_benchmark.sh \
+  /local/datasets/MeerKAT_10s_2024-06-12/manifests \
+  /experiments/animal2vec2-meerkat-fold0
+```
+
+The benchmark accepts `--fold N` and intentionally has no label-fraction
+option. It always uses `train_<fold>.tsv` and `valid_<fold>.tsv`, so it runs
+the approved 100% labeled-data condition only. `--dry-run` checks those paths
+and prints the complete command graph without allocating a GPU.
+
+The launcher uses the paired files in `configs/modern/` and pins their defining
+choices again as command-line overrides:
+
+- RoPE with strict FlashAttention and ALiBi disabled;
+- frame plus CLS regression during pretraining and a CLS sequence head during
+  fine-tuning;
+- packed GEGLU and DeepScaleLM initialization;
+- AdaGC, AdamW8bit, and cosine weight-decay annealing from `0.01` to `0.0`;
+- partial-graph `torch.compile`; and
+- no activation checkpointing.
+
+Pretraining uses `408000 × 8 × 3 = 9,792,000` tokens per optimizer update for
+384,230 updates. Fine-tuning uses `960000 × 8 × 2 = 15,360,000` tokens per
+optimizer update for 30,000 updates. These are the same eight-GPU batch and
+training-horizon controls used for the successful local reproduction. Do not
+change token, accumulation, or world-size settings when resuming a checkpoint.
+
+The environment preflight additionally requires bitsandbytes `>=0.49,<0.50`
+and confirms that its native CUDA library loaded. The host default is
+`A2V2_BNB_CUDA_VERSION=130`. Remove or override that value only when the
+installed wheel should select a different CUDA binary. Set
+`A2V2_BNB_CUDA_VERSION=auto` to omit `BNB_CUDA_VERSION` and use the wheel's
+automatic selection. Every training rank uses the same persistent cache at
+`OUTPUT_DIR/environment/torchinductor-cache`; set
+`A2V2_TORCHINDUCTOR_CACHE_DIR` to move it to another fast local filesystem.
+
+The final step evaluates `checkpoint_best.pt` with
+`a2v2-evaluate-sequence`, falling back to `checkpoint_last.pt` when needed.
+It writes atomic JSON to
+`OUTPUT_DIR/final-evaluation/final-evaluation-report.json`. These are
+recording-level CLS metrics. They are not frame-event metrics from the frozen
+Animal2Vec 1.0 evaluator, so compare the two model families with the matching
+metric definition.
+
+Before evaluation, the launcher compares `checkpoint_best.pt` with the current
+last or resume checkpoint's strict run fingerprint. It falls back to the
+current checkpoint when an old best file belongs to another manifest or run.
+The exact evaluated checkpoint is recorded in
+`evaluation-checkpoint-sha256.txt`; stage, update, size, and preflight results
+are stored in `evaluation-checkpoint-preflight.json`. The checkpoint hash is
+checked again before the metrics report is published.
+
+The benchmark supports the same batch and process environment variables as
+the local control, plus:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `A2V2_BNB_CUDA_VERSION` | `130` | bitsandbytes CUDA binary suffix; use `auto` to omit the override |
+| `A2V2_TORCHINDUCTOR_CACHE_DIR` | `OUTPUT_DIR/environment/torchinductor-cache` | Persistent compile cache shared by benchmark stages |
+| `A2V2_SEQUENCE_EVAL_ENTRY` | `a2v2-evaluate-sequence` | Sequence-evaluator executable |
+
+Strict FlashAttention fails at launch or first forward if PyTorch cannot
+dispatch its Flash kernel. The script does not fall back to the math backend,
+does not enable activation checkpointing, and does not reduce batch size after
+an OOM. Those failures indicate that the host no longer matches this benchmark
+profile and should be investigated rather than hidden by a silent policy
+change.
+
 ## 1. Select the published recipe
 
 The repository includes four primary recipes:

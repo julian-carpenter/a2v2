@@ -520,6 +520,26 @@ and DeepScaleLM. They also select activation checkpointing, AdaGC, AdamW8bit,
 cosine weight-decay annealing, partial-graph `torch.compile`, stateless crop
 coordinates, and strict resume provenance.
 
+For the full-label MeerKAT benchmark on the verified eight-A100 host, run the
+complete pretrain, fine-tune, and sequence-evaluation workflow with:
+
+```bash
+bash scripts/animal2vec2_benchmark.sh \
+  /local/datasets/MeerKAT_10s_2024-06-12/manifests \
+  /experiments/animal2vec2-meerkat-fold0
+```
+
+Use `--dry-run` first to inspect every resolved command. The benchmark keeps
+the reproduction driver's eight-rank token batches and update horizons, uses
+only the 100% label split, and overrides activation checkpointing off. It
+requires bitsandbytes 0.49 with a loaded CUDA backend and defaults
+`BNB_CUDA_VERSION` to `130` for this host. It also keeps one persistent
+TorchInductor cache below the output directory so the burn-in and resumed job
+can reuse compiled artifacts. Set `A2V2_BNB_CUDA_VERSION=auto` when the wheel
+should select its CUDA binary without an override. See the
+[reproduction guide](docs/reproducing-paper.md#modern-eight-a100-benchmark)
+for checkpoint, evaluation, and environment controls.
+
 Train the pretraining example after replacing its manifest path:
 
 ```bash

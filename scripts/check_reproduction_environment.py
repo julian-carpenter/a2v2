@@ -7,6 +7,7 @@ import argparse
 import json
 import platform
 import random
+import re
 import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -26,6 +27,36 @@ except Exception as error:  # pragma: no cover - exercised by a broken deploymen
 
 
 GIB = 1024**3
+
+
+def check_bitsandbytes() -> dict[str, object]:
+    """Validate the pinned 8-bit optimizer package and its CUDA backend."""
+
+    try:
+        import bitsandbytes
+        from bitsandbytes.cextension import lib
+    except Exception as error:
+        raise RuntimeError(
+            f"could not import bitsandbytes and its native backend: {error}"
+        ) from error
+
+    version = str(getattr(bitsandbytes, "__version__", "unknown"))
+    if re.fullmatch(r"0\.49(?:\.\d+)?(?:[-+].*)?", version) is None:
+        raise RuntimeError(
+            "modern benchmark requires bitsandbytes >=0.49,<0.50; "
+            f"found {version}"
+        )
+    compiled_with_cuda = bool(getattr(lib, "compiled_with_cuda", False))
+    if not compiled_with_cuda:
+        raise RuntimeError(
+            "bitsandbytes loaded without CUDA support; the AdamW8bit benchmark "
+            "cannot run"
+        )
+    return {
+        "version": version,
+        "compiled_with_cuda": compiled_with_cuda,
+        "native_library": str(getattr(lib, "_name", "unknown")),
+    }
 
 
 def check_cuda_devices(
@@ -93,6 +124,7 @@ def check_training_checkpoint(
     path: Path,
     expected_world_size: int,
     expected_stage: str | None = None,
+    reference_path: Path | None = None,
 ) -> dict[str, object]:
     """Validate that a native checkpoint can resume eight-rank optimization."""
 
@@ -217,11 +249,85 @@ def check_training_checkpoint(
 
     try:
         update = int(checkpoint["update"])
+    except (TypeError, ValueError, OverflowError) as error:
+        fail(f"update metadata is invalid: {error}")
+
+    active_config = (
+        checkpoint["config"].get("active")
+        if isinstance(checkpoint.get("config"), Mapping)
+        else None
+    )
+    if isinstance(active_config, Mapping):
+        optimization_config = active_config.get("optimization")
+        optimizer_config = active_config.get("optimizer")
+        checkpoint_config = active_config.get("checkpoint")
+        if (
+            isinstance(optimization_config, Mapping)
+            and optimization_config.get("gradient_clip_method") == "adagc"
+        ):
+            clipper_state = checkpoint.get("gradient_clipper")
+            expected_clipper_keys = {
+                "algorithm_version",
+                "update",
+                "parameter_names",
+                "norm_emas",
+            }
+            if not isinstance(clipper_state, Mapping):
+                fail("AdaGC checkpoint is missing clipper state")
+            if set(clipper_state) != expected_clipper_keys:
+                fail("AdaGC clipper state keys are malformed")
+            if clipper_state.get("algorithm_version") != 1:
+                fail("AdaGC clipper algorithm version is unsupported")
+            if clipper_state.get("update") != update:
+                fail("AdaGC clipper state does not match checkpoint update")
+            parameter_names = clipper_state.get("parameter_names")
+            norm_emas = clipper_state.get("norm_emas")
+            if (
+                not isinstance(parameter_names, list)
+                or not all(isinstance(name, str) for name in parameter_names)
+                or not isinstance(norm_emas, Mapping)
+                or set(norm_emas) != set(parameter_names)
+            ):
+                fail("AdaGC clipper parameter state is malformed")
+            for name in parameter_names:
+                norm = norm_emas[name]
+                if (
+                    not isinstance(norm, torch.Tensor)
+                    or norm.shape != torch.Size([])
+                    or norm.dtype != torch.float32
+                    or not (bool(torch.isfinite(norm)) or bool(torch.isposinf(norm)))
+                    or (bool(torch.isfinite(norm)) and float(norm) < 0.0)
+                ):
+                    fail(f"AdaGC norm for {name!r} is malformed")
+        if (
+            isinstance(optimizer_config, Mapping)
+            and optimizer_config.get("weight_decay_schedule") == "cosine"
+        ):
+            decay_state = checkpoint.get("weight_decay_scheduler")
+            if not isinstance(decay_state, Mapping):
+                fail("weight-decay scheduler is missing state")
+            if set(decay_state) != {"last_update"}:
+                fail("weight-decay scheduler state is malformed")
+            if decay_state.get("last_update") != update:
+                fail("weight-decay scheduler state does not match checkpoint update")
+        if (
+            isinstance(checkpoint_config, Mapping)
+            and checkpoint_config.get("resume_policy") == "strict"
+        ):
+            fingerprint = checkpoint.get("resume_compatibility")
+            if (
+                not isinstance(fingerprint, Mapping)
+                or fingerprint.get("training_data.schema")
+                != "a2v2.training-data.v2"
+            ):
+                fail("strict resume checkpoint lacks training-data provenance")
+
+    try:
         epoch = int(checkpoint["epoch"])
         size_bytes = resolved.stat().st_size
     except (TypeError, ValueError, OverflowError, OSError) as error:
         fail(f"metadata is invalid: {error}")
-    return {
+    report = {
         "path": str(resolved),
         "stage": stage,
         "update": update,
@@ -229,6 +335,32 @@ def check_training_checkpoint(
         "rng_world_size": saved_world_size,
         "size_bytes": size_bytes,
     }
+    if reference_path is not None:
+        reference_report = check_training_checkpoint(
+            reference_path,
+            expected_world_size,
+            expected_stage,
+        )
+        try:
+            reference_checkpoint = load_checkpoint(
+                reference_path.resolve(),
+                map_location="cpu",
+            )
+        except Exception as error:
+            fail(f"cannot load reference checkpoint {reference_path}: {error}")
+        selected_fingerprint = checkpoint.get("resume_compatibility")
+        reference_fingerprint = reference_checkpoint.get("resume_compatibility")
+        if (
+            not isinstance(selected_fingerprint, Mapping)
+            or not isinstance(reference_fingerprint, Mapping)
+            or dict(selected_fingerprint) != dict(reference_fingerprint)
+        ):
+            fail(
+                "resume fingerprint differs from reference checkpoint "
+                f"{reference_path.resolve()}"
+            )
+        report["reference_checkpoint"] = reference_report
+    return report
 
 
 def _runtime_report() -> dict[str, object]:
@@ -260,7 +392,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-free-gib", type=float, default=38.0)
     parser.add_argument("--min-disk-gib", type=float, default=64.0)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--reference-checkpoint", type=Path)
     parser.add_argument("--expected-stage", choices=("pretrain", "finetune"))
+    parser.add_argument(
+        "--require-bitsandbytes",
+        action="store_true",
+        help="require the pinned bitsandbytes release and a loaded CUDA backend",
+    )
     return parser
 
 
@@ -287,7 +425,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.checkpoint,
                 arguments.expected_gpus,
                 arguments.expected_stage,
+                arguments.reference_checkpoint,
             )
+        elif arguments.reference_checkpoint is not None:
+            raise RuntimeError("--reference-checkpoint requires --checkpoint")
+        if arguments.require_bitsandbytes:
+            report["bitsandbytes"] = check_bitsandbytes()
     except Exception as error:
         print(json.dumps({"pass": False, "error": str(error)}, sort_keys=True))
         return 1
