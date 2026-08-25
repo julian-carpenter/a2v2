@@ -2933,7 +2933,7 @@ def _run_training(
     )
     preflight = replace(preflight, pretrained_bundle=None)
     model.to(device)
-    _compile_model_in_place(model, config.common)
+    compile_report = _compile_model_in_place(model, config.common)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     gradient_clipper = _build_gradient_clipper_for_config(model, config)
@@ -3277,6 +3277,8 @@ def _run_training(
             "mode": config.common.torch_compile_mode,
             "fullgraph": config.common.torch_compile_fullgraph,
             "dynamic": config.common.torch_compile_dynamic,
+            "scope": compile_report.scope,
+            "regions": compile_report.regions,
         },
     }
     summary.update(_optimizer_run_metadata(optimizer))

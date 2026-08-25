@@ -2,6 +2,7 @@
 optimizer updates, EMA movement, and independent masking of cloned student views."""
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -22,7 +23,7 @@ from a2v2.model import (
     masks_for_cloned_batch,
 )
 from a2v2.training import CosineUpdateScheduler, TrainingEngine, load_checkpoint
-from a2v2.workflows import train_main
+from a2v2.workflows import _compile_model_in_place, train_main
 
 
 ROOT = Path(__file__).parents[2]
@@ -60,7 +61,7 @@ def test_compiled_pretraining_reports_execution_policy_without_state_prefixes(
         "--override", "common.torch_compile_backend=eager",
         "--override", "common.torch_compile_mode=default",
         "--override", "common.torch_compile_fullgraph=false",
-        "--override", "common.torch_compile_dynamic=false",
+        "--override", "common.torch_compile_dynamic=true",
         "--max-updates", "1",
         "--device", "cpu",
     ]) == 0
@@ -76,7 +77,9 @@ def test_compiled_pretraining_reports_execution_policy_without_state_prefixes(
         "backend": "eager",
         "mode": "default",
         "fullgraph": False,
-        "dynamic": False,
+        "dynamic": True,
+        "scope": "transformer_blocks",
+        "regions": 6,
     }
     checkpoint = load_checkpoint(output_root / "checkpoint_last.pt")
     common = checkpoint["config"]["active"]["common"]
@@ -84,7 +87,7 @@ def test_compiled_pretraining_reports_execution_policy_without_state_prefixes(
     assert common["torch_compile_backend"] == "eager"
     assert common["torch_compile_mode"] == "default"
     assert common["torch_compile_fullgraph"] is False
-    assert common["torch_compile_dynamic"] is False
+    assert common["torch_compile_dynamic"] is True
     assert all(not key.startswith("_orig_mod.") for key in checkpoint["model"])
     fingerprint = checkpoint["resume_compatibility"]
     assert all(not key.startswith("common.torch_compile") for key in fingerprint)
@@ -112,7 +115,18 @@ def test_compiled_rope_cls_geglu_checkpointed_pretraining_update_matches_eager()
     torch.manual_seed(601)
     eager = Animal2VecPretrainingModel.from_config(cfg).train()
     compiled = deepcopy(eager).train()
-    compiled.compile(backend="eager", fullgraph=False, dynamic=False)
+    compile_report = _compile_model_in_place(
+        compiled,
+        replace(
+            cfg.common,
+            torch_compile=True,
+            torch_compile_backend="eager",
+            torch_compile_fullgraph=False,
+            torch_compile_dynamic=True,
+        ),
+    )
+    assert compile_report.scope == "transformer_blocks"
+    assert compile_report.regions == 6
 
     def make_engine(model: Animal2VecPretrainingModel) -> TrainingEngine:
         """Build the optimizer after optional in-place compilation."""
@@ -123,7 +137,7 @@ def test_compiled_rope_cls_geglu_checkpointed_pretraining_update_matches_eager()
             max_lr=1e-3,
             min_lr=0.0,
             warmup_updates=0,
-            max_updates=2,
+            max_updates=12,
         )
         return TrainingEngine(
             model,
@@ -143,24 +157,40 @@ def test_compiled_rope_cls_geglu_checkpointed_pretraining_update_matches_eager()
     def update(
         model: Animal2VecPretrainingModel,
         engine: TrainingEngine,
+        retained_lengths: list[int],
     ) -> object:
         """Run one identically seeded masked update."""
 
-        torch.manual_seed(602)
-        np.random.seed(603)
-        return engine.step(
-            [batch],
-            lambda value: model(
+        torch.manual_seed(602 + engine.update)
+        np.random.seed(603 + engine.update)
+
+        def forward(value: dict[str, torch.Tensor]) -> object:
+            """Record the update-dependent student sequence length."""
+
+            output = model(
                 value["source"],
                 sample_ids=value["id"],
                 update=engine.update,
-            ),
+            )
+            retained_lengths.append(
+                output.mask.shape[1] - int(output.mask[0].sum().item())
+            )
+            return output
+
+        return engine.step(
+            [batch],
+            forward,
         )
 
-    eager_result = update(eager, eager_engine)
-    compiled_result = update(compiled, compiled_engine)
+    eager_lengths: list[int] = []
+    compiled_lengths: list[int] = []
+    for _ in range(12):
+        eager_result = update(eager, eager_engine, eager_lengths)
+        compiled_result = update(compiled, compiled_engine, compiled_lengths)
+        assert compiled_result == eager_result
 
-    assert compiled_result == eager_result
+    assert compiled_lengths == eager_lengths
+    assert len(set(compiled_lengths)) > 1
     assert tuple(compiled.state_dict()) == tuple(eager.state_dict())
     for name, expected in eager.state_dict().items():
         torch.testing.assert_close(compiled.state_dict()[name], expected, rtol=0, atol=0)
