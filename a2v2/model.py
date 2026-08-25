@@ -713,6 +713,7 @@ class MaskInfo:
     ids_keep: Tensor
 
 
+@torch.compiler.disable
 def compute_mask_indices(
     shape: tuple[int, int],
     padding_mask: Tensor | None,
