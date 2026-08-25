@@ -887,6 +887,7 @@ def compute_mask_indices(
     return torch.from_numpy(mask)
 
 
+@torch.compiler.disable
 def make_mask_info(features: Tensor, mask: Tensor) -> MaskInfo:
     """Gather unmasked tokens and record their inverse temporal permutation."""
 
