@@ -575,14 +575,23 @@ TorchDynamo DDP optimizer retain communication/compute overlap; the workflow
 does not disable DDP graph partitioning to work around scalar inputs.
 
 Fine-tuning and generic modules compile as one complete-model region.
-Pretraining keeps `Animal2VecPretrainingModel.forward` eager and compiles every
-student and EMA-teacher `TransformerBlock` instead. Mask generation,
-`MaskInfo.ids_keep`, decoder restoration, and masked target selection therefore
-never become Dynamo guards. Pretraining requires
-`torch_compile_dynamic=true`, so each block accepts the update-dependent
-retained sequence length without caching an exact-length graph. The terminal
-summary reports `scope=transformer_blocks` and the compiled region count;
-static compiled pretraining fails during setup with an actionable error.
+Pretraining keeps `Animal2VecPretrainingModel.forward` eager and compiles four
+regions: the student prenet and main `TransformerStack`, plus the matching EMA
+teacher stacks. Mask generation, `MaskInfo.ids_keep`, decoder restoration, and
+masked target selection therefore never become Dynamo guards. Immediately
+before each compiled stack, the encoder marks the token axes of its value,
+padding mask, positional IDs, and optional ALiBi bias dynamic. Pretraining
+requires `torch_compile_dynamic=true`; static compiled pretraining fails during
+setup with an actionable error. The terminal summary reports
+`scope=transformer_stacks` and `regions=4`.
+
+Stack-level regions are coarser than per-block regions for throughput, but do
+not cross the memory-unsafe student/teacher orchestration
+boundary. Whole-pretraining-model compilation specialized on `ids_keep`.
+Per-block compilation avoided that specialization but retained enough AOT
+autograd intermediates to exhaust a 40 GiB A100 at the larger batch profile.
+The stack boundary and the `408000 × 3` launcher partition were verified
+through update 10 on eight A100-SXM4-40GB GPUs after AdamW8bit state creation.
 
 `fullgraph=true` can reject unsupported operations inside a selected region and
 serves as a diagnostic for pure Transformer math. A two-length dynamic

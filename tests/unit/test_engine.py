@@ -68,18 +68,18 @@ def test_compile_policy_forwards_exact_options_without_rewrapping_model(
     assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
 
 
-def test_compile_policy_uses_dynamic_transformer_block_regions_for_pretraining(
+def test_compile_policy_uses_dynamic_transformer_stack_regions_for_pretraining(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep mask-dependent orchestration eager while compiling expensive blocks."""
+    """Keep mask orchestration eager while compiling the four encoder stacks."""
 
     config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
     model = Animal2VecPretrainingModel.from_config(config)
     expected_regions = (
-        *model.student.prenet.blocks,
-        *model.student.transformer.blocks,
-        *model.teacher.model.prenet.blocks,
-        *model.teacher.model.transformer.blocks,
+        model.student.prenet,
+        model.student.transformer,
+        model.teacher.model.prenet,
+        model.teacher.model.transformer,
     )
     state_keys = tuple(model.state_dict())
     parameter_ids = tuple(id(parameter) for parameter in model.parameters())
@@ -108,8 +108,10 @@ def test_compile_policy_uses_dynamic_transformer_block_regions_for_pretraining(
         "fullgraph": False,
         "dynamic": True,
     } for _, options in observed)
-    assert report.scope == "transformer_blocks"
+    assert report.scope == "transformer_stacks"
     assert report.regions == len(expected_regions)
+    assert model.student.regional_compile_dynamic is True
+    assert model.teacher.model.regional_compile_dynamic is True
     assert tuple(model.state_dict()) == state_keys
     assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
 

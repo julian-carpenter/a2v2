@@ -80,6 +80,30 @@ def test_rope_rejects_odd_attention_head_dimension() -> None:
         )
 
 
+def test_rope_attention_compiles_one_graph_for_dynamic_sequence_lengths() -> None:
+    """Keep symbolic RoPE axes free of Python shape specialization."""
+
+    layer = MultiheadAttention(
+        8,
+        2,
+        position_encoding="rope",
+        attention_backend="sdpa",
+    ).eval()
+    layer.compile(backend="eager", fullgraph=True, dynamic=True)
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+
+    for length in (5, 7):
+        value = torch.randn(2, length, 8)
+        position_ids = torch.arange(length).expand(2, -1)
+        torch._dynamo.mark_dynamic(value, 1)
+        torch._dynamo.mark_dynamic(position_ids, 1)
+        output = layer(value, position_ids=position_ids)
+        assert output.shape == value.shape
+
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 1
+
+
 def test_alibi_slopes_and_symmetric_bias() -> None:
     """Check ALiBi slopes and symmetric bias."""
     slopes = alibi_slopes(2)
@@ -424,7 +448,7 @@ def test_strict_flash_fails_with_actionable_context_on_cpu() -> None:
         RuntimeError,
         match=(
             r"strict FlashAttention failed.*backend=flash.*dtype=torch.float32"
-            r".*device=cpu.*head_dimension=4.*length=5.*padding=False"
+            r".*device=cpu.*head_dimension=4.*padding=False"
         ),
     ):
         layer(torch.randn(2, 5, 8))

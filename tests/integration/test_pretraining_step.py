@@ -78,8 +78,8 @@ def test_compiled_pretraining_reports_execution_policy_without_state_prefixes(
         "mode": "default",
         "fullgraph": False,
         "dynamic": True,
-        "scope": "transformer_blocks",
-        "regions": 6,
+        "scope": "transformer_stacks",
+        "regions": 4,
     }
     checkpoint = load_checkpoint(output_root / "checkpoint_last.pt")
     common = checkpoint["config"]["active"]["common"]
@@ -125,8 +125,8 @@ def test_compiled_rope_cls_geglu_checkpointed_pretraining_update_matches_eager()
             torch_compile_dynamic=True,
         ),
     )
-    assert compile_report.scope == "transformer_blocks"
-    assert compile_report.regions == 6
+    assert compile_report.scope == "transformer_stacks"
+    assert compile_report.regions == 4
 
     def make_engine(model: Animal2VecPretrainingModel) -> TrainingEngine:
         """Build the optimizer after optional in-place compilation."""

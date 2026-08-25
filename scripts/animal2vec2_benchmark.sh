@@ -184,9 +184,10 @@ SEQUENCE_EVAL_ENTRY="${A2V2_SEQUENCE_EVAL_ENTRY:-a2v2-evaluate-sequence}"
 
 # These values preserve the successful eight-GPU reproduction's effective
 # token batches: 9,792,000 for pretraining and 15,360,000 for fine-tuning.
-# The modern pretraining partition uses the measured faster 612000 x 2 profile.
-readonly PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-612000}"
-readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-2}"
+# 408000 x 3 leaves enough memory for compiled activations after AdamW8bit
+# materializes its optimizer state; 612000 x 2 does not fit on 40 GiB A100s.
+readonly PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-408000}"
+readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-3}"
 readonly FINETUNE_MAX_TOKENS="${A2V2_FINETUNE_MAX_TOKENS:-960000}"
 readonly FINETUNE_UPDATE_FREQ="${A2V2_FINETUNE_UPDATE_FREQ:-2}"
 readonly PRETRAIN_MAX_UPDATE=384230
@@ -335,7 +336,7 @@ if [[ "${DRY_RUN}" == false ]]; then
         printf 'optimizer=adamw8bit\n'
         printf 'weight_decay_schedule=cosine\n'
         printf 'torch_compile=true\n'
-        printf 'pretrain_torch_compile_scope=transformer_blocks\n'
+        printf 'pretrain_torch_compile_scope=transformer_stacks\n'
         printf 'finetune_torch_compile_scope=model\n'
         printf 'checkpoint_activations=%s\n' "${CHECKPOINT_ACTIVATIONS}"
         printf 'pretrain_max_tokens=%s\n' "${PRETRAIN_MAX_TOKENS}"
@@ -402,7 +403,9 @@ PRETRAIN_COMMAND=(
     --override "model.classification_head=frame"
     --device cuda
 )
-PRETRAIN_BURN_IN_COMMAND=("${PRETRAIN_COMMAND[@]}" --stop-at-update 1)
+# Two completed updates are required: update 2 exercises the first forward
+# after AdamW8bit has allocated its persistent optimizer state.
+PRETRAIN_BURN_IN_COMMAND=("${PRETRAIN_COMMAND[@]}" --stop-at-update 2)
 PRETRAIN_RESUME_COMMAND=("${PRETRAIN_COMMAND[@]}" --resume "${PRETRAIN_CHECKPOINT}")
 CHECKPOINT_PREFLIGHT_COMMAND=(
     "${PREFLIGHT_COMMAND[@]}"

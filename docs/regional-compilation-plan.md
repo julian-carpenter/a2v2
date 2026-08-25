@@ -4,7 +4,7 @@
 
 **Goal:** Prevent modern pretraining OOMs caused by mask-length-dependent whole-model recompilation while retaining compiled Transformer acceleration.
 
-**Architecture:** Keep `Animal2VecPretrainingModel.forward` eager and compile its student and teacher `TransformerBlock` instances in place with dynamic shapes. Preserve complete-model compilation for fine-tuning and other modules, and report the selected scope in run provenance.
+**Architecture:** Keep `Animal2VecPretrainingModel.forward` eager and compile its four student and teacher `TransformerStack` instances in place with token axes marked as dynamic. Preserve complete-model compilation for fine-tuning and other modules, and report the selected scope in run provenance.
 
 **Tech Stack:** Python 3.12, PyTorch `torch.compile`, TorchDynamo/Inductor, CUDA Flash SDPA, pytest, Bash.
 
@@ -37,7 +37,7 @@ Construct the tiny pretraining model, monkeypatch `nn.Module.compile`, call
 `_compile_model_in_place`, and assert that only every block in
 `student.prenet`, `student.transformer`, `teacher.model.prenet`, and
 `teacher.model.transformer` receives the configured options. Assert the report
-is `scope="transformer_blocks"` with the matching region count.
+is `scope="transformer_stacks"` with four regions.
 
 - [ ] **Step 2: Write the failing static-policy test**
 
@@ -53,8 +53,8 @@ pretraining model is currently the sole compile receiver.
 
 - [ ] **Step 4: Implement the minimal regional dispatcher**
 
-Add the immutable report, enumerate student and teacher block regions, require
-dynamic shapes for pretraining, compile each block in place, and retain the
+Add the immutable report, enumerate student and teacher stack regions, require
+dynamic shapes for pretraining, compile each stack in place, and retain the
 existing generic one-region policy. Remove the now-redundant decorators from
 `compute_mask_indices` and `make_mask_info`.
 
@@ -78,7 +78,7 @@ unchanged.
 - [ ] **Step 1: Update the integration expectation first**
 
 Set the compiled CPU pretraining override to dynamic shapes and expect scope
-`transformer_blocks` plus the exact number of compiled student/teacher blocks.
+`transformer_stacks` plus the four compiled student/teacher stacks.
 Add a run covering at least twelve deterministic update numbers whose retained
 token lengths vary.
 
@@ -120,7 +120,7 @@ prefixes.
 
 Assert the modern YAML sets `torch_compile_dynamic: true`, the launch command
 contains `--override common.torch_compile_dynamic=true`, and the run profile
-records the pretraining `transformer_blocks` and fine-tuning `model` scopes.
+records the pretraining `transformer_stacks` and fine-tuning `model` scopes.
 
 - [ ] **Step 2: Run the launcher tests and verify RED**
 
@@ -132,7 +132,7 @@ Expected: the dynamic override and scope record assertions fail.
 
 Change the pretraining recipe to dynamic shapes, add the explicit launcher
 override/profile field, and document why masking stays eager while Transformer
-blocks compile. Explain that a later NCCL timeout can be secondary to one-rank
+stacks compile. Explain that a later NCCL timeout can be secondary to one-rank
 compiler OOM.
 
 - [ ] **Step 4: Run launcher and configuration tests**
@@ -166,12 +166,15 @@ Expected: updates finish without graph-limit warnings and strict Flash remains a
 
 - [ ] **Step 3: Run the bounded eight-GPU resume probe**
 
-Copy the update-1 checkpoint to a temporary output, use a clean Inductor cache,
-resume the exact `612000 x 2` command through at least update 10, and enable
-`TORCH_LOGS=recompiles`.
+Use a clean Inductor cache for a production-shaped `408000 x 3` fresh run
+through update 2, resume that checkpoint through update 10, and enable
+`TORCH_LOGS=recompiles`. Also test `612000 x 2` with and without compilation to
+distinguish compiler growth from post-optimizer batch fit.
 
-Expected: no `ids_keep` recompilations, no compiler OOM, no NCCL timeout, and
-peak reserved memory remains below device capacity on every rank.
+Expected: no exact-length recompilations, no compiler OOM, no NCCL timeout, and
+peak reserved memory remains below device capacity on every rank. The larger
+partition is rejected if its second forward cannot fit after optimizer state
+creation.
 
 - [ ] **Step 4: Verify legacy integrity and the full non-GPU suite**
 

@@ -29,20 +29,22 @@ failure or an effective-batch-size problem.
 
 ## Architecture
 
-`_compile_model_in_place` will select its compilation scope from the concrete
+`_compile_model_in_place` selects its compilation scope from the concrete
 model type. Fine-tuning and unrelated modules retain the existing one-region,
 complete-model policy. `Animal2VecPretrainingModel` instead keeps its outer
-forward eager and compiles every student and EMA-teacher `TransformerBlock` in
-place. The block boundary contains the expensive attention and feed-forward
-math while excluding waveform mixup, deterministic NumPy mask generation,
-`MaskInfo`, masked-token gathering/restoration, teacher target selection, and
-masked prediction indexing.
+forward eager and compiles four modules in place: the student prenet and main
+`TransformerStack`, plus the matching EMA-teacher stacks. These boundaries
+contain the expensive attention and feed-forward math while excluding waveform
+mixup, deterministic NumPy mask generation, `MaskInfo`, masked-token
+gathering/restoration, teacher target selection, and masked prediction indexing.
 
-Regional pretraining requires `torch_compile_dynamic: true`. At a block entry,
-the retained sequence length is then an input dimension rather than a Python
-scalar captured above a graph break. Static or unspecified dynamic-shape policy
-is rejected with an actionable error instead of starting a run that may later
-accumulate specialized graphs.
+Regional pretraining requires `torch_compile_dynamic: true`. Before each stack,
+`AudioEncoder` marks the token axes of the value,
+padding mask, positional IDs, and optional ALiBi bias dynamic. Static or
+unspecified dynamic-shape policy is rejected with an actionable error instead
+of starting a run that may later accumulate specialized graphs. RoPE shape
+validation and strict-Flash diagnostics use symbolic-safe assertions so they do
+not constrain those dimensions back to exact Python integers.
 
 The policy returns an immutable report containing `scope` and `regions`. The
 training summary records these fields beside the configured backend, mode,
@@ -60,14 +62,20 @@ eager functions and retain their existing unit coverage.
 
 The modern pretraining YAML and `animal2vec2_benchmark.sh` will explicitly set
 `common.torch_compile_dynamic=true`. The benchmark profile will record
-`pretrain_torch_compile_scope=transformer_blocks` and
+`pretrain_torch_compile_scope=transformer_stacks` and
 `finetune_torch_compile_scope=model`. Fine-tuning keeps complete-model dynamic
 compilation. The legacy reproduction launcher and legacy configs are not changed.
+
+The eight-A100 launcher defaults to `max_tokens=408000` and `update_freq=3`.
+The `612000 × 2` partition has the same effective batch, but it fits the first
+update and OOMs on the next forward once AdamW8bit state is resident, even in
+eager mode. The burn-in therefore completes two successful updates before the
+full resume.
 
 ## Verification
 
 1. A unit test captures `Module.compile` calls and proves that a pretraining
-   model compiles only student and teacher Transformer blocks with exact options.
+   model compiles only the four student and teacher Transformer stacks.
 2. A unit test proves compiled pretraining rejects non-dynamic policy before
    touching any module.
 3. Existing generic compile-policy tests continue to prove complete-model
@@ -76,6 +84,6 @@ compilation. The legacy reproduction launcher and legacy configs are not changed
 5. A multi-update modern pretraining regression uses changing retained-token
    lengths without compiling the outer forward.
 6. Focused CUDA tests exercise strict FlashAttention and DDP.
-7. An eight-A100 resume probe runs past the previous recompilation window with a
-   clean Inductor cache and records recompilation logs and peak memory.
+7. An eight-A100 production-shaped run reaches update 2 and resumes through
+   update 10 while recording recompilation logs and peak memory.
 8. The frozen reproduction launcher checksum is verified unchanged.

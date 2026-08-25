@@ -2338,7 +2338,7 @@ def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, obj
 class _CompilePolicyReport:
     """Describe the effective in-place compilation boundary for provenance."""
 
-    scope: Literal["disabled", "model", "transformer_blocks"]
+    scope: Literal["disabled", "model", "transformer_stacks"]
     regions: int
 
 
@@ -2362,12 +2362,14 @@ def _compile_model_in_place(
                 "static retained-token lengths accumulate specialized graphs"
             )
         regions: tuple[nn.Module, ...] = (
-            *model.student.prenet.blocks,
-            *model.student.transformer.blocks,
-            *model.teacher.model.prenet.blocks,
-            *model.teacher.model.transformer.blocks,
+            model.student.prenet,
+            model.student.transformer,
+            model.teacher.model.prenet,
+            model.teacher.model.transformer,
         )
-        scope: Literal["model", "transformer_blocks"] = "transformer_blocks"
+        model.student.regional_compile_dynamic = True
+        model.teacher.model.regional_compile_dynamic = True
+        scope: Literal["model", "transformer_stacks"] = "transformer_stacks"
     else:
         regions = (model,)
         scope = "model"

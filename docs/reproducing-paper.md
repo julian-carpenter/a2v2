@@ -156,9 +156,11 @@ Preflight requires exactly eight visible A100 devices, at least 39 GiB total
 and 38 GiB currently free on every device, and at least 64 GiB free on the
 output filesystem. The distributed probe exercises NCCL tensor collectives and
 Gloo transport for the serialized per-rank RNG checkpoint state. A fresh run's
-one-update burn-in uses the full paper model, data, token budget, accumulation,
-AMP, and eight-rank topology; `--stop-at-update 1` changes only the stopping
-point, not the configured scheduler horizon.
+two-update burn-in uses the full paper model, data, token budget, accumulation,
+AMP, and eight-rank topology; `--stop-at-update 2` changes only the stopping
+point, not the configured scheduler horizon. Reaching update 2 is important:
+it exercises a forward after AdamW8bit has allocated persistent optimizer
+state, which a one-update burn-in cannot validate.
 
 The script validates and resumes pretraining from `checkpoint_last.pt`. For
 fine-tuning it prefers `checkpoint_last.pt`; when that file is absent after an
@@ -187,7 +189,7 @@ provenance.
 
 `scripts/animal2vec2_benchmark.sh` is the performance-oriented companion to
 the frozen Animal2Vec 1.0 control. It follows the same preflight, eight-rank
-NCCL probe, one-update burn-in, checkpoint validation, full pretraining,
+NCCL probe, two-update burn-in, checkpoint validation, full pretraining,
 fine-tuning, and final-evaluation sequence. It does not modify or replace
 `scripts/reproduce_meerkat_paper.sh`.
 
@@ -216,38 +218,36 @@ choices again as command-line overrides:
   compilation; and
 - no activation checkpointing.
 
-Pretraining uses `612000 × 8 × 2 = 9,792,000` tokens per optimizer update for
+Pretraining uses `408000 × 8 × 3 = 9,792,000` tokens per optimizer update for
 384,230 updates. Fine-tuning uses `960000 × 8 × 2 = 15,360,000` tokens per
 optimizer update for 30,000 updates. These preserve the successful local
-reproduction's eight-GPU token-cap batch and training horizon, while using the
-faster measured pretraining partition. Do not change token, accumulation, or
-world-size settings when resuming a checkpoint.
+reproduction's eight-GPU effective batch and training horizon. Do not change
+token, accumulation, or world-size settings when resuming a checkpoint.
 
-The modern batch controls were profiled on 2026-08-25 with eight
-A100-SXM4-40GB GPUs, bitsandbytes 0.50.1, the production manifests, compiled
-FlashAttention, no activation checkpointing, and an already settled AMP
-scale. Each pretraining timing covers two successful resumed updates and the
-same terminal-checkpoint path:
+The final memory acceptance run used eight A100-SXM4-40GB GPUs,
+bitsandbytes 0.50.0, the production manifests, strict FlashAttention, no
+activation checkpointing, and a clean dynamic stack-compilation policy. A
+fresh run reached update 2, then a checkpoint resume reached update 10 across
+changing retained-token lengths. There were no graph breaks, exact-length
+recompiles, OOMs, or secondary NCCL timeouts. The worst reported peak was
+34.20 GiB allocated and 34.81 GiB reserved on a 39.49 GiB device.
 
-| Pretraining profile | Realized recordings/rank/update | Two-update wall time | Global recordings/s | Worst reserved peak | AMP scale |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| fallback `408000 × 3` | 15 | 620.95 s | 0.3865 | 27.84 GiB | 0.5 |
-| default `612000 × 2` | 14 | 441.49 s | 0.5074 | 36.26 GiB | 0.25 |
+`612000 × 2` is not safe on this host. Its first optimizer update can fit, but
+the next forward fails after AdamW8bit state is resident; the same failure was
+reproduced with compilation disabled, so allocator settings and compiler graph
+caches are not the root cause. The former one-update burn-in therefore gave a
+false positive. The launcher now uses `408000 × 3` and burns in through update
+2. Both partitions have the same nominal effective token budget, but only the
+new default retains adequate post-optimizer headroom.
 
-The default profile delivered about 31.3% more recordings per second. The run
-processed 14 instead of 15 recordings per rank and update, settled at AMP
-scale 0.25 instead of 0.5, and reserved up to 36.26 GiB. We chose this profile
-for its measured throughput on the compatible eight-A100-40GB host. Those
-short measurements used the former whole-pretraining-model compile boundary:
-they establish batch fit and relative throughput, but not long-run compiler
-cache safety. Variable `ids_keep` lengths later caused whole-model Inductor
-recompilation and eventually exhausted one rank; the following NCCL timeout was
-secondary. The current policy leaves masking eager and dynamically compiles
-only student and teacher Transformer blocks, preventing mask lengths from
-specializing the outer forward. A fresh lower-memory run can restore the
-previous partition with
-`A2V2_PRETRAIN_MAX_TOKENS=408000` and `A2V2_PRETRAIN_UPDATE_FREQ=3`; never
-change either value while resuming an existing checkpoint.
+Variable `ids_keep` lengths did expose a separate compiler issue: compiling the
+whole pretraining model specialized its continuation and accumulated large
+graphs. The current policy leaves masking eager, compiles the four student and
+teacher Transformer stacks, and marks their token axes as dynamic.
+Expected finite variants cover student/teacher grad mode, prenet/main depth,
+and aligned/unaligned Inductor kernels; they do not specialize exact token
+lengths. Never override the default batch upward without a two-update burn-in,
+and never change either batch value while resuming an existing checkpoint.
 
 Fine-tuning was tested separately with its backbone unfrozen from update zero.
 The default `960000 × 2` completed one full update with a worst reserved peak

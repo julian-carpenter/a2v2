@@ -28,6 +28,7 @@ from a2v2.training import (
 )
 from a2v2.training import TrainingEngine
 from a2v2.training import CosineUpdateScheduler, build_gradient_clipper, build_optimizer
+from a2v2.workflows import _compile_model_in_place
 
 
 ROOT = Path(__file__).parents[2]
@@ -623,6 +624,7 @@ def test_compile_cuda_complete_pretraining_and_finetuning_updates(
             "model.post_mlp_drop=0.0",
             "model.dropout_input=0.0",
             "model.modalities.audio.prenet_dropout=0.0",
+            "optimization.max_update=12",
         ),
     )
     finetune = load_config(
@@ -679,29 +681,48 @@ def test_compile_cuda_complete_pretraining_and_finetuning_updates(
     pretraining_model = Animal2VecPretrainingModel.from_config(pretrain).to(cuda_device).train()
     pretraining_keys = tuple(pretraining_model.state_dict())
     pretraining_parameters = tuple(id(parameter) for parameter in pretraining_model.parameters())
-    pretraining_model.compile(
-        backend="inductor",
-        mode="default",
-        fullgraph=False,
-        dynamic=True,
+    compile_report = _compile_model_in_place(
+        pretraining_model,
+        replace(
+            pretrain.common,
+            torch_compile=True,
+            torch_compile_backend="inductor",
+            torch_compile_mode="default",
+            torch_compile_fullgraph=False,
+            torch_compile_dynamic=True,
+        ),
     )
+    assert compile_report.scope == "transformer_stacks"
+    assert compile_report.regions == 4
     assert tuple(pretraining_model.state_dict()) == pretraining_keys
     assert tuple(id(parameter) for parameter in pretraining_model.parameters()) == pretraining_parameters
     pretraining_engine = make_engine(pretraining_model, pretrain)
     torch.cuda.reset_peak_memory_stats(cuda_device)
     torch.cuda.synchronize(cuda_device)
     started = time.perf_counter()
-    pretraining_result = pretraining_engine.step(
-        [{
-            "source": torch.randn(2, 64, device=cuda_device),
-            "id": torch.tensor([41, 42]),
-        }],
-        lambda batch: pretraining_model(
+    retained_lengths: list[int] = []
+
+    def pretraining_forward(batch: dict[str, torch.Tensor]) -> object:
+        """Record dynamic retained lengths outside compiled block regions."""
+
+        output = pretraining_model(
             batch["source"],
             sample_ids=batch["id"],
             update=pretraining_engine.update,
-        ),
-    )
+        )
+        retained_lengths.append(
+            output.mask.shape[1] - int(output.mask[0].sum().item())
+        )
+        return output
+
+    for _ in range(12):
+        pretraining_result = pretraining_engine.step(
+            [{
+                "source": torch.randn(2, 64, device=cuda_device),
+                "id": torch.tensor([41, 42]),
+            }],
+            pretraining_forward,
+        )
     torch.cuda.synchronize(cuda_device)
     diagnostics["pretraining"] = {
         "shape": [2, 64],
@@ -709,11 +730,13 @@ def test_compile_cuda_complete_pretraining_and_finetuning_updates(
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(cuda_device),
         "peak_reserved_bytes": torch.cuda.max_memory_reserved(cuda_device),
         "loss": pretraining_result.loss,
+        "retained_lengths": retained_lengths,
         "graph_breaks": sum(torch._dynamo.utils.counters["graph_break"].values()),
         "graph_break_reasons": dict(torch._dynamo.utils.counters["graph_break"]),
         "unique_graphs": torch._dynamo.utils.counters["stats"]["unique_graphs"],
     }
     assert torch.isfinite(torch.tensor(pretraining_result.loss))
+    assert len(set(retained_lengths)) > 1
 
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()

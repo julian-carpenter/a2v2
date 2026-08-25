@@ -519,9 +519,9 @@ eight-layer prenet, RoPE, strict Flash attention, a CLS token, packed GEGLU,
 and DeepScaleLM. They also select activation checkpointing, AdaGC, AdamW8bit,
 cosine weight-decay annealing, dynamic `torch.compile`, stateless crop
 coordinates, and strict resume provenance. Pretraining keeps update-dependent
-masking eager and compiles the student and teacher Transformer blocks;
-fine-tuning compiles the complete model. This avoids retaining a separate large
-graph for each masked-token length.
+masking eager and compiles the four student and teacher Transformer stacks;
+fine-tuning compiles the complete model. The stack inputs mark the
+retained-token axis as dynamic, avoiding one large graph per masked-token length.
 
 For the full-label MeerKAT benchmark on the verified eight-A100 host, run the
 complete pretrain, fine-tune, and sequence-evaluation workflow with:
@@ -533,14 +533,15 @@ bash scripts/animal2vec2_benchmark.sh \
 ```
 
 Use `--dry-run` first to inspect every resolved command. The benchmark keeps
-the reproduction driver's eight-rank token-cap batches and update horizons,
-using the measured `612000 × 2` pretraining partition. It uses only the 100%
-label split and overrides activation checkpointing off. It requires
-bitsandbytes 0.50 with a loaded CUDA backend and defaults to the wheel's
+the reproduction driver's eight-rank effective token batches and update
+horizons, using the hardware-verified `408000 × 3` pretraining partition. It
+uses the 100% label split and overrides activation checkpointing off. It
+requires bitsandbytes 0.50 with a loaded CUDA backend and defaults to the wheel's
 automatic CUDA-binary selection. It also keeps one persistent TorchInductor
-cache below the output directory so the burn-in and resumed job can reuse
-compiled artifacts. Set `A2V2_BNB_CUDA_VERSION` when you need another
-compatible packaged binary. See the
+cache below the output directory so resumed jobs can reuse compiled artifacts.
+The burn-in completes two updates so it exercises a forward after AdamW8bit
+has materialized optimizer state. Set `A2V2_BNB_CUDA_VERSION` when you need
+another compatible packaged binary. See the
 [reproduction guide](docs/reproducing-paper.md#modern-eight-a100-benchmark)
 for checkpoint, evaluation, and environment controls.
 

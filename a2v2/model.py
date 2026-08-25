@@ -500,10 +500,23 @@ def apply_rotary_position_embedding(
     head_dimension = query.shape[-1]
     if head_dimension % 2:
         raise ValueError("RoPE attention head dimension must be even")
-    if query.shape != key.shape:
+    if query.ndim != key.ndim:
         raise ValueError("RoPE query and key tensors must have matching shapes")
-    if position_ids.shape != (query.shape[0], query.shape[-2]):
+    for query_size, key_size in zip(query.shape, key.shape, strict=True):
+        torch._assert(
+            query_size == key_size,
+            "RoPE query and key tensors must have matching shapes",
+        )
+    if position_ids.ndim != 2:
         raise ValueError("position_ids must have shape [batch, frames]")
+    torch._assert(
+        position_ids.shape[0] == query.shape[0],
+        "position_ids must have shape [batch, frames]",
+    )
+    torch._assert(
+        position_ids.shape[1] == query.shape[-2],
+        "position_ids must have shape [batch, frames]",
+    )
 
     # Mathematics: each adjacent coordinate pair is rotated by
     # p * theta^(-2i/d), with p taken from the original frame coordinate.
@@ -682,7 +695,7 @@ class MultiheadAttention(nn.Module):
                 details = (
                     "strict FlashAttention failed "
                     f"(backend=flash, dtype={query.dtype}, device={query.device}, "
-                    f"head_dimension={self.head_dim}, length={length}, "
+                    f"head_dimension={self.head_dim}, "
                     f"padding={padding_mask is not None})"
                 )
                 if query.device.type != "cuda":
@@ -2079,6 +2092,7 @@ class AudioEncoder(nn.Module):
         ) if position_encoding is None else position_encoding
         self.use_alibi = self.position_encoding == "alibi"
         self.use_cls_token = use_cls_token
+        self.regional_compile_dynamic = False
         if use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, dimension))
         self.local_encoder = ConvFeatureEncoder(
@@ -2272,6 +2286,26 @@ class AudioEncoder(nn.Module):
         projected = self.project_features(self.project_norm(local.transpose(1, 2)))
         return projected, self.convert_padding_mask(projected, padding_mask)
 
+    def _mark_dynamic_stack_inputs(
+        self,
+        value: Tensor,
+        padding_mask: Tensor | None,
+        bias: Tensor | None,
+        position_ids: Tensor | None,
+    ) -> None:
+        """Mark sequence axes at the eager-to-compiled pretraining boundary."""
+
+        if not self.regional_compile_dynamic:
+            return
+        torch._dynamo.mark_dynamic(value, 1)
+        if padding_mask is not None:
+            torch._dynamo.mark_dynamic(padding_mask, 1)
+        if bias is not None:
+            torch._dynamo.mark_dynamic(bias, 2)
+            torch._dynamo.mark_dynamic(bias, 3)
+        if position_ids is not None:
+            torch._dynamo.mark_dynamic(position_ids, 1)
+
     def encode_projected(
         self,
         projected: Tensor,
@@ -2375,11 +2409,23 @@ class AudioEncoder(nn.Module):
         # Prenet(value; padding,bias); padding,bias), retaining every layer target.
         # Interpretation: both optional context blocks and the main stack remain
         # visible to teacher-target selection and fine-tuning.
+        self._mark_dynamic_stack_inputs(
+            value,
+            contextual_padding,
+            bias,
+            position_ids,
+        )
         value, prenet_layers = self.prenet(
             value,
             contextual_padding,
             bias,
             position_ids=position_ids,
+        )
+        self._mark_dynamic_stack_inputs(
+            value,
+            contextual_padding,
+            bias,
+            position_ids,
         )
         value, layer_outputs = self.transformer(
             value,

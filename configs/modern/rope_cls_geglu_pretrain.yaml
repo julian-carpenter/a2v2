@@ -3,8 +3,8 @@
 # no-CLS encoder weights because GEGLU and CLS add new parameter shapes.
 # Replace task.data before launch. Install a2v2[bnb] for AdamW8bit.
 
-# Keep mask orchestration eager and compile each Transformer block in place
-# before DDP. Dynamic shapes cover the update-dependent retained-token length.
+# Keep mask orchestration eager and compile the four Transformer stacks in
+# place before DDP. The encoder marks their retained-token axes as dynamic.
 common:
   fp16: true
   log_interval: 384

@@ -98,13 +98,14 @@ def test_dry_run_resolves_the_approved_modern_full_label_workflow(
     )
 
     training_text = "\n".join(training)
-    assert training_text.count("dataset.max_tokens=612000") == 2
-    assert training_text.count("optimization.update_freq=[2]") == 3
+    assert training_text.count("dataset.max_tokens=408000") == 2
+    assert training_text.count("optimization.update_freq=[3]") == 2
+    assert training_text.count("optimization.update_freq=[2]") == 1
     assert "dataset.max_tokens=960000" in training_text
     assert "optimization.update_freq=[2]" in training_text
     assert "pretrain_max_update=384230" in semantic
     assert "finetune_max_update=30000" in semantic
-    assert "--stop-at-update 1" in semantic
+    assert "--stop-at-update 2" in semantic
     assert f"--resume {output / 'pretrain/checkpoint_last.pt'}" in semantic
     assert f"--pretrained-checkpoint {output / 'pretrain/checkpoint_last.pt'}" in semantic
     assert "--require-bitsandbytes" in semantic
@@ -169,7 +170,7 @@ def test_dry_run_validates_and_resumes_existing_native_checkpoints(
 
     assert completed.returncode == 0, completed.stderr
     semantic = completed.stdout.replace("\\", "")
-    assert "--stop-at-update 1" not in semantic
+    assert "--stop-at-update 2" not in semantic
     assert f"--checkpoint {pretrain} --expected-stage pretrain" in semantic
     assert f"--resume {pretrain}" in semantic
     assert f"--checkpoint {finetune} --expected-stage finetune" in semantic
@@ -266,7 +267,7 @@ else:
     assert "variant=animal2vec2-modern\n" in profile
     assert "label_fraction=100\n" in profile
     assert "checkpoint_activations=false\n" in profile
-    assert "pretrain_torch_compile_scope=transformer_blocks\n" in profile
+    assert "pretrain_torch_compile_scope=transformer_stacks\n" in profile
     assert "finetune_torch_compile_scope=model\n" in profile
     assert "pretrain_max_update=384230\n" in profile
     assert "finetune_max_update=30000\n" in profile
