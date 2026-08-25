@@ -530,13 +530,14 @@ bash scripts/animal2vec2_benchmark.sh \
 ```
 
 Use `--dry-run` first to inspect every resolved command. The benchmark keeps
-the reproduction driver's eight-rank token batches and update horizons, uses
-only the 100% label split, and overrides activation checkpointing off. It
-requires bitsandbytes 0.50 with a loaded CUDA backend and defaults to the
-wheel's automatic CUDA-binary selection. It also keeps one persistent
-TorchInductor cache below the output directory so the burn-in and resumed job
-can reuse compiled artifacts. Set `A2V2_BNB_CUDA_VERSION` to a numeric suffix
-only when deliberately selecting another compatible packaged binary. See the
+the reproduction driver's eight-rank token-cap batches and update horizons,
+using the measured `612000 × 2` pretraining partition. It uses only the 100%
+label split and overrides activation checkpointing off. It requires
+bitsandbytes 0.50 with a loaded CUDA backend and defaults to the wheel's
+automatic CUDA-binary selection. It also keeps one persistent TorchInductor
+cache below the output directory so the burn-in and resumed job can reuse
+compiled artifacts. Set `A2V2_BNB_CUDA_VERSION` when you need another
+compatible packaged binary. See the
 [reproduction guide](docs/reproducing-paper.md#modern-eight-a100-benchmark)
 for checkpoint, evaluation, and environment controls.
 

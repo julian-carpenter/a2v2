@@ -184,8 +184,9 @@ SEQUENCE_EVAL_ENTRY="${A2V2_SEQUENCE_EVAL_ENTRY:-a2v2-evaluate-sequence}"
 
 # These values preserve the successful eight-GPU reproduction's effective
 # token batches: 9,792,000 for pretraining and 15,360,000 for fine-tuning.
-readonly PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-408000}"
-readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-3}"
+# The modern pretraining partition uses the measured faster 612000 x 2 profile.
+readonly PRETRAIN_MAX_TOKENS="${A2V2_PRETRAIN_MAX_TOKENS:-612000}"
+readonly PRETRAIN_UPDATE_FREQ="${A2V2_PRETRAIN_UPDATE_FREQ:-2}"
 readonly FINETUNE_MAX_TOKENS="${A2V2_FINETUNE_MAX_TOKENS:-960000}"
 readonly FINETUNE_UPDATE_FREQ="${A2V2_FINETUNE_UPDATE_FREQ:-2}"
 readonly PRETRAIN_MAX_UPDATE=384230

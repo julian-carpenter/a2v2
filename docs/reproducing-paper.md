@@ -215,11 +215,12 @@ choices again as command-line overrides:
 - partial-graph `torch.compile`; and
 - no activation checkpointing.
 
-Pretraining uses `408000 × 8 × 3 = 9,792,000` tokens per optimizer update for
+Pretraining uses `612000 × 8 × 2 = 9,792,000` tokens per optimizer update for
 384,230 updates. Fine-tuning uses `960000 × 8 × 2 = 15,360,000` tokens per
-optimizer update for 30,000 updates. These are the same eight-GPU batch and
-training-horizon controls used for the successful local reproduction. Do not
-change token, accumulation, or world-size settings when resuming a checkpoint.
+optimizer update for 30,000 updates. These preserve the successful local
+reproduction's eight-GPU token-cap batch and training horizon, while using the
+faster measured pretraining partition. Do not change token, accumulation, or
+world-size settings when resuming a checkpoint.
 
 The modern batch controls were profiled again on 2026-08-25 with eight
 A100-SXM4-40GB GPUs, bitsandbytes 0.50.1, the production manifests, compiled
@@ -229,17 +230,16 @@ same terminal-checkpoint path:
 
 | Pretraining profile | Realized recordings/rank/update | Two-update wall time | Global recordings/s | Worst reserved peak | AMP scale |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| default `408000 × 3` | 15 | 620.95 s | 0.3865 | 27.84 GiB | 0.5 |
-| experimental `612000 × 2` | 14 | 441.49 s | 0.5074 | 36.26 GiB | 0.25 |
+| fallback `408000 × 3` | 15 | 620.95 s | 0.3865 | 27.84 GiB | 0.5 |
+| default `612000 × 2` | 14 | 441.49 s | 0.5074 | 36.26 GiB | 0.25 |
 
-The experimental profile delivered about 31.3% more recordings per second,
-but it changed the realized batch exposure, reduced the settled loss scale,
-and left only about 3.23 GiB below the device capacity in the worst observed
-run. It is therefore not the reproducible or reliability-oriented default. A
-fresh exploratory run can select it with
-`A2V2_PRETRAIN_MAX_TOKENS=612000` and
-`A2V2_PRETRAIN_UPDATE_FREQ=2`; never apply those overrides while resuming a
-checkpoint created with the default partition.
+The default profile delivered about 31.3% more recordings per second. The run
+processed 14 instead of 15 recordings per rank and update, settled at AMP
+scale 0.25 instead of 0.5, and reserved up to 36.26 GiB. We chose this profile
+for its measured throughput on the compatible eight-A100-40GB host. A fresh
+lower-memory run can restore the previous partition with
+`A2V2_PRETRAIN_MAX_TOKENS=408000` and `A2V2_PRETRAIN_UPDATE_FREQ=3`; never
+change either value while resuming an existing checkpoint.
 
 Fine-tuning was tested separately with its backbone unfrozen from update zero.
 The default `960000 × 2` completed one full update with a worst reserved peak

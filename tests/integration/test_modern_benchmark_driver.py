@@ -94,8 +94,8 @@ def test_dry_run_resolves_the_approved_modern_full_label_workflow(
     )
 
     training_text = "\n".join(training)
-    assert training_text.count("dataset.max_tokens=408000") == 2
-    assert training_text.count("optimization.update_freq=[3]") == 2
+    assert training_text.count("dataset.max_tokens=612000") == 2
+    assert training_text.count("optimization.update_freq=[2]") == 3
     assert "dataset.max_tokens=960000" in training_text
     assert "optimization.update_freq=[2]" in training_text
     assert "pretrain_max_update=384230" in semantic
