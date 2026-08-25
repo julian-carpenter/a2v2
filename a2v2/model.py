@@ -1531,8 +1531,22 @@ class TransformerBlock(nn.Module):
         if initialization == "deepscale_lm":
             if total_depth is None or total_depth < 2:
                 raise ValueError("DeepScaleLM total encoder depth must be at least two")
-            self.residual_lambda = math.sqrt(1.0 - 2.0 / total_depth)
-            self.residual_beta = math.sqrt(2.0 / total_depth)
+            self.register_buffer(
+                "residual_lambda",
+                torch.tensor(
+                    math.sqrt(1.0 - 2.0 / total_depth),
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "residual_beta",
+                torch.tensor(
+                    math.sqrt(2.0 / total_depth),
+                    dtype=torch.float32,
+                ),
+                persistent=False,
+            )
         else:
             self.residual_lambda = 1.0
             self.residual_beta = 1.0

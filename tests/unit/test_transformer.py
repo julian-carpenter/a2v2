@@ -163,6 +163,27 @@ def test_deepscale_residual_coefficients_scale_both_branches(
     torch.testing.assert_close(output, expected_output)
 
 
+def test_deepscale_residual_coefficients_are_nonpersistent_tensor_buffers() -> None:
+    """Keep compiled-DDP scalar inputs device-aware without checkpoint keys."""
+
+    block = TransformerBlock(
+        8,
+        2,
+        initialization="deepscale_lm",
+        total_depth=8,
+    )
+    buffers = dict(block.named_buffers())
+
+    assert buffers["residual_lambda"].shape == torch.Size([])
+    assert buffers["residual_beta"].shape == torch.Size([])
+    assert buffers["residual_lambda"].dtype == torch.float32
+    assert buffers["residual_beta"].dtype == torch.float32
+    assert buffers["residual_lambda"].item() == pytest.approx(math.sqrt(0.75))
+    assert buffers["residual_beta"].item() == pytest.approx(math.sqrt(0.25))
+    assert "residual_lambda" not in block.state_dict()
+    assert "residual_beta" not in block.state_dict()
+
+
 def test_deepscale_rejects_total_encoder_depth_below_two() -> None:
     """Refuse undefined residual coefficients before constructing any block."""
 

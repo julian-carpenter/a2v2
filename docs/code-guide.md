@@ -294,6 +294,14 @@ audio frontend under its acoustic rules. Checkpoint loading overwrites
 initialization, while strict tensor keys and shapes enforce architecture
 compatibility.
 
+DeepScaleLM stores `lambda` and `beta` as scalar FP32 buffers with
+`persistent=False`. Tensor metadata therefore survives TorchDynamo's DDP graph
+partition boundaries, while neither constant adds a checkpoint key. The legacy
+initialization path retains its historical Python-float arithmetic and state
+schema. `tests/gpu/ddp_compile_deepscale.py` forces a small DDP bucket across
+the same boundary and executes a compiled forward, backward, and optimizer
+step on two CUDA ranks.
+
 ### Masking and decoder
 
 `compute_mask_indices` reproduces the Fairseq Data2Vec span sampler, including
@@ -562,6 +570,9 @@ The workflow moves the model to its device, calls `Module.compile` in place
 when enabled, and then builds the clipper, optimizer, and DDP wrapper. In-place
 compilation keeps parameter identities and state keys. Compile settings stay
 in execution provenance and do not enter the mathematical resume fingerprint.
+DeepScaleLM's non-persistent residual buffers let the default TorchDynamo DDP
+optimizer retain communication/compute overlap; the workflow does not disable
+DDP graph partitioning to work around scalar inputs.
 
 `torch_compile_fullgraph=false` permits graph breaks around deterministic
 NumPy mask creation, dynamic `nonzero` selection, stable sample-ID scalar
