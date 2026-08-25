@@ -2334,31 +2334,60 @@ def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, obj
     }
 
 
-def _compile_model_in_place(model: nn.Module, common: CommonConfig) -> None:
+@dataclass(frozen=True)
+class _CompilePolicyReport:
+    """Describe the effective in-place compilation boundary for provenance."""
+
+    scope: Literal["disabled", "model", "transformer_blocks"]
+    regions: int
+
+
+def _compile_model_in_place(
+    model: nn.Module,
+    common: CommonConfig,
+) -> _CompilePolicyReport:
     """Apply the configured execution policy without wrapping the module."""
 
     if not common.torch_compile:
-        return
+        return _CompilePolicyReport(scope="disabled", regions=0)
     if torch._dynamo.config.suppress_errors:
         raise RuntimeError(
             "torch.compile requires torch._dynamo.config.suppress_errors=False; "
             "suppress_errors=True permits a silent eager fallback"
         )
-    try:
-        model.compile(
-            backend=common.torch_compile_backend,
-            mode=common.torch_compile_mode,
-            fullgraph=common.torch_compile_fullgraph,
-            dynamic=common.torch_compile_dynamic,
+    if isinstance(model, Animal2VecPretrainingModel):
+        if common.torch_compile_dynamic is not True:
+            raise RuntimeError(
+                "compiled pretraining requires common.torch_compile_dynamic=true; "
+                "static retained-token lengths accumulate specialized graphs"
+            )
+        regions: tuple[nn.Module, ...] = (
+            *model.student.prenet.blocks,
+            *model.student.transformer.blocks,
+            *model.teacher.model.prenet.blocks,
+            *model.teacher.model.transformer.blocks,
         )
+        scope: Literal["model", "transformer_blocks"] = "transformer_blocks"
+    else:
+        regions = (model,)
+        scope = "model"
+    try:
+        for region in regions:
+            region.compile(
+                backend=common.torch_compile_backend,
+                mode=common.torch_compile_mode,
+                fullgraph=common.torch_compile_fullgraph,
+                dynamic=common.torch_compile_dynamic,
+            )
     except Exception as error:
         raise RuntimeError(
             "torch.compile setup failed "
-            f"(backend={common.torch_compile_backend}, "
+            f"(scope={scope}, backend={common.torch_compile_backend}, "
             f"mode={common.torch_compile_mode}, "
             f"fullgraph={common.torch_compile_fullgraph}, "
             f"dynamic={common.torch_compile_dynamic}): {error}"
         ) from error
+    return _CompilePolicyReport(scope=scope, regions=len(regions))
 
 
 def _restore_and_release_checkpoint(

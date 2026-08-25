@@ -13,6 +13,7 @@ from torch import nn
 import a2v2.training as training
 import a2v2.workflows as workflows
 from a2v2.config import CommonConfig, load_config
+from a2v2.model import Animal2VecPretrainingModel
 from a2v2.workflows import _restore_and_release_checkpoint
 from a2v2.training import TrainingEngine
 from a2v2.training import CosineUpdateScheduler
@@ -65,6 +66,77 @@ def test_compile_policy_forwards_exact_options_without_rewrapping_model(
     )]
     assert tuple(model.state_dict()) == state_keys
     assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
+
+
+def test_compile_policy_uses_dynamic_transformer_block_regions_for_pretraining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep mask-dependent orchestration eager while compiling expensive blocks."""
+
+    config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    model = Animal2VecPretrainingModel.from_config(config)
+    expected_regions = (
+        *model.student.prenet.blocks,
+        *model.student.transformer.blocks,
+        *model.teacher.model.prenet.blocks,
+        *model.teacher.model.transformer.blocks,
+    )
+    state_keys = tuple(model.state_dict())
+    parameter_ids = tuple(id(parameter) for parameter in model.parameters())
+    observed: list[tuple[nn.Module, dict[str, object]]] = []
+
+    def capture_compile(module: nn.Module, **options: object) -> None:
+        """Record each in-place regional compile receiver and its options."""
+
+        observed.append((module, options))
+
+    monkeypatch.setattr(nn.Module, "compile", capture_compile)
+    common = CommonConfig(
+        torch_compile=True,
+        torch_compile_backend="aot_eager",
+        torch_compile_mode="default",
+        torch_compile_fullgraph=False,
+        torch_compile_dynamic=True,
+    )
+
+    report = workflows._compile_model_in_place(model, common)
+
+    assert tuple(module for module, _ in observed) == expected_regions
+    assert all(options == {
+        "backend": "aot_eager",
+        "mode": "default",
+        "fullgraph": False,
+        "dynamic": True,
+    } for _, options in observed)
+    assert report.scope == "transformer_blocks"
+    assert report.regions == len(expected_regions)
+    assert tuple(model.state_dict()) == state_keys
+    assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
+
+
+def test_compile_policy_rejects_static_pretraining_before_compiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject an unsafe policy before it can accumulate mask-length graphs."""
+
+    config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
+    model = Animal2VecPretrainingModel.from_config(config)
+
+    def reject_compile(*_: object, **__: object) -> None:
+        """Prove validation occurs before any module receives compilation."""
+
+        raise AssertionError("Module.compile called before dynamic-shape validation")
+
+    monkeypatch.setattr(nn.Module, "compile", reject_compile)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"compiled pretraining requires.*torch_compile_dynamic=true",
+    ):
+        workflows._compile_model_in_place(
+            model,
+            CommonConfig(torch_compile=True, torch_compile_dynamic=False),
+        )
 
 
 def test_disabled_compile_policy_does_not_touch_module(
