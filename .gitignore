@@ -31,3 +31,6 @@ wandb/
 .idea/
 .vscode/
 .DS_Store
+.superpowers
+docs/superpowers
+docs/verification
