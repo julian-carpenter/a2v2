@@ -862,7 +862,7 @@ class FairseqCompatibleAdam(torch.optim.Optimizer):
         return loss
 
 
-_BITSANDBYTES_VERSION_RANGE = "bitsandbytes>=0.49,<0.50"
+_BITSANDBYTES_VERSION_RANGE = "bitsandbytes>=0.50,<0.51"
 
 
 def _bitsandbytes_optimizer_class(
@@ -873,7 +873,7 @@ def _bitsandbytes_optimizer_class(
 
     version = str(getattr(bitsandbytes, "__version__", "unknown"))
     supported = re.fullmatch(
-        r"0\.49(?:\.\d+)?(?:\.post\d+)?(?:\+[A-Za-z0-9.-]+)?",
+        r"0\.50(?:\.\d+)?(?:\.post\d+)?(?:\+[A-Za-z0-9.-]+)?",
         version,
     )
     if supported is None:

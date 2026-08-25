@@ -317,6 +317,9 @@ def test_modern_features_and_slurm_contract_are_documented() -> None:
         encoding="utf-8",
     )
     slurm = (ROOT / "docs/slurm.md").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "scripts/Dockerfile").read_text(encoding="utf-8")
+
+    assert "bitsandbytes==0.50.1" in dockerfile
 
     for required in (
         "configs/modern/rope_cls_geglu_pretrain.yaml",
@@ -341,7 +344,8 @@ def test_modern_features_and_slurm_contract_are_documented() -> None:
         "weight_decay_schedule",
         "torch_compile_fullgraph",
         "checkpoint_activations",
-        "BNB_CUDA_VERSION=130",
+        "bitsandbytes>=0.50,<0.51",
+        "CUDA 13.2",
     ):
         assert required in configs
 

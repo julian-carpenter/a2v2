@@ -434,13 +434,13 @@ update zero.
 `build_optimizer` adds PyTorch AdamW plus bitsandbytes Adam8bit and AdamW8bit.
 The two 8-bit paths import bitsandbytes after device and
 `min_8bit_size` validation. They require CUDA and the
-`bitsandbytes>=0.49,<0.50` extra. The builder reports missing APIs, version
+`bitsandbytes>=0.50,<0.51` extra. The builder reports missing APIs, version
 mismatch, unloaded CUDA libraries, and constructor failures as setup errors.
 All optimizers use the same ordered decay and no-decay parameter groups.
 
-The 0.49.2 wheel lacks a CUDA 13.3 binary. Bounded CUDA tests on the recorded
-13.3 host used `BNB_CUDA_VERSION=130` to load the packaged CUDA 13.0 binary.
-A source build covers CUDA 13.3 without that wheel override.
+On the recorded CUDA 13.3 host, the 0.50.1 wheel automatically loads its
+compatible packaged CUDA 13.2 binary. Bounded CUDA tests exercise this default
+path with `BNB_CUDA_VERSION` unset, including optimizer checkpoint/resume.
 
 #### Cosine weight-decay clock
 

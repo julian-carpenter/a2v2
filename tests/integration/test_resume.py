@@ -646,11 +646,11 @@ def test_optimizer_run_metadata_records_only_selected_bitsandbytes_version() -> 
     model = nn.Linear(2, 1)
     native = torch.optim.Adam(model.parameters(), lr=1e-3)
     fake_bnb = torch.optim.Adam(model.parameters(), lr=1e-3)
-    fake_bnb._a2v2_bitsandbytes_version = "0.49.1"
+    fake_bnb._a2v2_bitsandbytes_version = "0.50.0"
 
     assert workflows._optimizer_run_metadata(native) == {}
     assert workflows._optimizer_run_metadata(fake_bnb) == {
-        "bitsandbytes_version": "0.49.1"
+        "bitsandbytes_version": "0.50.0"
     }
 
 

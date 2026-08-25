@@ -221,12 +221,12 @@ optimizer update for 30,000 updates. These are the same eight-GPU batch and
 training-horizon controls used for the successful local reproduction. Do not
 change token, accumulation, or world-size settings when resuming a checkpoint.
 
-The environment preflight additionally requires bitsandbytes `>=0.49,<0.50`
-and confirms that its native CUDA library loaded. The host default is
-`A2V2_BNB_CUDA_VERSION=130`. Remove or override that value only when the
-installed wheel should select a different CUDA binary. Set
-`A2V2_BNB_CUDA_VERSION=auto` to omit `BNB_CUDA_VERSION` and use the wheel's
-automatic selection. Every training rank uses the same persistent cache at
+The environment preflight additionally requires bitsandbytes `>=0.50,<0.51`
+and confirms that its native CUDA library loaded. The default
+`A2V2_BNB_CUDA_VERSION=auto` omits `BNB_CUDA_VERSION`, allowing version 0.50.1
+to select its compatible packaged CUDA binary. Set a numeric suffix only when
+deliberately selecting another compatible binary. Every training rank uses
+the same persistent cache at
 `OUTPUT_DIR/environment/torchinductor-cache`; set
 `A2V2_TORCHINDUCTOR_CACHE_DIR` to move it to another fast local filesystem.
 
@@ -251,7 +251,7 @@ the local control, plus:
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `A2V2_BNB_CUDA_VERSION` | `130` | bitsandbytes CUDA binary suffix; use `auto` to omit the override |
+| `A2V2_BNB_CUDA_VERSION` | `auto` | Automatic bitsandbytes CUDA-binary selection; set a numeric suffix for an explicit compatible override |
 | `A2V2_TORCHINDUCTOR_CACHE_DIR` | `OUTPUT_DIR/environment/torchinductor-cache` | Persistent compile cache shared by benchmark stages |
 | `A2V2_SEQUENCE_EVAL_ENTRY` | `a2v2-evaluate-sequence` | Sequence-evaluator executable |
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -855,34 +854,30 @@ def test_amp_overflow_skips_update_and_reduces_scale(
         assert engine.gradient_clipper.state_dict()["update"] == 1
 
 
-def test_bitsandbytes_cuda_missing_native_binary_fails_during_setup(
+def test_bitsandbytes_cuda_native_binary_loads_during_setup(
     cuda_device: torch.device,
 ) -> None:
-    """Require CUDA 13.3 without an override to fail before optimizer use."""
+    """Require supported bitsandbytes with a loaded native CUDA backend."""
 
-    if torch.version.cuda != "13.3":
-        pytest.skip("this negative gate targets the observed CUDA 13.3 binary gap")
-    if os.environ.get("BNB_CUDA_VERSION"):
-        pytest.skip("a bitsandbytes CUDA override deliberately selects another binary")
-    pytest.importorskip(
+    bitsandbytes = pytest.importorskip(
         "bitsandbytes",
         reason="bitsandbytes extra is not installed; install a2v2[bnb] to run this CUDA gate",
     )
     model = torch.nn.Linear(128, 128, bias=False, device=cuda_device)
+    optimizer = build_optimizer(
+        model,
+        name="adamw8bit",
+        learning_rate=3e-4,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+        weight_decay=0.1,
+        min_8bit_size=1,
+        device=cuda_device,
+    )
 
-    with pytest.raises(training.OptimizerSetupError, match="CUDA native library") as raised:
-        build_optimizer(
-            model,
-            name="adam8bit",
-            learning_rate=3e-4,
-            betas=(0.9, 0.98),
-            eps=1e-8,
-            weight_decay=0.1,
-            min_8bit_size=1,
-            device=cuda_device,
-        )
-    assert "compatible bitsandbytes binary" in str(raised.value)
-    assert "BNB_CUDA_VERSION" in str(raised.value)
+    assert bitsandbytes.__version__.startswith("0.50")
+    assert bitsandbytes.cextension.lib.compiled_with_cuda
+    assert optimizer._a2v2_bitsandbytes_version == bitsandbytes.__version__
 
 
 @pytest.mark.parametrize("optimizer_name", ("adam8bit", "adamw8bit"))
@@ -939,7 +934,7 @@ def test_bitsandbytes_optimizer_cuda_state_resume(
     optimizer.step()
     resumed_optimizer.step()
 
-    assert getattr(optimizer, "_a2v2_bitsandbytes_version") == bitsandbytes.__version__
+    assert optimizer._a2v2_bitsandbytes_version == bitsandbytes.__version__
     assert torch.equal(resumed_model.weight, model.weight)
     _assert_tree_equal(
         _clone_tree(resumed_optimizer.state_dict()),

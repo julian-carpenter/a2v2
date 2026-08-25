@@ -473,11 +473,11 @@ optional dependency with:
 python -m pip install -e '.[bnb]'
 ```
 
-The `bitsandbytes>=0.49,<0.50` wheel range lacks a CUDA 13.3 binary. The
-verified CUDA 13.3 host used the wheel's CUDA 13.0 binary with
-`BNB_CUDA_VERSION=130`. Use that override after confirming driver support for
-the packaged CUDA 13.0 binary, or build bitsandbytes from source. Other CUDA
-wheel targets need no override.
+The supported range is `bitsandbytes>=0.50,<0.51`. On the verified CUDA 13.3
+host, bitsandbytes 0.50.1 automatically loads its compatible packaged CUDA 13.2
+binary; no `BNB_CUDA_VERSION` override is needed. An explicit override remains
+available for advanced setups that deliberately select another compatible
+packaged binary.
 
 Confirm that the four console commands exist:
 
@@ -532,18 +532,17 @@ bash scripts/animal2vec2_benchmark.sh \
 Use `--dry-run` first to inspect every resolved command. The benchmark keeps
 the reproduction driver's eight-rank token batches and update horizons, uses
 only the 100% label split, and overrides activation checkpointing off. It
-requires bitsandbytes 0.49 with a loaded CUDA backend and defaults
-`BNB_CUDA_VERSION` to `130` for this host. It also keeps one persistent
+requires bitsandbytes 0.50 with a loaded CUDA backend and defaults to the
+wheel's automatic CUDA-binary selection. It also keeps one persistent
 TorchInductor cache below the output directory so the burn-in and resumed job
-can reuse compiled artifacts. Set `A2V2_BNB_CUDA_VERSION=auto` when the wheel
-should select its CUDA binary without an override. See the
+can reuse compiled artifacts. Set `A2V2_BNB_CUDA_VERSION` to a numeric suffix
+only when deliberately selecting another compatible packaged binary. See the
 [reproduction guide](docs/reproducing-paper.md#modern-eight-a100-benchmark)
 for checkpoint, evaluation, and environment controls.
 
 Train the pretraining example after replacing its manifest path:
 
 ```bash
-BNB_CUDA_VERSION=130 \
 torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
   --config configs/modern/rope_cls_geglu_pretrain.yaml \
   --override task.data=/datasets/MeerKAT/manifests \
@@ -554,7 +553,6 @@ torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
 Pass the resulting native checkpoint to the paired fine-tuning recipe:
 
 ```bash
-BNB_CUDA_VERSION=130 \
 torchrun --standalone --nproc-per-node=4 "$(command -v a2v2-train)" \
   --config configs/modern/rope_cls_geglu_finetune.yaml \
   --pretrained-checkpoint /checkpoints/modern-pretrain/checkpoint_last.pt \
@@ -583,7 +581,7 @@ The evaluator restores the encoder architecture from the checkpoint's
 pretraining config, uses a strict model-state load, and prints sequence
 metrics as JSON. It does not restore training topology or optimizer state.
 
-Remove `BNB_CUDA_VERSION` on a CUDA target covered by the installed wheel.
+Let bitsandbytes 0.50 select its compatible packaged CUDA binary by default.
 Strict Flash raises an error when PyTorch cannot dispatch the Flash kernel;
 select `model.attention_backend=sdpa` for kernel fallback. Read the
 [configuration guide](configs/README.md) before changing architecture fields.

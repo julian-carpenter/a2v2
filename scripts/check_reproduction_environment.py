@@ -41,9 +41,9 @@ def check_bitsandbytes() -> dict[str, object]:
         ) from error
 
     version = str(getattr(bitsandbytes, "__version__", "unknown"))
-    if re.fullmatch(r"0\.49(?:\.\d+)?(?:[-+].*)?", version) is None:
+    if re.fullmatch(r"0\.50(?:\.\d+)?(?:[-+].*)?", version) is None:
         raise RuntimeError(
-            "modern benchmark requires bitsandbytes >=0.49,<0.50; "
+            "modern benchmark requires bitsandbytes >=0.50,<0.51; "
             f"found {version}"
         )
     compiled_with_cuda = bool(getattr(lib, "compiled_with_cuda", False))

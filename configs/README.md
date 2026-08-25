@@ -123,11 +123,11 @@ Install the optional optimizer extra with:
 python -m pip install -e '.[bnb]'
 ```
 
-The pinned range is `bitsandbytes>=0.49,<0.50`. Version 0.49.2 does not ship
-a CUDA 13.3 binary. The tested CUDA 13.3 host loaded the packaged CUDA 13.0
-binary with `BNB_CUDA_VERSION=130`. Use that override when the selected
-binary matches the host driver and toolkit contract. A source build provides
-the other CUDA 13.3 route. CUDA versions covered by the wheel need no override.
+The supported range is `bitsandbytes>=0.50,<0.51`. On the tested CUDA 13.3
+host, version 0.50.1 automatically loads its compatible packaged CUDA 13.2
+binary. Leave `BNB_CUDA_VERSION` unset for normal use. Set it to a numeric
+binary suffix only for an advanced setup whose driver and toolkit contract
+has been verified separately.
 
 ## Adding another A2V2 family
 

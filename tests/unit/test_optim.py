@@ -247,7 +247,7 @@ def test_bitsandbytes_optimizer_selection_forwards_groups_and_adam_hyperparamete
         """Stand in for bitsandbytes.optim.AdamW8bit."""
 
     fake_module = SimpleNamespace(
-        __version__="0.49.1",
+        __version__="0.50.0",
         cextension=SimpleNamespace(
             lib=SimpleNamespace(compiled_with_cuda=True),
         ),
@@ -282,10 +282,10 @@ def test_bitsandbytes_optimizer_selection_forwards_groups_and_adam_hyperparamete
         "min_8bit_size": 2048,
     }
     assert [group["weight_decay"] for group in optimizer.param_groups] == [0.12, 0.0]
-    assert optimizer._a2v2_bitsandbytes_version == "0.49.1"
+    assert optimizer._a2v2_bitsandbytes_version == "0.50.0"
 
 
-@pytest.mark.parametrize("version", ("0.48.9", "0.50.0"))
+@pytest.mark.parametrize("version", ("0.49.2", "0.51.0"))
 def test_bitsandbytes_optimizer_rejects_versions_outside_pinned_range(
     monkeypatch: pytest.MonkeyPatch,
     version: str,
@@ -309,7 +309,7 @@ def test_bitsandbytes_optimizer_rejects_versions_outside_pinned_range(
 
     with pytest.raises(
         training.OptimizerSetupError,
-        match=r"bitsandbytes>=0\.49,<0\.50",
+        match=r"bitsandbytes>=0\.50,<0\.51",
     ):
         build_optimizer(
             GroupFixture(),
@@ -337,7 +337,7 @@ def test_bitsandbytes_optimizer_rejects_missing_optimizer_api(
     """Catch leaking raw attribute errors for an incomplete optional package."""
 
     fake_module = SimpleNamespace(
-        __version__="0.49.2",
+        __version__="0.50.0",
         cextension=SimpleNamespace(
             lib=SimpleNamespace(compiled_with_cuda=True),
         ),
@@ -369,7 +369,7 @@ def test_bitsandbytes_optimizer_rejects_unloaded_cuda_native_library(
             self.param_groups = groups
 
     fake_module = SimpleNamespace(
-        __version__="0.49.2",
+        __version__="0.50.0",
         cextension=SimpleNamespace(
             lib=SimpleNamespace(compiled_with_cuda=False),
         ),
@@ -406,7 +406,7 @@ def test_bitsandbytes_optimizer_translates_constructor_backend_errors(
             raise TypeError("incompatible backend constructor")
 
     fake_module = SimpleNamespace(
-        __version__="0.49.2",
+        __version__="0.50.0",
         cextension=SimpleNamespace(
             lib=SimpleNamespace(compiled_with_cuda=True),
         ),
@@ -444,7 +444,7 @@ def test_bitsandbytes_optimizer_does_not_translate_terminal_exceptions(
             raise terminal
 
     fake_module = SimpleNamespace(
-        __version__="0.49.2",
+        __version__="0.50.0",
         cextension=SimpleNamespace(
             lib=SimpleNamespace(compiled_with_cuda=True),
         ),
@@ -471,7 +471,7 @@ def test_bitsandbytes_extra_uses_the_pinned_compatible_range() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert metadata["project"]["optional-dependencies"]["bnb"] == [
-        "bitsandbytes>=0.49,<0.50"
+        "bitsandbytes>=0.50,<0.51"
     ]
 
 

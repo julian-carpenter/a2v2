@@ -86,7 +86,7 @@ def test_dry_run_resolves_the_approved_modern_full_label_workflow(
     assert sum("rope_cls_geglu_finetune.yaml" in line for line in training) == 1
     assert all("--nproc-per-node=8" in line for line in training)
     assert all("OMP_NUM_THREADS=8" in line for line in training)
-    assert all("BNB_CUDA_VERSION=130" in line for line in training)
+    assert all("env -u BNB_CUDA_VERSION" in line for line in training)
     assert all("TORCHINDUCTOR_CACHE_DIR=" in line for line in training)
     assert all(
         "--override model.checkpoint_activations=false" in line
@@ -281,7 +281,7 @@ else:
     ]
     assert len(training_records) == 3
     assert all(
-        record["environment"]["BNB_CUDA_VERSION"] == "130"
+        record["environment"]["BNB_CUDA_VERSION"] is None
         for record in training_records
     )
     caches = {
@@ -506,11 +506,11 @@ def test_bitsandbytes_preflight_requires_the_pinned_cuda_backend(
 
     preflight = _load_preflight()
     package = ModuleType("bitsandbytes")
-    package.__version__ = "0.49.2"  # type: ignore[attr-defined]
+    package.__version__ = "0.50.0"  # type: ignore[attr-defined]
     extension = ModuleType("bitsandbytes.cextension")
     extension.lib = SimpleNamespace(
         compiled_with_cuda=True,
-        _name="libbitsandbytes_cuda130.so",
+        _name="libbitsandbytes_cuda132.so",
     )
     monkeypatch.setitem(sys.modules, "bitsandbytes", package)
     monkeypatch.setitem(sys.modules, "bitsandbytes.cextension", extension)
@@ -518,17 +518,17 @@ def test_bitsandbytes_preflight_requires_the_pinned_cuda_backend(
     report = preflight.check_bitsandbytes()
 
     assert report == {
-        "version": "0.49.2",
+        "version": "0.50.0",
         "compiled_with_cuda": True,
-        "native_library": "libbitsandbytes_cuda130.so",
+        "native_library": "libbitsandbytes_cuda132.so",
     }
 
 
 @pytest.mark.parametrize(
     ("version", "compiled", "message"),
     [
-        ("0.50.0", True, "requires bitsandbytes >=0.49,<0.50"),
-        ("0.49.2", False, "without CUDA support"),
+        ("0.49.2", True, "requires bitsandbytes >=0.50,<0.51"),
+        ("0.50.0", False, "without CUDA support"),
     ],
 )
 def test_bitsandbytes_preflight_rejects_an_unsupported_runtime(
