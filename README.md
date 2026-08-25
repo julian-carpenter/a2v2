@@ -260,7 +260,7 @@ experiment storage.
 - AdaGC with checkpointed per-parameter norm history.
 - AdamW plus optional bitsandbytes Adam8bit and AdamW8bit.
 - Cosine weight-decay annealing on the successful-update clock.
-- In-place `torch.compile` policy with recorded graph settings.
+- In-place `torch.compile` policy with recorded model or Transformer-block scope.
 - The existing non-reentrant activation-checkpointing option.
 - Separate SLURM launchers with torchrun topology and preemption contracts.
 
@@ -517,8 +517,11 @@ The paired modern examples live outside the frozen reproduction directories:
 Both files define the same 16-layer, 1,024-dimensional encoder with an
 eight-layer prenet, RoPE, strict Flash attention, a CLS token, packed GEGLU,
 and DeepScaleLM. They also select activation checkpointing, AdaGC, AdamW8bit,
-cosine weight-decay annealing, partial-graph `torch.compile`, stateless crop
-coordinates, and strict resume provenance.
+cosine weight-decay annealing, dynamic `torch.compile`, stateless crop
+coordinates, and strict resume provenance. Pretraining keeps update-dependent
+masking eager and compiles the student and teacher Transformer blocks;
+fine-tuning compiles the complete model. This avoids retaining a separate large
+graph for each masked-token length.
 
 For the full-label MeerKAT benchmark on the verified eight-A100 host, run the
 complete pretrain, fine-tune, and sequence-evaluation workflow with:

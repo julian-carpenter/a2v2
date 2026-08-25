@@ -566,21 +566,27 @@ This file composes all lower-level pieces and owns external side effects.
 
 ### Compile policy and Graph breaks
 
-The workflow moves the model to its device, calls `Module.compile` in place
-when enabled, and then builds the clipper, optimizer, and DDP wrapper. In-place
-compilation keeps parameter identities and state keys. Compile settings stay
-in execution provenance and do not enter the mathematical resume fingerprint.
-DeepScaleLM's non-persistent residual buffers let the default TorchDynamo DDP
-optimizer retain communication/compute overlap; the workflow does not disable
-DDP graph partitioning to work around scalar inputs.
+The workflow moves the model to its device, applies its in-place compile policy,
+and then builds the clipper, optimizer, and DDP wrapper. In-place compilation
+keeps parameter identities and state keys. Compile settings and the effective
+scope stay in execution provenance and do not enter the mathematical resume
+fingerprint. DeepScaleLM's non-persistent residual buffers let the default
+TorchDynamo DDP optimizer retain communication/compute overlap; the workflow
+does not disable DDP graph partitioning to work around scalar inputs.
 
-`torch_compile_fullgraph=false` permits graph breaks around deterministic
-NumPy mask creation, dynamic `nonzero` selection, stable sample-ID scalar
-access, and mask-count validation. A complete modern pretraining update in the
-recorded CUDA run produced seven graph breaks and ten unique graphs.
-`fullgraph=true` can reject NumPy layerdrop and serves as a diagnostic for
-pure Transformer regions. A two-length dynamic fine-tuning test recorded one
-unique graph.
+Fine-tuning and generic modules compile as one complete-model region.
+Pretraining keeps `Animal2VecPretrainingModel.forward` eager and compiles every
+student and EMA-teacher `TransformerBlock` instead. Mask generation,
+`MaskInfo.ids_keep`, decoder restoration, and masked target selection therefore
+never become Dynamo guards. Pretraining requires
+`torch_compile_dynamic=true`, so each block accepts the update-dependent
+retained sequence length without caching an exact-length graph. The terminal
+summary reports `scope=transformer_blocks` and the compiled region count;
+static compiled pretraining fails during setup with an actionable error.
+
+`fullgraph=true` can reject unsupported operations inside a selected region and
+serves as a diagnostic for pure Transformer math. A two-length dynamic
+fine-tuning test recorded one unique graph.
 
 The bounded A100 microbenchmark measured one warmed-up FP16 shape:
 `B=2`, `T=128`, `D=64`, four heads, two layers, GEGLU, strict Flash, and

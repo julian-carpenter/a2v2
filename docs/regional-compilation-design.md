@@ -60,9 +60,9 @@ eager functions and retain their existing unit coverage.
 
 The modern pretraining YAML and `animal2vec2_benchmark.sh` will explicitly set
 `common.torch_compile_dynamic=true`. The benchmark profile will record
-`torch_compile_scope=transformer_blocks`. Fine-tuning keeps complete-model
-dynamic compilation. The legacy reproduction launcher and legacy configs are
-not changed.
+`pretrain_torch_compile_scope=transformer_blocks` and
+`finetune_torch_compile_scope=model`. Fine-tuning keeps complete-model dynamic
+compilation. The legacy reproduction launcher and legacy configs are not changed.
 
 ## Verification
 
@@ -79,4 +79,3 @@ not changed.
 7. An eight-A100 resume probe runs past the previous recompilation window with a
    clean Inductor cache and records recompilation logs and peak memory.
 8. The frozen reproduction launcher checksum is verified unchanged.
-

@@ -212,7 +212,8 @@ choices again as command-line overrides:
   fine-tuning;
 - packed GEGLU and DeepScaleLM initialization;
 - AdaGC, AdamW8bit, and cosine weight-decay annealing from `0.01` to `0.0`;
-- partial-graph `torch.compile`; and
+- dynamic regional pretraining compilation plus complete-model fine-tuning
+  compilation; and
 - no activation checkpointing.
 
 Pretraining uses `612000 × 8 × 2 = 9,792,000` tokens per optimizer update for
@@ -222,7 +223,7 @@ reproduction's eight-GPU token-cap batch and training horizon, while using the
 faster measured pretraining partition. Do not change token, accumulation, or
 world-size settings when resuming a checkpoint.
 
-The modern batch controls were profiled again on 2026-08-25 with eight
+The modern batch controls were profiled on 2026-08-25 with eight
 A100-SXM4-40GB GPUs, bitsandbytes 0.50.1, the production manifests, compiled
 FlashAttention, no activation checkpointing, and an already settled AMP
 scale. Each pretraining timing covers two successful resumed updates and the
@@ -236,8 +237,15 @@ same terminal-checkpoint path:
 The default profile delivered about 31.3% more recordings per second. The run
 processed 14 instead of 15 recordings per rank and update, settled at AMP
 scale 0.25 instead of 0.5, and reserved up to 36.26 GiB. We chose this profile
-for its measured throughput on the compatible eight-A100-40GB host. A fresh
-lower-memory run can restore the previous partition with
+for its measured throughput on the compatible eight-A100-40GB host. Those
+short measurements used the former whole-pretraining-model compile boundary:
+they establish batch fit and relative throughput, but not long-run compiler
+cache safety. Variable `ids_keep` lengths later caused whole-model Inductor
+recompilation and eventually exhausted one rank; the following NCCL timeout was
+secondary. The current policy leaves masking eager and dynamically compiles
+only student and teacher Transformer blocks, preventing mask lengths from
+specializing the outer forward. A fresh lower-memory run can restore the
+previous partition with
 `A2V2_PRETRAIN_MAX_TOKENS=408000` and `A2V2_PRETRAIN_UPDATE_FREQ=3`; never
 change either value while resuming an existing checkpoint.
 

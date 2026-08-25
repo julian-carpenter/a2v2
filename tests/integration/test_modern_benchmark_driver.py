@@ -92,6 +92,10 @@ def test_dry_run_resolves_the_approved_modern_full_label_workflow(
         "--override model.checkpoint_activations=false" in line
         for line in training
     )
+    assert all(
+        "--override common.torch_compile_dynamic=true" in line
+        for line in training
+    )
 
     training_text = "\n".join(training)
     assert training_text.count("dataset.max_tokens=612000") == 2
@@ -262,6 +266,8 @@ else:
     assert "variant=animal2vec2-modern\n" in profile
     assert "label_fraction=100\n" in profile
     assert "checkpoint_activations=false\n" in profile
+    assert "pretrain_torch_compile_scope=transformer_blocks\n" in profile
+    assert "finetune_torch_compile_scope=model\n" in profile
     assert "pretrain_max_update=384230\n" in profile
     assert "finetune_max_update=30000\n" in profile
     pretrain_log = (output / "pretrain/train.log").read_text(encoding="utf-8")

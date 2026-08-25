@@ -3,8 +3,8 @@
 # no-CLS encoder weights because GEGLU and CLS add new parameter shapes.
 # Replace task.data before launch. Install a2v2[bnb] for AdamW8bit.
 
-# Compile the module in place before DDP. Partial-graph mode permits the
-# deterministic NumPy mask builder and dynamic masked-token selection.
+# Keep mask orchestration eager and compile each Transformer block in place
+# before DDP. Dynamic shapes cover the update-dependent retained-token length.
 common:
   fp16: true
   log_interval: 384
@@ -15,7 +15,7 @@ common:
   torch_compile_backend: inductor
   torch_compile_mode: default
   torch_compile_fullgraph: false
-  torch_compile_dynamic: false
+  torch_compile_dynamic: true
 
 # Save native checkpoint v2 state, including AdaGC and decay clocks.
 checkpoint:

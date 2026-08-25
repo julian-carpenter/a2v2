@@ -107,7 +107,7 @@ prefixes.
 **Files:**
 - Modify: `configs/modern/rope_cls_geglu_pretrain.yaml`
 - Modify: `scripts/animal2vec2_benchmark.sh`
-- Modify: `tests/unit/test_modern_benchmark_script.py`
+- Modify: `tests/integration/test_modern_benchmark_driver.py`
 - Modify: `docs/code-guide.md`
 - Modify: `docs/reproducing-paper.md`
 - Modify: `README.md`
@@ -120,11 +120,11 @@ prefixes.
 
 Assert the modern YAML sets `torch_compile_dynamic: true`, the launch command
 contains `--override common.torch_compile_dynamic=true`, and the run profile
-records `torch_compile_scope=transformer_blocks`.
+records the pretraining `transformer_blocks` and fine-tuning `model` scopes.
 
 - [ ] **Step 2: Run the launcher tests and verify RED**
 
-Run: `pytest tests/unit/test_modern_benchmark_script.py -q`
+Run: `pytest tests/integration/test_modern_benchmark_driver.py -q`
 
 Expected: the dynamic override and scope record assertions fail.
 
@@ -137,7 +137,7 @@ compiler OOM.
 
 - [ ] **Step 4: Run launcher and configuration tests**
 
-Run: `pytest tests/unit/test_modern_benchmark_script.py tests/unit/test_config.py -q`
+Run: `pytest tests/integration/test_modern_benchmark_driver.py tests/unit/test_config.py -q`
 
 Expected: all selected tests pass.
 
@@ -153,7 +153,7 @@ Expected: all selected tests pass.
 
 - [ ] **Step 1: Run focused CPU suites**
 
-Run: `pytest tests/unit/test_engine.py tests/integration/test_pretraining_step.py tests/unit/test_modern_benchmark_script.py tests/unit/test_config.py -q`
+Run: `pytest tests/unit/test_engine.py tests/integration/test_pretraining_step.py tests/integration/test_modern_benchmark_driver.py tests/unit/test_config.py -q`
 
 Expected: all tests pass.
 
@@ -186,4 +186,3 @@ and all tests pass.
 
 Inspect `git diff --check`, review the complete diff, and commit the verified
 regional-compilation fix directly on the previously authorized `main` branch.
-

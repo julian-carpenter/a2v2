@@ -335,6 +335,8 @@ if [[ "${DRY_RUN}" == false ]]; then
         printf 'optimizer=adamw8bit\n'
         printf 'weight_decay_schedule=cosine\n'
         printf 'torch_compile=true\n'
+        printf 'pretrain_torch_compile_scope=transformer_blocks\n'
+        printf 'finetune_torch_compile_scope=model\n'
         printf 'checkpoint_activations=%s\n' "${CHECKPOINT_ACTIVATIONS}"
         printf 'pretrain_max_tokens=%s\n' "${PRETRAIN_MAX_TOKENS}"
         printf 'pretrain_update_freq=%s\n' "${PRETRAIN_UPDATE_FREQ}"
@@ -361,6 +363,7 @@ fi
 
 MODERN_OVERRIDES=(
     --override "common.torch_compile=true"
+    --override "common.torch_compile_dynamic=true"
     --override "model.position_encoding=rope"
     --override "model.attention_backend=flash"
     --override "model.use_cls_token=true"

@@ -119,6 +119,7 @@ def test_modern_example_configs_select_compatible_architecture_and_policies() ->
         assert config.model.checkpoint_activations is True
         assert config.common.torch_compile is True
         assert config.common.torch_compile_fullgraph is False
+        assert config.common.torch_compile_dynamic is True
         assert config.optimization.gradient_clip_method == "adagc"
         assert config.optimization.adagc_beta == 0.99
         assert config.optimization.adagc_relative_clip == 1.04
