@@ -58,15 +58,15 @@ optimization:
   adagc_warmup_updates: 100
 
 # AdamW8bit requires the optional bnb extra and a CUDA device. The cosine
-# weight-decay clock reaches zero at max_update and ignores failed AMP steps.
+# weight-decay clock reaches weight_decay_end at max_update and ignores failed AMP steps.
 optimizer:
   _name: adamw8bit
   adam_betas: [0.9, 0.98]
   adam_eps: 1e-6
-  weight_decay: 0.01
+  weight_decay: 0.0075
   min_8bit_size: 4096
   weight_decay_schedule: cosine
-  weight_decay_end: 0.0
+  weight_decay_end: 0.0125
 
 # The learning-rate clock uses the same successful-update counter.
 lr_scheduler:
