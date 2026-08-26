@@ -374,9 +374,9 @@ MODERN_OVERRIDES=(
     --override "model.checkpoint_activations=${CHECKPOINT_ACTIVATIONS}"
     --override "optimization.gradient_clip_method=adagc"
     --override "optimizer._name=adamw8bit"
-    --override "optimizer.weight_decay=0.01"
+    --override "optimizer.weight_decay=0.0075"
     --override "optimizer.weight_decay_schedule=cosine"
-    --override "optimizer.weight_decay_end=0.0"
+    --override "optimizer.weight_decay_end=0.0125"
 )
 TRAIN_ENV=(
     env
