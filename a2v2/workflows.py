@@ -66,6 +66,7 @@ from .data import (
 from .model import (
     Animal2VecFineTuningModel,
     Animal2VecPretrainingModel,
+    AudioEncoder,
 )
 from .slurm import (
     DistributedEnvironment,
@@ -862,59 +863,100 @@ def aggregate_segmented_metrics(
 
 @dataclass(frozen=True)
 class InferenceResult:
-    """Concatenated frame outputs and fused events for one recording."""
+    """CPU frame outputs and optional per-segment CLS outputs for one recording."""
 
-    probabilities: Tensor
+    probabilities: Tensor | None
     embeddings: Tensor
     timestamps: Tensor
-    events: tuple[EventInterval, ...]
+    events: tuple[EventInterval, ...] | None
+    cls_embeddings: Tensor | None = None
+    cls_predictions: Tensor | None = None
 
 
 def _trim_frames_to_duration(
-    probabilities: Tensor,
+    probabilities: Tensor | None,
     embeddings: Tensor,
     timestamps: Tensor,
     *,
     end_seconds: float,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor | None, Tensor, Tensor]:
     """Remove padded-frontend frames whose centers lie beyond real audio."""
 
     frame_count = timestamps.numel()
-    if probabilities.shape[0] != frame_count or embeddings.shape[0] != frame_count:
+    if (probabilities is not None and probabilities.shape[0] != frame_count) or embeddings.shape[0] != frame_count:
         raise ValueError("probabilities, embeddings, and timestamps must align")
     keep = timestamps < end_seconds
-    return probabilities[keep], embeddings[keep], timestamps[keep]
+    return probabilities[keep] if probabilities is not None else None, embeddings[keep], timestamps[keep]
 
 
 class InferenceRunner:
-    """Load a native fine-tuning checkpoint and process long recordings.
+    """Load a native checkpoint and process long recordings.
 
     Recordings are resampled and split into bounded segments. Frame timestamps
     retain each segment's absolute offset, and padded frames from the final
     partial segment are removed before event fusion.
+
+    Pretraining uses the unmasked student encoder, without class predictions.
+    ``event_detection`` reduces class probabilities using ``event_vote`` before
+    temporal fusion. ``return_cls`` requests one CLS vector per segment when
+    available; a trained CLS classifier enables it automatically. CLS predictions
+    are probabilities, not thresholded labels or frame-level event boundaries.
     """
 
-    def __init__(self, checkpoint_path: str | Path, *, device: torch.device | None = None) -> None:
+    def __init__(
+        self, checkpoint_path: str | Path, *, device: torch.device | None = None,
+        event_detection: bool = False,
+        event_vote: Literal["max", "mean", "median"] = "max",
+        return_cls: bool = False,
+    ) -> None:
+        if event_vote not in ("max", "mean", "median"):
+            raise ValueError("event_vote must be max, mean, or median")
+        self.event_detection = event_detection
+        self.event_vote = event_vote
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = load_checkpoint(checkpoint_path, map_location=self.device)
-        if checkpoint["stage"] != "finetune":
-            raise CheckpointError("inference requires a fine-tuning checkpoint")
+        # Keep optimizer, teacher, and decoder checkpoint tensors off the GPU.
+        checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
         stored_config = checkpoint["config"]
-        if not isinstance(stored_config, dict) or "active" not in stored_config or "pretrained" not in stored_config:
-            raise CheckpointError("fine-tuning checkpoint lacks active/pretrained native configs")
+        if not isinstance(stored_config, dict) or "active" not in stored_config:
+            raise CheckpointError("checkpoint lacks an active native config")
         self.config = config_from_serialized_dict(stored_config["active"])
-        self.pretrained_config = config_from_serialized_dict(stored_config["pretrained"])
-        if self.config.model.classification_head != "frame":
-            raise CheckpointError(
-                "event inference requires model.classification_head=frame; "
-                f"received {self.config.model.classification_head} sequence classification checkpoint"
+        self.is_pretrain = checkpoint["stage"] == "pretrain"
+        if self.is_pretrain:
+            self.pretrained_config = self.config
+            self.model = AudioEncoder.from_config(self.config)
+            self.model.load_state_dict({
+                key.removeprefix("student."): value
+                for key, value in checkpoint["model"].items()
+                if key.startswith("student.")
+            }, strict=True)
+        else:
+            if "pretrained" not in stored_config:
+                raise CheckpointError("fine-tuning checkpoint lacks active/pretrained native configs")
+            self.pretrained_config = config_from_serialized_dict(stored_config["pretrained"])
+            self.model = Animal2VecFineTuningModel.from_config(
+                self.config, pretrained_config=self.pretrained_config
             )
-        self.model = Animal2VecFineTuningModel.from_config(
-            self.config, pretrained_config=self.pretrained_config
-        ).to(self.device)
-        self.model.load_state_dict(checkpoint["model"], strict=True)
+            self.model.load_state_dict(checkpoint["model"], strict=True)
+        self.has_frame_predictions = not self.is_pretrain and self.config.model.classification_head == "frame"
+        self.has_cls_predictions = not self.is_pretrain and self.config.model.classification_head == "cls"
+        self.return_cls = return_cls or self.has_cls_predictions
+        self.labels = ("event",) if event_detection else self.config.task.unique_labels
+        self.model.to(self.device)
         self.model.eval()
         self.update = int(checkpoint["update"])
+
+    def _event_probabilities(self, probabilities: Tensor) -> Tensor:
+        """Reduce probabilities across classes before thresholding or fusion."""
+        if not self.event_detection:
+            return probabilities
+        if self.event_vote == "max":
+            return probabilities.amax(dim=-1, keepdim=True)
+        if self.event_vote == "mean":
+            return probabilities.mean(dim=-1, keepdim=True)
+        ordered = probabilities.sort(dim=-1).values
+        count = ordered.shape[-1]
+        # Average the central pair for even vocabularies, unlike torch.median.
+        return ((ordered[..., (count - 1) // 2] + ordered[..., count // 2]) / 2).unsqueeze(-1)
 
     @torch.inference_mode()
     def run_tensor(
@@ -956,25 +998,36 @@ class InferenceRunner:
         probability_parts: list[Tensor] = []
         embedding_parts: list[Tensor] = []
         timestamp_parts: list[Tensor] = []
+        cls_embedding_parts: list[Tensor] = []
+        cls_prediction_parts: list[Tensor] = []
+        encoder = self.model if self.is_pretrain else self.model.encoder
+        collect_cls = self.return_cls and encoder.use_cls_token
         for start in range(0, waveform.shape[-1], segment_samples):
             segment = normalize_waveform(waveform[start: start + segment_samples]).unsqueeze(0).to(self.device)
+            # Fine-tuning inherits attention architecture from pretraining.
             with _evaluation_autocast(self.pretrained_config, self.device):
-                output = self.model(segment, update=self.update)
+                output = self.model(segment) if self.is_pretrain else self.model(segment, update=self.update)
             # Mathematics: independent class probability p_{tc}=σ(logit_{tc});
             # embedding z_t is the arithmetic mean of the final K layer outputs.
             # Interpretation: event decisions and reusable representations come
             # from the same forward pass and frame grid.
-            probabilities = torch.sigmoid(output.logits[0].float()).cpu()
+            probabilities = None
+            if self.has_frame_predictions:
+                probabilities = self._event_probabilities(torch.sigmoid(output.logits[0].float()).cpu())
+            elif self.has_cls_predictions:
+                cls_prediction_parts.append(self._event_probabilities(torch.sigmoid(output.logits.float()).cpu()))
             layer_count = min(self.config.model.average_top_k_layers, len(output.layer_outputs))
             embeddings = torch.stack(output.layer_outputs[-layer_count:]).mean(dim=0)[0].cpu()
-            if self.model.encoder.use_cls_token:
+            if collect_cls:
+                cls_embedding_parts.append(embeddings[:1])
+            if encoder.use_cls_token:
                 embeddings = embeddings[1:]
             # Mathematics: local frame centers receive absolute offset
             # start/f_target before segments are concatenated.
             # Interpretation: splitting for memory does not reset time to zero
             # at each segment boundary.
             timestamps = feature_timestamps(
-                probabilities.shape[0], target_rate, self.config.task.conv_feature_layers
+                embeddings.shape[0], target_rate, self.config.task.conv_feature_layers
             ) + start / target_rate
             segment_end = min(
                 recording_duration,
@@ -988,18 +1041,25 @@ class InferenceRunner:
             )
             if timestamps.numel() == 0:
                 continue
-            probability_parts.append(probabilities)
+            if probabilities is not None:
+                probability_parts.append(probabilities)
             embedding_parts.append(embeddings)
             timestamp_parts.append(timestamps)
 
+        dimension = self.pretrained_config.model.embed_dim
+        embeddings = torch.cat(embedding_parts) if embedding_parts else torch.empty(0, dimension)
+        timestamps = torch.cat(timestamp_parts) if timestamp_parts else torch.empty(0)
+        cls_embeddings = (
+            torch.cat(cls_embedding_parts) if cls_embedding_parts else torch.empty(0, dimension)
+        ) if collect_cls else None
+        cls_predictions = (
+            torch.cat(cls_prediction_parts) if cls_prediction_parts else torch.empty(0, len(self.labels))
+        ) if self.has_cls_predictions else None
+        if not self.has_frame_predictions:
+            return InferenceResult(None, embeddings, timestamps, None, cls_embeddings, cls_predictions)
         if not probability_parts:
-            label_count = len(self.config.task.unique_labels)
-            empty_probabilities = torch.empty(0, label_count)
-            empty_embeddings = torch.empty(0, self.pretrained_config.model.embed_dim)
-            return InferenceResult(empty_probabilities, empty_embeddings, torch.empty(0), ())
+            return InferenceResult(torch.empty(0, len(self.labels)), embeddings, timestamps, (), cls_embeddings, cls_predictions)
         probabilities = torch.cat(probability_parts)
-        embeddings = torch.cat(embedding_parts)
-        timestamps = torch.cat(timestamp_parts)
         threshold = self.config.criterion.metric_threshold if threshold is None else threshold
         event_method = self.config.criterion.event_method if event_method is None else event_method
         window_seconds = self.config.criterion.sigma_s if fusion_window_seconds is None else fusion_window_seconds
@@ -1019,12 +1079,12 @@ class InferenceRunner:
             window_frames=max(1, round(window_seconds * frame_rate)),
             recording_duration=recording_duration,
         )
-        return InferenceResult(probabilities, embeddings, timestamps, events)
+        return InferenceResult(probabilities, embeddings, timestamps, events, cls_embeddings, cls_predictions)
 
     def write_events(
         self,
         path: str | Path,
-        events: tuple[EventInterval, ...],
+        events: tuple[EventInterval, ...] | None,
         *,
         audition: bool = False,
     ) -> None:
@@ -1037,6 +1097,8 @@ class InferenceRunner:
         changes serialization only; both branches receive the same event set.
         """
 
+        if events is None:
+            raise ValueError("this checkpoint has no frame events to export; use the embedding/CLS result fields")
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if audition:
@@ -1055,7 +1117,7 @@ class InferenceRunner:
                 ),
             )
             for event in ordered_events:
-                label = self.config.task.unique_labels[event.label_index]
+                label = self.labels[event.label_index]
                 # Mathematics: a range marker stores onset t_s and duration
                 # Δt=t_e-t_s. ``timedelta`` maps each real-valued second count
                 # to the legacy [D day[s], ]H:MM:SS[.ffffff] representation.
@@ -1088,7 +1150,7 @@ class InferenceRunner:
 
         lines = ["label\tstart_seconds\tend_seconds\tscore"]
         for event in events:
-            label = self.config.task.unique_labels[event.label_index]
+            label = self.labels[event.label_index]
             lines.append(
                 f"{label}\t{event.start_seconds:.6f}\t{event.end_seconds:.6f}\t{event.score:.8f}"
             )

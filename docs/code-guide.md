@@ -268,8 +268,9 @@ no token or predictor and retains legacy state keys.
 
 `classification_head=cls` averages selected top-layer CLS states and emits
 `[B, C]` logits. Fine-tuning reduces frame labels to recording occurrence
-before mixup and reports `sample_size=B`. Event fusion rejects sequence
-logits because they contain no timing axis. `a2v2-evaluate-sequence` restores
+before mixup and reports `sample_size=B`. Sequence logits have no frame timing
+axis; `InferenceRunner` returns their probabilities as per-segment
+`cls_predictions` instead of fusing frame events. `a2v2-evaluate-sequence` restores
 a native CLS fine-tuning checkpoint and reports multilabel precision, recall,
 F1, accuracy, and average precision.
 
@@ -631,13 +632,73 @@ implementation.
 
 ### Inference
 
-`InferenceRunner` loads a native fine-tuning checkpoint, reconstructs both
-active and pretrained configurations, and loads state strictly.
+`InferenceRunner(checkpoint_path, *, device=None, event_detection=False,
+event_vote="max", return_cls=False)` accepts native pretraining and fine-tuning
+checkpoints. Loading uses pickle, so callers must trust the checkpoint source.
+The constructor reads checkpoint tensors on CPU and moves the inference model
+to the requested device; optimizer and teacher tensors stay off the GPU.
+
+For pretraining, it reconstructs `AudioEncoder` from the active config and
+loads the `student.*` keys with strict encoder-state validation. It runs the
+student on unmasked audio and does not construct the EMA teacher or decoder.
+For fine-tuning, it reconstructs the model from the active/pretrained configs
+and loads the model state strictly, retaining the checkpoint's frame or CLS
+classification head.
 
 `run_tensor` selects or averages channels, resamples to the model rate, divides
 long audio into bounded segments, computes probabilities and averaged
 embeddings, assigns absolute timestamps, removes frames beyond the true final
-duration, and fuses events.
+duration, and fuses events when a frame classifier is available. CUDA Flash
+inference uses FP16 autocast and computes sigmoid probabilities in FP32.
+The runner selects precision from the encoder's pretraining config, even if
+the active fine-tuning config names a different attention backend.
+The legacy attention path retains its evaluation precision.
+
+`InferenceResult` exposes CPU tensors with two distinct time axes:
+
+| Field | Shape and availability |
+| --- | --- |
+| `embeddings` | `[F, D]` for all checkpoint types; top-K layer mean with CLS removed |
+| `timestamps` | `[F]` absolute frame-center times in seconds, trimmed to real audio |
+| `probabilities` | `[F, C]` for a frame classifier; `None` for pretraining or a CLS classifier |
+| `events` | Immutable frame-event tuple for a frame classifier; otherwise `None` |
+| `cls_embeddings` | `[N, D]` top-K CLS mean if `return_cls` is enabled and the encoder has CLS; otherwise `None` |
+| `cls_predictions` | `[N, C]` sigmoid probabilities from a trained CLS head; otherwise `None` |
+
+`F` counts retained frames, `N` counts input segments, `D` is the encoder width,
+and `C` is the checkpoint's class count. A CLS classifier enables `return_cls`
+even if the caller supplies `False`. A pretraining CLS regression head is not
+a class predictor; a frame classifier also does not supply CLS predictions.
+CLS rows follow segment order, with one row for the short final segment as
+well. Frame timestamps do not describe CLS rows. Segment `i` starts at
+`i * round(segment_seconds * target_rate) / target_rate`; its end is bounded
+by the recording duration. A segment may have a CLS row even if timestamp
+trimming removes all its frame rows.
+
+Empty audio returns zero-row tensors for available outputs, `None` for
+unavailable outputs, and `events=()` for a frame classifier. The optional CLS
+fields default to `None`, preserving four-argument `InferenceResult`
+construction. Disabling CLS output does not remove the token from an encoder
+trained with CLS; it only controls which result fields the runner returns.
+
+#### Class-agnostic voting
+
+With `event_detection=True`, `_event_probabilities` reduces sigmoid
+probabilities over the class axis before thresholding. `event_vote="max"`
+uses the maximum; `"mean"` uses the arithmetic mean; `"median"` averages
+the middle two sorted values for an even class count. It leaves one column:
+`[F, 1]` for frame probabilities or `[N, 1]` for CLS predictions. Embeddings
+and timestamps do not change. The reduction includes the entire output
+vocabulary, including auxiliary channels such as `focal`, without claiming
+recognition of unseen sound classes.
+
+For frame classifiers, the runner then applies the existing temporal
+`event_method` pooling and threshold/fusion routine to that column. It emits
+event intervals with `label_index=0` and exposes `runner.labels=("event",)`.
+Without event detection, `runner.labels` follows the checkpoint vocabulary.
+For CLS classifiers, callers can threshold `cls_predictions` for segment
+decisions; the runner does not fabricate frame boundaries. Pretraining still
+returns no probabilities, events, or CLS predictions.
 
 `write_events` owns the two external event-table representations. Its default
 native TSV stores label, onset seconds, offset seconds, and the full score.
@@ -650,7 +711,11 @@ formats both coordinates as `datetime.timedelta` values, and rounds the score
 to three decimal places. It sorts markers by numeric onset before writing the
 tab-delimited `.csv`.
 
-The serializer receives the existing event tuple. It does not suppress
+The serializer receives the existing event tuple and resolves labels through
+`runner.labels`, so class-agnostic exports use `event`. It rejects `None`
+before creating an output file. The `a2v2-infer` CLI remains a frame-event
+exporter; use the Python API for embedding-only or CLS-only checkpoints.
+The serializer does not suppress
 overlapping labels or reinterpret the `focal` channel. Researchers who need a
 different event-selection policy can operate on `InferenceResult.events`
 before calling `write_events`.

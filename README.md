@@ -846,7 +846,8 @@ a2v2-convert-checkpoint \
 ```
 
 The converted pretraining checkpoint can initialize native fine-tuning. It can
-also be inspected or used for embedding/model work through the Python API.
+also supply unmasked student embeddings through `InferenceRunner`; see the
+[Python inference API](#python-inference-api).
 
 ### Convert the official fine-tuning checkpoint
 
@@ -1376,6 +1377,10 @@ The runner:
 No sidecar YAML is required because a native fine-tuning checkpoint stores both
 active and pretrained configurations.
 
+The `a2v2-infer` command exports frame events and requires a frame-classifier
+checkpoint. Use the Python API below for pretraining embeddings, CLS outputs,
+or class-agnostic event voting.
+
 ### Adobe Audition marker CSV
 
 Researchers can import A2V2 event predictions as Adobe Audition range markers:
@@ -1430,7 +1435,9 @@ the real recording.
 
 ### Python inference API
 
-Use the API when frame probabilities, embeddings, or timestamps are required:
+Use the API for frame probabilities, embeddings, timestamps, or per-segment
+CLS outputs. Pass a native checkpoint from a trusted source; checkpoint loading
+uses Python's pickle-backed PyTorch format.
 
 ```python
 from pathlib import Path
@@ -1457,7 +1464,7 @@ print("probabilities:", result.probabilities.shape)
 print("embeddings:", result.embeddings.shape)
 print("timestamps:", result.timestamps.shape)
 for event in result.events:
-    label = runner.config.task.unique_labels[event.label_index]
+    label = runner.labels[event.label_index]
     print(
         label,
         event.start_seconds,
@@ -1475,16 +1482,91 @@ runner.write_events(
 )
 ```
 
-`result.probabilities`, `result.embeddings`, and `result.timestamps` are CPU
-tensors aligned along their first dimension. `result.events` is an immutable
-tuple of event intervals.
+For a frame classifier, `result.probabilities`, `result.embeddings`, and
+`result.timestamps` are CPU tensors aligned along their first dimension.
+`result.events` is an immutable tuple of event intervals. The defaults preserve
+the class-specific inference behavior above.
+
+#### Pretraining embeddings and optional CLS outputs
+
+```python
+runner = InferenceRunner(
+    "/checkpoints/pretrain/checkpoint_last.pt",
+    device=torch.device("cuda:0"),
+    return_cls=True,  # default False; has an effect only if CLS is available
+)
+result = runner.run_tensor(waveform, sample_rate, segment_seconds=10.0)
+print(result.embeddings.shape, result.timestamps.shape)
+assert result.probabilities is None and result.events is None
+assert result.cls_predictions is None  # pretraining has no trained classifier
+if result.cls_embeddings is not None:
+    print(result.cls_embeddings.shape)
+```
+
+Pretraining inference uses the unmasked **student encoder**, without the EMA
+teacher, decoder, or pretraining regression loss. Frame and CLS embeddings use
+the arithmetic mean of the last `average_top_k_layers` Transformer outputs.
+Frame embeddings exclude the prepended CLS token and retain convolution-aware
+timestamps in seconds.
+
+All available arrays are CPU tensors. Let `F` be the total retained frames,
+`N` the number of audio segments, `D` the embedding dimension, and `C` the
+checkpoint's class count:
+
+| Checkpoint | `probabilities` / `events` | `cls_embeddings` | `cls_predictions` |
+| --- | --- | --- | --- |
+| Pretraining | `None` / `None` | `[N, D]` if CLS exists and `return_cls=True`; otherwise `None` | `None` |
+| Fine-tuned frame classifier | `[F, C]` / event tuple | `[N, D]` if CLS exists and `return_cls=True`; otherwise `None` | `None` |
+| Fine-tuned CLS classifier | `None` / `None` | `[N, D]`; enables `return_cls` even if passed as `False` | `[N, C]` class probabilities |
+
+Each checkpoint type returns `embeddings` with shape `[F, D]` and `timestamps`
+with shape `[F]`. A CLS row describes one input segment, including a short final
+segment, in chronological segment order. Frame timestamps do not index CLS
+rows. Changing `segment_seconds` changes the context represented by each CLS
+row. For a CLS classifier, use `result.cls_predictions >= threshold` to obtain
+segment-level decisions; these predictions do not define frame event boundaries.
+
+#### Class-agnostic event detection
+
+```python
+runner = InferenceRunner(
+    "/checkpoints/finetune/checkpoint_best.pt",
+    device=torch.device("cuda:0"),
+    event_detection=True,
+    event_vote="max",  # default; alternatives: "mean", "median"
+    return_cls=True,
+)
+result = runner.run_tensor(waveform, sample_rate, threshold=0.5)
+if result.events is not None:
+    runner.write_events("/predictions/events.tsv", result.events)
+```
+
+Set `event_detection=True` to reduce sigmoid probabilities across the class
+axis before thresholding and temporal event fusion. `max` selects the largest
+probability; `mean` averages all class probabilities; `median` selects the
+middle value, averaging the two central values for an even class count.
+This is probability aggregation, not voting on already-thresholded labels.
+
+A frame classifier then returns `[F, 1]` probabilities and events with
+`label_index=0`. `runner.labels` is `("event",)`, and both TSV and Audition
+exports use the label `event`. This can produce multiple event intervals in
+a recording. The `event_vote` option reduces **classes**; the existing
+`event_method="avg"|"max"` option controls **temporal** fusion.
+
+For a CLS classifier, the same reduction returns `[N, 1]` in
+`cls_predictions`; `probabilities` and `events` remain `None`. Pretraining
+checkpoints remain embedding-only even with event detection enabled.
+The reduction includes all output classes, including auxiliary classes such
+as `focal`. It does not add the ability to recognize sounds outside the
+model's learned classes. Tune the threshold for your corpus and voting mode.
 
 ### Empty and very short recordings
 
-An empty input returns correctly shaped empty probability, embedding, and
-timestamp tensors and no events. A short final segment is not padded into fake
-timestamps beyond the recording. These behaviors have dedicated CPU and GPU
-regressions.
+An empty input returns zero-row tensors for available outputs. Unavailable or
+disabled outputs remain `None`; a frame classifier returns `events=()`.
+`write_events` rejects `events=None` rather than writing a misleading empty
+event file. A short final segment does not introduce frame timestamps beyond
+the recording. CPU and GPU tests cover these boundaries.
 
 ## Evaluation
 

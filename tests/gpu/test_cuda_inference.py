@@ -12,13 +12,76 @@ import torch
 
 from a2v2.config import config_to_dict, load_config
 from a2v2.workflows import InferenceRunner
-from a2v2.model import Animal2VecFineTuningModel
+from a2v2.model import Animal2VecFineTuningModel, Animal2VecPretrainingModel
 from a2v2.training import capture_rng_state, save_checkpoint
 from a2v2 import workflows
 
 
 ROOT = Path(__file__).parents[2]
 pytestmark = pytest.mark.gpu
+
+
+@pytest.mark.parametrize("stage,encoder_backend,active_backend", [
+    ("pretrain", "flash", "flash"),
+    ("frame", "flash", "flash"),
+    ("cls", "flash", "flash"),
+    ("frame", "flash", "manual"),
+    ("cls", "flash", "manual"),
+    ("frame", "manual", "flash"),
+    ("cls", "manual", "flash"),
+])
+def test_flash_embedding_and_cls_inference_modes(
+    cuda_device: torch.device, tmp_path: Path, stage: str,
+    encoder_backend: str, active_backend: str,
+) -> None:
+    """Exercise strict Flash with student-only, frame, and sequence checkpoints."""
+    overrides = (
+        "model.position_encoding=rope", f"model.attention_backend={encoder_backend}",
+        "model.use_cls_token=true", "model.modalities.audio.use_alibi_encoder=false",
+    )
+    pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml", overrides=overrides)
+    if stage == "pretrain":
+        model = Animal2VecPretrainingModel.from_config(pretrain)
+        stored = {"active": config_to_dict(pretrain)}
+    else:
+        config = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml", overrides=(
+            *overrides, f"model.classification_head={stage}",
+            f"model.attention_backend={active_backend}",
+        ))
+        model = Animal2VecFineTuningModel.from_config(config, pretrained_config=pretrain)
+        stored = {"active": config_to_dict(config), "pretrained": config_to_dict(pretrain)}
+    path = tmp_path / "checkpoint.pt"
+    save_checkpoint(path, {
+        "format_version": 1, "stage": "pretrain" if stage == "pretrain" else "finetune",
+        "config": stored, "model": model.state_dict(), "teacher": None,
+        "optimizer": None, "scheduler": None, "scaler": None,
+        "update": 2, "epoch": 1, "batch_in_epoch": 0,
+        "rng_state": capture_rng_state(), "sampler_state": None, "best_metric": None,
+    })
+    runner = InferenceRunner(path, device=cuda_device, return_cls=True, event_detection=True)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        result = runner.run_tensor(torch.randn(160), 8000, segment_seconds=0.008)
+    assert result.cls_embeddings.shape == (3, 16)
+    assert result.cls_embeddings.device.type == "cpu"
+    assert torch.isfinite(result.cls_embeddings).all()
+    assert torch.isfinite(result.embeddings).all()
+    assert len(result.embeddings) == len(result.timestamps)
+    assert result.timestamps[-1] < 0.02
+    used_flash = any("_scaled_dot_product_flash_attention" in event.key for event in profile.key_averages())
+    assert used_flash == (encoder_backend == "flash")
+    if encoder_backend == "manual":
+        assert result.embeddings.dtype == torch.float32
+        assert result.cls_embeddings.dtype == torch.float32
+    if stage == "frame":
+        assert result.probabilities.shape == (len(result.timestamps), 1)
+        assert result.cls_predictions is None
+    else:
+        assert result.probabilities is None and result.events is None
+        if stage == "cls":
+            assert result.cls_predictions.shape == (3, 1)
+            assert result.cls_predictions.device.type == "cpu"
+        else:
+            assert result.cls_predictions is None
 
 
 @pytest.mark.parametrize("head", ["frame", "cls"])
