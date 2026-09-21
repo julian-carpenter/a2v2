@@ -4,6 +4,7 @@ concatenation, stereo handling, partial window bounds, and shaped empty outputs.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,16 +14,58 @@ from a2v2.config import config_to_dict, load_config
 from a2v2.workflows import InferenceRunner
 from a2v2.model import Animal2VecFineTuningModel
 from a2v2.training import capture_rng_state, save_checkpoint
+from a2v2 import workflows
 
 
 ROOT = Path(__file__).parents[2]
 pytestmark = pytest.mark.gpu
 
 
-def _checkpoint(path: Path) -> Path:
+@pytest.mark.parametrize("head", ["frame", "cls"])
+def test_strict_flash_validation_uses_half_precision(
+    cuda_device: torch.device, monkeypatch: pytest.MonkeyPatch, head: str,
+) -> None:
+    """Catch full-precision validation failing at the first scheduled update."""
+    overrides = (
+        "model.position_encoding=rope", "model.attention_backend=flash",
+        "model.use_cls_token=true", "model.modalities.audio.use_alibi_encoder=false",
+    )
+    pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml", overrides=overrides)
+    config = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml", overrides=(
+        *overrides, f"model.classification_head={head}",
+        "dataset.required_batch_size_multiple=1", "dataset.num_workers=0",
+    ))
+    config = replace(config, common=replace(config.common, fp16=True))
+    model = Animal2VecFineTuningModel.from_config(config, pretrained_config=pretrain).to(cuda_device)
+
+    class ValidationDataset(torch.utils.data.Dataset):
+        """Supply one real collatable labeled recording."""
+        sizes = (64,)
+
+        def __len__(self) -> int:
+            """Return the fixture recording count."""
+            return 1
+
+        def __getitem__(self, index: int) -> dict[str, object]:
+            """Return waveform and frame targets for actual model evaluation."""
+            return {"id": index, "source": torch.randn(64), "target": torch.zeros(16, 2), "path": "sample.wav"}
+
+    monkeypatch.setattr(workflows, "_make_dataset", lambda *_: ValidationDataset())
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+        metrics = workflows._validate(model, config, device=cuda_device, update=10000)
+    assert torch.isfinite(torch.tensor(metrics["loss"]))
+    assert model.training
+    assert any("_scaled_dot_product_flash_attention" in event.key for event in profile.key_averages())
+
+
+def _checkpoint(path: Path, *, flash: bool = False) -> Path:
     """Create the tiny native checkpoint fixture required by this module."""
-    pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml")
-    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml")
+    overrides = (
+        "model.position_encoding=rope", "model.attention_backend=flash",
+        "model.modalities.audio.use_alibi_encoder=false",
+    ) if flash else ()
+    pretrain = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml", overrides=overrides)
+    finetune = load_config(ROOT / "tests/fixtures/tiny_finetune.yaml", overrides=overrides)
     model = Animal2VecFineTuningModel.from_config(finetune, pretrained_config=pretrain)
     with torch.no_grad():
         model.classifier.weight.zero_()
@@ -49,13 +92,15 @@ def _checkpoint(path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("flash", [False, True])
 def test_chunked_stereo_inference_runs_on_cuda_and_bounds_final_segment(
     cuda_device: torch.device,
     tmp_path: Path,
+    flash: bool,
 ) -> None:
     """Check chunked stereo inference runs on CUDA and bounds final segment."""
     runner = InferenceRunner(
-        _checkpoint(tmp_path / "finetuned.pt"),
+        _checkpoint(tmp_path / "finetuned.pt", flash=flash),
         device=cuda_device,
     )
     assert next(runner.model.parameters()).device == cuda_device

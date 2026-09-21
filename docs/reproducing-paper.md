@@ -298,6 +298,22 @@ an OOM. Those failures indicate that the host no longer matches this benchmark
 profile and should be investigated rather than hidden by a silent policy
 change.
 
+CUDA validation and inference explicitly use FP16 autocast when the saved
+attention backend is `flash`; probabilities and validation scores are computed
+in FP32. FlashAttention requires half-precision inputs even when gradients are
+disabled. Without this evaluation context, a run can train successfully yet
+fail at its first validation (normally update 10,000), with a warning that
+query/key/value are `float` followed by `No available kernel`. This is separate
+from backbone unfreezing at the same update. Legacy attention evaluation is
+unchanged. GPU regression tests cover frame and CLS validation and chunked
+inference, including a profiler assertion that validation uses FlashAttention.
+
+For a frame-head variant, select a frame metric such as
+`metrics/finetune/frame/f1` for best-checkpoint selection. The paired modern
+CLS-head recipe instead emits `sequence_f1`; that selector is not valid for
+a frame head. Preserve the head and training configuration stored in a resume
+checkpoint rather than substituting a different recipe.
+
 ## 1. Select the published recipe
 
 The repository includes four primary recipes:

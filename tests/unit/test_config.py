@@ -127,8 +127,11 @@ def test_modern_example_configs_select_compatible_architecture_and_policies() ->
         assert config.optimizer.name == "adamw8bit"
         assert config.optimizer.min_8bit_size == 4096
         assert config.optimizer.weight_decay_schedule == "cosine"
-        assert config.optimizer.weight_decay == 0.01
-        assert config.optimizer.weight_decay_end == 0.0
+
+    assert pretrain.optimizer.weight_decay == 0.0075
+    assert pretrain.optimizer.weight_decay_end == 0.0125
+    assert finetune.optimizer.weight_decay == 0.01
+    assert finetune.optimizer.weight_decay_end == 0.0
 
     assert pretrain.model.classification_head == "frame"
     assert pretrain.model.cls_loss_weight == 1.0

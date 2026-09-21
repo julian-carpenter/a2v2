@@ -41,7 +41,7 @@ YAML_HASHES = {
     "configs/modern/rope_cls_geglu_finetune.yaml":
         "d0bb4b2ef448439a2fd6f2a757cbcbd92c5d454bbe450fddad76c9d29ce57ba7",
     "configs/modern/rope_cls_geglu_pretrain.yaml":
-        "836a507490afa8ac53d2476ff676d6de2a4e3d196b366911fcfa57629e21cbdd",
+        "bcb77a70095d63fd5af03ff7c3eb1255a59c838f3086f312924290d31070d2c0",
     "tests/fixtures/tiny_finetune.yaml":
         "166ebbbc14417430a664b02fdaf2f7c327d9923217cff5f00a6b8487aedff0cc",
     "tests/fixtures/tiny_pretrain.yaml":

@@ -958,12 +958,13 @@ class InferenceRunner:
         timestamp_parts: list[Tensor] = []
         for start in range(0, waveform.shape[-1], segment_samples):
             segment = normalize_waveform(waveform[start: start + segment_samples]).unsqueeze(0).to(self.device)
-            output = self.model(segment, update=self.update)
+            with _evaluation_autocast(self.pretrained_config, self.device):
+                output = self.model(segment, update=self.update)
             # Mathematics: independent class probability p_{tc}=σ(logit_{tc});
             # embedding z_t is the arithmetic mean of the final K layer outputs.
             # Interpretation: event decisions and reusable representations come
             # from the same forward pass and frame grid.
-            probabilities = torch.sigmoid(output.logits[0]).cpu()
+            probabilities = torch.sigmoid(output.logits[0].float()).cpu()
             layer_count = min(self.config.model.average_top_k_layers, len(output.layer_outputs))
             embeddings = torch.stack(output.layer_outputs[-layer_count:]).mean(dim=0)[0].cpu()
             if self.model.encoder.use_cls_token:
@@ -2078,6 +2079,16 @@ def _validation_due(config: Animal2VecConfig, *, update: int, epoch: int | None 
     return epoch is not None and dataset.validate_interval > 0 and epoch % dataset.validate_interval == 0
 
 
+def _evaluation_autocast(config: Animal2VecConfig, device: torch.device) -> torch.autocast:
+    """Supply Flash's required half precision without changing legacy evaluation."""
+
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=device.type == "cuda" and config.model.attention_backend == "flash",
+    )
+
+
 @torch.inference_mode()
 def _validate(
     model: nn.Module,
@@ -2135,21 +2146,22 @@ def _validate(
         for cpu_batch in loader:
             batch = _move_batch(cpu_batch, device)
             padding = batch.get("padding_mask")
-            if config.stage == "pretrain":
-                output = model(
-                    batch["source"],
-                    sample_ids=batch["id"],
-                    update=update,
-                    padding_mask=padding,
-                )
-            else:
-                output = model(
-                    batch["source"],
-                    target=batch["target"],
-                    sample_ids=batch["id"],
-                    update=update,
-                    padding_mask=padding,
-                )
+            with _evaluation_autocast(config, device):
+                if config.stage == "pretrain":
+                    output = model(
+                        batch["source"],
+                        sample_ids=batch["id"],
+                        update=update,
+                        padding_mask=padding,
+                    )
+                else:
+                    output = model(
+                        batch["source"],
+                        target=batch["target"],
+                        sample_ids=batch["id"],
+                        update=update,
+                        padding_mask=padding,
+                    )
             if output.loss is None:
                 raise ValueError("validation model did not return a loss")
             # Mathematics: validation accumulates summed losses L_k and token
@@ -2159,7 +2171,7 @@ def _validate(
             total_loss += float(output.loss)
             total_sample_size += int(output.sample_size)
             if config.stage == "finetune":
-                scores = torch.sigmoid(output.logits)
+                scores = torch.sigmoid(output.logits.float())
                 targets = output.targets
                 if targets is None:
                     raise ValueError("fine-tuning validation did not return targets")
