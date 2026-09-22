@@ -16,7 +16,7 @@ checkpoint:
 task:
   _name: audio_ccas
   data: /local/datasets/xeno-canto/processed_data_6s_8000Hz/manifests
-  unique_labels: ""
+  unique_labels: "[]"
   # Change feature extractor to account for reduced sample rate in meerkat data
   # 8000Hz / 5 / 2 / 2 / 2 / 1 / 1 / 1 -> Effective encoder output frequency of 200Hz.
   conv_feature_layers: '[(63, 125, 1)] +[(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
