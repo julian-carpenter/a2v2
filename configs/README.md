@@ -15,8 +15,14 @@ comparing a new A2V2 method against the published system:
 | MeerKAT | full-data fine-tuning | `MeerKAT/finetune_mixup_100.yaml` |
 | MeerKAT | 25% fine-tuning | `MeerKAT/finetune_mixup_025.yaml` |
 | MeerKAT | 1% fine-tuning | `MeerKAT/finetune_mixup_001.yaml` |
-| Spotted hyena | base pretraining | `hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml` |
-| Spotted hyena | full-data fine-tuning | `hyenas/finetune_mixup_100.yaml` |
+| HyenaSet | large pretraining | `HyenaSet/a2v_large_pretrain_best.yaml` |
+| HyenaSet | full-data fine-tuning | `HyenaSet/finetune_mixup_100.yaml` |
+| Coati | large pretraining | `Coati/a2v_large_pretrain_best.yaml` |
+| Coati | full-data fine-tuning | `Coati/finetune_mixup_100.yaml` |
+| Sifaka | large pretraining | `Sifaka/a2v_large_pretrain_best.yaml` |
+| Sifaka | full-data fine-tuning | `Sifaka/finetune_mixup_100.yaml` |
+| XenoCanto | large pretraining | `XenoCanto/a2v_large_pretrain_best.yaml` |
+| NIPS4B Plus | full-data fine-tuning | `NIPS4BPLus/finetune_mixup_100.yaml` |
 
 These files define the frozen Animal2Vec 1.0 control baseline. New A2V2
 experiments should not overwrite them or reuse their filenames for changed
