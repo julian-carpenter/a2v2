@@ -22,7 +22,6 @@ comparing a new A2V2 method against the published system:
 | Sifaka | large pretraining | `Sifaka/a2v_large_pretrain_best.yaml` |
 | Sifaka | full-data fine-tuning | `Sifaka/finetune_mixup_100.yaml` |
 | XenoCanto | large pretraining | `XenoCanto/a2v_large_pretrain_best.yaml` |
-| NIPS4B Plus | full-data fine-tuning | `NIPS4BPLus/finetune_mixup_100.yaml` |
 
 These files define the frozen Animal2Vec 1.0 control baseline. New A2V2
 experiments should not overwrite them or reuse their filenames for changed
