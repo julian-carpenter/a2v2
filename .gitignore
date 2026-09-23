@@ -34,3 +34,4 @@ wandb/
 .superpowers
 docs/superpowers
 docs/verification
+scripts/internal
