@@ -2,6 +2,9 @@
 events, misses, false positives, splits, mergers, strict boundaries, overlapping
 classes, and negative clips."""
 
+import subprocess
+import sys
+
 import pytest
 import torch
 
@@ -9,7 +12,55 @@ from a2v2.workflows import (
     SegmentedEvaluation,
     aggregate_segmented_metrics,
     legacy_segmented_evaluation,
+    _best_f1,
 )
+
+
+def test_focal_threshold_search_handles_many_distinct_scores_promptly() -> None:
+    """A quadratic rescan must not stall distributed validation."""
+    subprocess.run(
+        [sys.executable, "-c", """
+import torch
+from a2v2.workflows import _best_f1
+torch.set_num_threads(1)
+scores = torch.arange(100000, dtype=torch.float64) / 100000
+targets = torch.zeros(100000, dtype=torch.long)
+targets[-1] = 1
+assert _best_f1(scores, targets) == (0.99999, 1.0, 1.0, 1.0)
+"""], check=True, timeout=20,
+    )
+
+
+@pytest.mark.parametrize("scores, targets, expected", [
+    ([], [], (1.0, 0.0, 0.0, 0.0)),
+    ([0.9, 0.7, 0.7], [1, 0, 1], (0.7, 0.8, 2 / 3, 1.0)),
+    ([0.9, 0.8, 0.7, 0.6], [0, 1, 0, 1], (0.6, 2 / 3, 0.5, 1.0)),
+    ([0.9, 0.7], [0, 0], (0.9, 0.0, 0.0, 0.0)),
+    ([0.9, 0.8, 0.7, 0.6], [1, 0, 0, 1], (0.9, 2 / 3, 1.0, 0.5)),
+])
+def test_focal_threshold_preserves_ties_and_inclusive_predictions(scores, targets, expected):
+    """Keep inclusive score groups and prefer the highest threshold on F1 ties."""
+    assert _best_f1(torch.tensor(scores, dtype=torch.float64), torch.tensor(targets)) == pytest.approx(expected)
+
+
+def test_focal_threshold_matches_archived_scan_exactly() -> None:
+    """Preserve archived arithmetic and tie-breaking over varied score groups."""
+    for seed in range(20):
+        generator = torch.Generator().manual_seed(seed)
+        scores = torch.randint(0, 30, (257,), generator=generator).float() / 30
+        positive = torch.randint(0, 2, (257,), generator=generator).bool()
+        expected = (float(scores.max()), -1.0, 0.0, 0.0)
+        for threshold in torch.unique(scores).sort(descending=True).values:
+            predicted = scores >= threshold
+            tp = int((predicted & positive).sum())
+            fp = int((predicted & ~positive).sum())
+            fn = int((~predicted & positive).sum())
+            precision = tp / max(tp + fp, 1)
+            recall = tp / max(tp + fn, 1)
+            f1 = 2 * precision * recall / max(precision + recall, 1e-30)
+            if f1 > expected[1]:
+                expected = (float(threshold), f1, precision, recall)
+        assert _best_f1(scores, positive) == expected
 
 
 def test_perfect_event_matches_archived_segment_score_and_iou() -> None:

@@ -756,17 +756,28 @@ def _best_f1(scores: Tensor, targets: Tensor) -> tuple[float, float, float, floa
 
     if scores.numel() == 0:
         return 1.0, 0.0, 0.0, 0.0
-    best = (float(scores.max()), -1.0, 0.0, 0.0)
-    for candidate in torch.unique(scores).sort(descending=True).values:
-        # Mathematics: evaluate every distinct observed score τ using
-        # prediction_i=1[score_i>=τ], then maximize harmonic mean F1.
-        # Interpretation: the selected focal threshold is data-derived and
-        # never depends on an arbitrary threshold grid resolution.
-        predicted = scores >= candidate
-        positive = targets.bool()
-        true_positive = int(torch.count_nonzero(predicted & positive))
-        false_positive = int(torch.count_nonzero(predicted & ~positive))
-        false_negative = int(torch.count_nonzero(~predicted & positive))
+    sorted_scores, order = scores.reshape(-1).sort(descending=True)
+    positive = targets.reshape(-1).bool()[order]
+    cumulative_positive = positive.to(torch.int64).cumsum(0)
+    # Mathematics: at the last row of each equal-score group, cumulative
+    # counts describe exactly prediction_i=1[score_i>=τ]. Sort once instead
+    # of rescanning all N rows at each of U thresholds (O(N*U)).
+    # Interpretation: inclusive thresholds, zero padding, and the highest
+    # threshold on F1 ties remain identical to the archived calculation.
+    group_end = torch.cat([
+        sorted_scores[:-1] != sorted_scores[1:],
+        torch.ones(1, dtype=torch.bool, device=scores.device),
+    ]).nonzero(as_tuple=False).flatten()
+    candidates = sorted_scores[group_end].tolist()
+    true_positives = cumulative_positive[group_end].tolist()
+    predicted_counts = (group_end + 1).tolist()
+    total_positive = int(cumulative_positive[-1])
+    best = (float(sorted_scores[0]), -1.0, 0.0, 0.0)
+    for candidate, true_positive, predicted_count in zip(
+        candidates, true_positives, predicted_counts
+    ):
+        false_positive = predicted_count - true_positive
+        false_negative = total_positive - true_positive
         precision = true_positive / max(true_positive + false_positive, 1)
         recall = true_positive / max(true_positive + false_negative, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-30)
