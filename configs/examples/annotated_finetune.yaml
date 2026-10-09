@@ -1,0 +1,113 @@
+# Researcher tutorial: fine-tuning partner for annotated_pretrain.yaml.
+# This is NOT the frozen paper control. Read docs/configuration-guide.md.
+# KEEP encoder geometry aligned with your pretrained checkpoint. Fields marked
+# TUNE control dataset, optimization, regularization, or evaluation choices.
+
+common:
+  seed: 1  # TUNE: record seeds for repeated supervised trials.
+  fp16: true  # CUDA AMP, false for CPU execution.
+  fp16_init_scale: 1  # Initial loss scale; AMP adjusts it after overflow.
+  min_loss_scale: 1e-6  # Fail when repeated overflows drive the scale below this.
+  log_interval: 100  # Successful optimizer updates between progress records.
+  tensorboard_logdir: tb  # Relative to checkpoint.save_dir.
+  torch_compile: false  # Benchmark after encoder unfreezing before enabling.
+
+checkpoint:
+  save_dir: checkpoints/tutorial_finetune  # TUNE: distinct from pretraining output.
+  save_interval: 1  # Epoch-based checkpoint cadence.
+  save_interval_updates: 500  # Periodic recovery checkpoints.
+  keep_last_epochs: 1  # Retained epoch snapshots, separate from periodic snapshots.
+  best_checkpoint_metric: metrics/finetune/f1  # TUNE: frame F1; segmented_f1 selects events.
+  resume_policy: strict  # Require matching dataset/sampler provenance on resume.
+
+task:
+  data: /path/to/manifests  # TUNE: labeled fold manifests and their annotation paths.
+  sample_rate: 8000  # KEEP: same waveform rate as the pretrained encoder.
+  normalize: true  # KEEP: same waveform preprocessing as pretraining.
+  with_labels: true  # Supervised training uses frame annotations.
+  # TUNE: labels, spelling, and order MUST match your annotation vocabulary.
+  # Each column uses an independent sigmoid, so labels can overlap in time.
+  unique_labels: ['beep', 'synch', 'sn', 'cc', 'ld', 'oth', 'mo', 'al', 'soc', 'agg', 'eating', 'focal']
+  # KEEP: first tuple (127,63,1) = 127 Sinc filters, 63-sample kernel, stride 1.
+  # Remaining tuples specify ordinary convolutions. Product of strides=40.
+  conv_feature_layers: '[(127, 63, 1)] + [(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1000  # TUNE: minimum resampled recording length (125 ms here).
+  max_sample_size: 80000  # TUNE: 10-second training crops at this sample rate.
+  min_label_size: 0  # TUNE: byte filter, not number of events. Keep negatives initially.
+  enable_padding: false  # Crop microbatch items to shortest; true pads to longest.
+
+dataset:
+  num_workers: 8  # TUNE per rank; monitor data-loader throughput/CPU pressure.
+  crop_strategy: stateless  # Exact crop resume, seeded by checkpointed occurrences.
+  max_tokens: 400000  # TUNE: waveform samples/GPU/microbatch, not Transformer frames.
+  required_batch_size_multiple: 1  # No extra recording-count rounding.
+  train_subset: train_0  # TUNE: training manifest basename for the chosen fold.
+  valid_subset: valid_0  # TUNE: disjoint validation manifest; never train on it.
+  disable_validation: false  # Supervised validation selects checkpoint_best.pt.
+  validate_after_updates: 10000  # First validation at the encoder-unfreeze boundary.
+  validate_interval_updates: 5000  # Later validation every 5000 successful updates.
+  validate_interval: 5000  # Suppress frequent epoch-triggered validation.
+
+distributed_training:
+  distributed_world_size: 4  # TUNE: four total training processes for this example.
+  # The trainer selects NCCL for CUDA and Gloo for CPU execution.
+
+criterion:
+  use_focal_loss: true  # TUNE: focal loss discounts easy negatives.
+  focal_alpha: 0.25  # Weighting for positive vs negative class decisions.
+  focal_gamma: 2.0  # Strength of discounting for easy predictions.
+  label_smoothing: 0.0  # Used by BCE when focal loss is disabled.
+  metric_threshold: 0.175  # TUNE on validation: lower raises recall/false positives.
+  method: avg  # TUNE: smooth event probabilities by avg or max temporal pooling.
+  sigma_s: 0.1  # TUNE: pooling duration in seconds (20 frames at 200 Hz).
+  iou_threshold: 0.0  # Strict event matching requires IoU > this value.
+
+optimization:
+  update_freq: [5]  # TUNE: 400000/8000 * 4 * 5 = 1000 nominal seconds/update.
+  max_update: 30000  # TUNE: successful updates; see epoch conversion in the guide.
+  lr: [0.00003]  # TUNE: peak supervised LR; consider unfreezing stability.
+  clip_norm: 1.0  # Global gradient-norm clipping threshold.
+  gradient_clip_method: global  # Keep clipping comparable across experiments.
+
+optimizer:
+  _name: adam  # Fairseq-compatible Adam; other optimizers define new experiments.
+  adam_betas: [0.9, 0.98]  # First/second-moment decay.
+  adam_eps: 1e-8  # Denominator stabilization.
+  weight_decay: 0.0  # TUNE regularization against validation performance.
+  weight_decay_schedule: constant  # cosine optionally anneals to weight_decay_end.
+
+lr_scheduler:
+  warmup_updates: 2000  # TUNE: successful updates until peak LR.
+  warmup_init_lr: 1e-10  # LR at start of supervised training.
+  min_lr: 5e-6  # Final cosine LR at max_update.
+
+model:
+  w2v_path: checkpoints/tutorial_pretrain/checkpoint_last.pt  # TUNE: trusted native encoder checkpoint.
+  freeze_finetune_updates: 10000  # TUNE: classifier-only phase before Transformer updates.
+  feature_grad_mult: 0.0  # 0 freezes local Sinc/convolutions; >0 scales their gradients.
+  average_top_k_layers: 16  # Average last K encoder layers for frame classification.
+  classification_head: frame  # frame for event timing; cls for sequence presence.
+  use_cls_token: false  # KEEP aligned with pretrained architecture.
+  position_encoding: legacy  # KEEP aligned with pretrained positional strategy.
+  attention_backend: legacy  # ALiBi uses manual attention; RoPE can use flash.
+  ffn_type: mlp  # KEEP: GEGLU requires a compatible pretrained checkpoint.
+  initialization: legacy  # Loaded weights define encoder initialization.
+  checkpoint_activations: false  # Optional training memory/recompute tradeoff.
+  apply_mask: true  # TUNE: apply supervised time/channel masks during training.
+  mask_prob: 0.825  # Time span-count parameter, evaluated on the feature grid.
+  mask_length: 4  # Length of time-mask spans in feature frames (20 ms here).
+  mask_channel_prob: 0.5  # Span-count parameter along embedding channels.
+  mask_channel_length: 64  # Number of channels per channel-mask span.
+  dropout: 0.1  # TUNE: shared encoder residual regularization.
+  dropout_input: 0.0  # Feature-input dropout before contextual encoding.
+  activation_dropout: 0.1  # Dropout within the FFN.
+  attention_dropout: 0.2  # Attention-weight dropout during supervised training.
+  final_dropout: 0.0  # Dropout before the classifier.
+  layerdrop: 0.1  # Randomly skip shared Transformer layers in training.
+  drop_path: 0.0  # Residual stochastic-depth rate during fine-tuning.
+  target_mixup: true  # Mix frame targets with the same ratio as waveforms.
+  source_mixup: 0.5  # Lower bound of mixing ratio sampled from [0.5,1].
+  mixup_prob: 1.0  # Fraction of eligible batches receiving mixup.
+  same_mixup: true  # Share one mixing ratio across the microbatch.
+  mixing_window_length: 0.05  # Gain-estimation window in seconds.
+  gain_mode: A_weighting  # Loudness-aware mixing gains.

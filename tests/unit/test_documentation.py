@@ -34,10 +34,24 @@ YAML_HASHES = {
         "fe6a83820aea9b9c9b0f47e3375ce682cc281d5bcd8e9f29522056cb49adf3d7",
     "configs/cpu_smoke_pretraining.yaml":
         "9f25841c8e6ee848f043a2fcf87d5f2ab0f6bcae3b51895f74e1d5827e4292f9",
-    "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml":
-        "5398ae35c32452694f624bbd7df90eadfee74e118de51dcb1d7c74d172f0f59f",
-    "configs/hyenas/finetune_mixup_100.yaml":
-        "7b657777801b20fdef164a714def35677be579b7cbbd8bca3cbbd16cf96a9681",
+    "configs/HyenaSet/a2v_large_pretrain_best.yaml":
+        "33cac66a84b657a5b3b628da227072e6b2dc59b4024d49282dd09fa8be54b359",
+    "configs/HyenaSet/finetune_mixup_100.yaml":
+        "0e90585c8d5faff05d40c16c4de2db2d1a821a0de35150c0caedcc93f6b3ff66",
+    "configs/Coati/a2v_large_pretrain_best.yaml":
+        "49384d797298002c3e03ab2822a7335fdff08a63a52893626f98c554ae36f6dd",
+    "configs/Coati/finetune_mixup_100.yaml":
+        "85a6d060418cc64d038f4c7b1870d2fb7a950b8b5e7be491e8f30ea16d6dda36",
+    "configs/Sifaka/a2v_large_pretrain_best.yaml":
+        "bdc43aaf8cac55fe641a2f9136341b2a9f011fd6f3740b1c192525cf8f3f13f2",
+    "configs/Sifaka/finetune_mixup_100.yaml":
+        "d16df0b182a83c4a9417c60ce79bf0d1c4451f6341ffc908a0e78c7e9d3f95b4",
+    "configs/XenoCanto/a2v_base_pretrain_best.yaml":
+        "fe514d8b45eb084651b47709b6c7a010cb203c8b2e0a72cdc30523b58eaabc84",
+    "configs/examples/annotated_pretrain.yaml":
+        "9cdef1cbb033e2fe868087c965e8b2fa6988345dd33aab53dc067fbabb5511a5",
+    "configs/examples/annotated_finetune.yaml":
+        "24a37073d0d00d8f4b3bf1be76008a053f2c7bc1102199ecaefdbaa7bfb6aa55",
     "configs/modern/rope_cls_geglu_finetune.yaml":
         "d0bb4b2ef448439a2fd6f2a757cbcbd92c5d454bbe450fddad76c9d29ce57ba7",
     "configs/modern/rope_cls_geglu_pretrain.yaml":
@@ -53,14 +67,11 @@ IGNORED_RECIPE_PATHS = {
     "common.log_format",
     "common.fp16_no_flatten_grads",
     "common.all_gather_list_size",
-    "checkpoint.keep_last_epochs",
     "task._name",
     "task.verbose_tensorboard_logging",
     "dataset.skip_invalid_size_inputs_valid_test",
     "distributed_training.ddp_backend",
     "criterion._name",
-    "criterion.use_focal_loss",
-    "criterion.label_smoothing",
     "criterion.maxfilt_s",
     "criterion.max_duration_s",
     "criterion.lowP",
@@ -151,6 +162,10 @@ def test_checked_in_recipes_exclude_ignored_legacy_options() -> None:
 
     violations: list[str] = []
     for relative in YAML_HASHES:
+        # These user-restored archives intentionally retain Fairseq wrappers.
+        if relative.startswith(("configs/HyenaSet/", "configs/Coati/",
+                                "configs/Sifaka/", "configs/XenoCanto/")):
+            continue
         values = yaml.safe_load((ROOT / relative).read_text(encoding="utf-8"))
         pending: list[tuple[tuple[str, ...], object]] = [((), values)]
         while pending:
@@ -168,6 +183,35 @@ def test_checked_in_recipes_exclude_ignored_legacy_options() -> None:
         "Checked-in recipes contain ignored legacy options:\n"
         + "\n".join(sorted(violations))
     )
+
+
+def test_annotated_examples_load_and_match_documented_batch_geometry() -> None:
+    """Execute both tutorial configs and verify their nominal audio budget."""
+
+    from math import prod
+    from a2v2.config import load_config
+
+    pretrain = load_config(ROOT / "configs/examples/annotated_pretrain.yaml")
+    finetune = load_config(ROOT / "configs/examples/annotated_finetune.yaml")
+    assert pretrain.stage == "pretrain"
+    assert finetune.stage == "finetune"
+    for config in (pretrain, finetune):
+        assert config.dataset.max_tokens / config.task.sample_rate * (
+            config.distributed.requested_world_size
+        ) * config.optimization.update_freq[0] == 1000
+        assert config.task.sample_rate / prod(
+            layer[2] for layer in config.task.conv_feature_layers
+        ) == 200
+    assert pretrain.task.conv_feature_layers == finetune.task.conv_feature_layers
+
+
+def test_inference_guide_fusion_example_executes() -> None:
+    """Execute the guide's standalone example without model or audio assets."""
+
+    guide = (ROOT / "docs/inference-guide.md").read_text(encoding="utf-8")
+    examples = re.findall(r"```python\n(.*?)```", guide, re.DOTALL)
+    standalone = next(example for example in examples if "assert len(events)" in example)
+    exec(compile(standalone, "docs/inference-guide.md", "exec"), {})
 
 
 def _shell_fences(markdown: str) -> list[str]:
@@ -395,6 +439,8 @@ def test_task11_relative_markdown_links_resolve() -> None:
         "docs/code-guide.md",
         "docs/reproducing-paper.md",
         "docs/slurm.md",
+        "docs/configuration-guide.md",
+        "docs/inference-guide.md",
     ):
         _assert_relative_links_resolve(ROOT / relative)
 

@@ -660,6 +660,15 @@ The runner selects precision from the encoder's pretraining config, even if
 the active fine-tuning config names a different attention backend.
 The legacy attention path retains its evaluation precision.
 
+`run_tensor(..., overlap_seconds=0.0, overlap_method="mean")` optionally
+overlaps windows. Positive overlap aligns starts to the frontend stride;
+duplicate frame probabilities are averaged or maximized before event voting
+and thresholding. Duplicate embeddings are averaged, while CLS rows remain
+per window. The default disjoint path is unchanged. See the
+[inference guide](inference-guide.md) for examples and `fuse_probabilities`
+argument provenance, and the [configuration guide](configuration-guide.md)
+for annotated recipes, Sinc geometry, and batch/epoch calculations.
+
 `InferenceResult` exposes CPU tensors with two distinct time axes:
 
 | Field | Shape and availability |
@@ -677,7 +686,8 @@ even if the caller supplies `False`. A pretraining CLS regression head is not
 a class predictor; a frame classifier also does not supply CLS predictions.
 CLS rows follow segment order, with one row for the short final segment as
 well. Frame timestamps do not describe CLS rows. Segment `i` starts at
-`i * round(segment_seconds * target_rate) / target_rate`; its end is bounded
+`i * step_samples / target_rate`, where `step_samples` is the window length
+without overlap or the stride-aligned hop with overlap; its end is bounded
 by the recording duration. A segment may have a CLS row even if timestamp
 trimming removes all its frame rows.
 
@@ -848,7 +858,7 @@ torchrun --standalone --nproc-per-node=4 \
   --output-dir results/gpu_reverification/resume-4
 ```
 
-The report in `gpu-verification-20260723.md` records the official checkpoint,
+The [archived GPU report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md) records the official checkpoint,
 FP32, FP16, gradient, optimizer-update, NCCL, memory, and exact-resume evidence
 for the implementation before file consolidation. The consolidation preserved
 function bodies and state signatures. A GPU agent should rerun the durable

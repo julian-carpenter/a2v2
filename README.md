@@ -8,7 +8,7 @@ conversion, long-recording inference, event evaluation, mixed precision,
 distributed training, and native checkpoint resume without Fairseq. See the
 opt-in strict policy below for exact data-path resume.
 
-The published recipes under `configs/MeerKAT/` and `configs/hyenas/` are
+The published recipes under `configs/MeerKAT/` are
 **Animal2Vec 1.0 reproduction baselines**. They are frozen controls intended
 for reproducing the original paper and comparing future A2V2 methods against
 it; they are not configurations for a new method called Animal2Vec 2.0. The
@@ -27,7 +27,7 @@ under the same project identity without renaming the Animal2Vec 1.0 control.
 > publisher release does not include authoritative split manifests. Full paper
 > training and all paper metrics have not been completed. The paper has
 > **not** been reproduced. See
-> [the complete A100 report](docs/gpu-verification-20260723.md).
+> [the complete A100 report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md).
 
 ## Contents
 
@@ -134,7 +134,7 @@ b1be8d45eaf9307458dafad9902ada0422a8da52
 
 It also includes the narrow working-tree corrections and durable tests produced
 during A100 verification. Those corrections are itemized in
-[the GPU verification report](docs/gpu-verification-20260723.md), which also
+[the GPU verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md), which also
 records the original commit, complete diff provenance, environment locks, GPU
 UUIDs, test results, checkpoint hashes, and first-divergence investigations.
 
@@ -351,7 +351,11 @@ animal2vec2.0/
 ├── configs/
 │   ├── README.md
 │   ├── MeerKAT/
-│   ├── hyenas/
+│   ├── HyenaSet/
+│   ├── Coati/
+│   ├── Sifaka/
+│   ├── XenoCanto/
+│   ├── examples/
 │   ├── modern/
 │   ├── cpu_smoke_pretraining.yaml
 │   └── cpu_smoke_finetuning.yaml
@@ -360,11 +364,8 @@ animal2vec2.0/
 │   ├── slurm.md
 │   ├── checkpoint-conversion.md
 │   ├── reproducing-paper.md
-│   ├── gpu-verification-20260723.md
-│   ├── refactoring-design.md
-│   ├── refactoring-plan.md
-│   ├── documentation-design.md
-│   └── documentation-plan.md
+│   ├── configuration-guide.md
+│   └── inference-guide.md
 ├── scripts/
 │   ├── audit_meerkat_dataset.py
 │   └── audit_meerkat_manifests.py
@@ -495,7 +496,7 @@ script to `torchrun`, as shown below.
 
 ### Verified A100 environment
 
-The [A100 verification report](docs/gpu-verification-20260723.md) records the
+The [A100 verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md) records the
 exact CPython build, CUDA wheel, package freezes, GPU allocation, NCCL
 topology, checkpoint hashes, and measured memory. The
 [code guide](docs/code-guide.md) lists the GPU tests that should run after a
@@ -906,7 +907,7 @@ Move only the resulting plain file into the native environment and run the same
 conversion command against it. Fairseq, Hydra, and OmegaConf are not needed
 again after this boundary.
 
-The [GPU verification report](docs/gpu-verification-20260723.md) records the
+The [GPU verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md) records the
 exact isolated legacy environment used for the official exports. That
 environment is external to this standalone native source tree.
 
@@ -974,7 +975,7 @@ For mapping details and failure handling, read
 | Dataset/profile | Recipe |
 | --- | --- |
 | Published MeerKAT large pretraining | `configs/MeerKAT/a2v_large_pretrain_best.yaml` |
-| Published spotted-hyena example | `configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml` |
+| Published spotted-hyena example | `configs/HyenaSet/a2v_large_pretrain_best.yaml` |
 | Tiny CPU plumbing check | `configs/cpu_smoke_pretraining.yaml` |
 
 The published MeerKAT model uses:
@@ -1560,6 +1561,17 @@ The reduction includes all output classes, including auxiliary classes such
 as `focal`. It does not add the ability to recognize sounds outside the
 model's learned classes. Tune the threshold for your corpus and voting mode.
 
+### Overlapping inference windows
+
+Use `runner.run_tensor(waveform, sample_rate, overlap_seconds=1.0,
+overlap_method="mean")` to overlap ten-second windows. `"max"` is also
+available. The runner merges probabilities on a shared frame grid before
+class voting, smoothing, and thresholding, and averages duplicate frame
+embeddings. CLS outputs remain per window. Zero overlap preserves the default.
+The CLI accepts `--overlap-seconds` and `--overlap-method`.
+See [inference windows and event fusion](docs/inference-guide.md) for timing,
+partial windows, and the sources of all `fuse_probabilities` arguments.
+
 ### Empty and very short recordings
 
 An empty input returns zero-row tensors for available outputs. Unavailable or
@@ -1704,15 +1716,18 @@ world size. Changing it is a different experiment and is not an exact resume.
 
 ### Checked-in recipes
 
-The repository contains eight YAML files:
+See the [configuration inventory](configs/README.md) for corpus and modern
+recipes. The [annotated pretraining](configs/examples/annotated_pretrain.yaml)
+and [annotated fine-tuning](configs/examples/annotated_finetune.yaml) examples
+explain parameters in place. The [tuning guide](docs/configuration-guide.md)
+explains Sinc tuples, `max_tokens × world_size × update_freq / sample_rate`,
+and epoch-based update budgets. The main paper and CPU controls are:
 
 ```text
 configs/MeerKAT/a2v_large_pretrain_best.yaml
 configs/MeerKAT/finetune_mixup_100.yaml
 configs/MeerKAT/finetune_mixup_025.yaml
 configs/MeerKAT/finetune_mixup_001.yaml
-configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml
-configs/hyenas/finetune_mixup_100.yaml
 configs/cpu_smoke_pretraining.yaml
 configs/cpu_smoke_finetuning.yaml
 ```
@@ -1849,7 +1864,7 @@ Official same-GPU comparisons passed:
 
 The production-topology pretraining and 100% fine-tuning stop/continuous/resume
 burn-ins were recursively bitwise exact after normalizing only the output
-directory. Read [docs/gpu-verification-20260723.md](docs/gpu-verification-20260723.md)
+directory. Read [Archived A100 verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md)
 for tolerances, per-rank memory, hashes, first divergences, rejected DDP
 experiments, and the precise scope of every claim.
 
@@ -1860,10 +1875,10 @@ experiments, and the precise scope of every claim.
 | [Code guide](docs/code-guide.md) | You want a reading order, data-flow trace, or old-to-new import map |
 | [Checkpoint conversion](docs/checkpoint-conversion.md) | You are converting official or custom Fairseq weights |
 | [Paper reproduction](docs/reproducing-paper.md) | You are preparing manifests and full training/evaluation runs |
-| [Final A100 report](docs/gpu-verification-20260723.md) | You need current evidence, outcomes, defects, hashes, memory, commands, and blockers |
-| [Refactor design](docs/refactoring-design.md) | You need the rationale and compatibility boundary for the flat package |
-| [Documentation design](docs/documentation-design.md) | You need the scope and accuracy rules for source explanations |
-| [Documentation plan](docs/documentation-plan.md) | You need the file-by-file execution and verification checklist |
+| [Final A100 report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md) | You need current evidence, outcomes, defects, hashes, memory, commands, and blockers |
+| [Refactor design](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/refactoring-design.md) | You need the rationale and compatibility boundary for the flat package |
+| [Documentation design](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/documentation-design.md) | You need the scope and accuracy rules for source explanations |
+| [Documentation plan](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/documentation-plan.md) | You need the file-by-file execution and verification checklist |
 
 The A100 report describes the pre-refactor file paths used during verification.
 Its opening note links those paths to the current flat modules.
@@ -2071,14 +2086,14 @@ unchanged while resuming.
 - Full-manifest event outputs and paper aggregation.
 
 Only after Gate G described in the
-[GPU verification report](docs/gpu-verification-20260723.md) passes should a
+[GPU verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md) passes should a
 report say that the paper was reproduced.
 
 For the exact procedure, target values, environment capture, data provenance,
 and acceptance gates, read:
 
 1. [docs/reproducing-paper.md](docs/reproducing-paper.md); and
-2. [docs/gpu-verification-20260723.md](docs/gpu-verification-20260723.md).
+2. [Archived A100 verification report](https://github.com/julian-carpenter/a2v2/blob/bad5463fea0687397eaf42b53551d605cdafda30/docs/gpu-verification-20260723.md).
 
 ## Citation and license
 

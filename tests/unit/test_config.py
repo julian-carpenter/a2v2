@@ -159,13 +159,15 @@ def test_modern_example_configs_select_compatible_architecture_and_policies() ->
 def test_published_recipes_and_local_reproduction_driver_keep_frozen_hashes() -> None:
     """Reject edits to the published controls while modern examples evolve."""
 
+    # MeerKAT and its driver retain their original guards. HyenaSet hashes
+    # track the user-restored archive replacing the deleted configs/hyenas pair.
     expected = {
         "configs/MeerKAT/a2v_large_pretrain_best.yaml": "c5eb23d979cd12704f0dd3977fac1b6031cb4cbf7d5868930eaa6c2816f36a29",
         "configs/MeerKAT/finetune_mixup_001.yaml": "384eed9a25da913258e618425c9526cffdaccdacc2a16f912f8e1719fe15a9e0",
         "configs/MeerKAT/finetune_mixup_025.yaml": "31daab6409907238af025a480bf236fd2bb82fdd9442a9a1e4d3b0552e0d3f4a",
         "configs/MeerKAT/finetune_mixup_100.yaml": "c31c2a3df37d2397ae2cd7cbc502aa849bd819af5ac35f9ff930ab35fb192fd0",
-        "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml": "6a40999452b56e95834d2487860ddc11974c9840b9814eafec1f21468de09102",
-        "configs/hyenas/finetune_mixup_100.yaml": "f892d0f9bb52a823a1fe4bcd168aab33a29cbd6bcc395ce0822525b6bc3c07ca",
+        "configs/HyenaSet/a2v_large_pretrain_best.yaml": "28606827b90f8f9ab85b6f7b4d10df84961efaabdcdded65c44b8cbfb5843711",
+        "configs/HyenaSet/finetune_mixup_100.yaml": "cc13f0d4701eb7ece42bba2a90882ff8bf21c827551673482251a3547b7a2bcf",
         "scripts/reproduce_meerkat_paper.sh": "485b4b36fe1045174a392834bd9ee9848538ab496944631a0b2d514e22d4de18",
     }
 
@@ -180,7 +182,7 @@ def test_modern_options_default_to_legacy_and_round_trip() -> None:
     """Keep checked-in recipes on their frozen legacy configuration path."""
 
     recipe_paths = sorted((ROOT / "configs/MeerKAT").glob("*.yaml")) + sorted(
-        (ROOT / "configs/hyenas").glob("*.yaml")
+        (ROOT / "configs/HyenaSet").glob("*.yaml")
     )
     assert recipe_paths
 
@@ -504,7 +506,7 @@ def test_loads_meerkat_pretraining_recipe() -> None:
 def test_loads_hyena_finetuning_recipe_and_overrides() -> None:
     """Check loads hyena finetuning recipe and overrides."""
     cfg = load_config(
-        ROOT / "configs/hyenas/finetune_mixup_100.yaml",
+        ROOT / "configs/HyenaSet/finetune_mixup_100.yaml",
         overrides=("model.depth=3", "task.data=/tmp/manifests"),
     )
 

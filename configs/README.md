@@ -1,10 +1,11 @@
 # Configuration families
 
-The checked-in experiment recipes fall into two groups.
+The checked-in experiment recipes include paper controls, corpus archives,
+annotated tutorials, smoke tests, and opt-in modern examples.
 
 ## Animal2Vec 1.0 reproduction baselines
 
-The files under `MeerKAT/` and `hyenas/` preserve the architecture, objectives,
+The files under `MeerKAT/` preserve the architecture, objectives,
 optimization settings, masking, mixup, and training schedules released for
 Animal2Vec 1.0. Use these recipes when reproducing the original paper or
 comparing a new A2V2 method against the published system:
@@ -21,11 +22,23 @@ comparing a new A2V2 method against the published system:
 | Coati | full-data fine-tuning | `Coati/finetune_mixup_100.yaml` |
 | Sifaka | large pretraining | `Sifaka/a2v_large_pretrain_best.yaml` |
 | Sifaka | full-data fine-tuning | `Sifaka/finetune_mixup_100.yaml` |
-| XenoCanto | large pretraining | `XenoCanto/a2v_large_pretrain_best.yaml` |
+| XenoCanto | base pretraining | `XenoCanto/a2v_base_pretrain_best.yaml` |
 
-These files define the frozen Animal2Vec 1.0 control baseline. New A2V2
+The MeerKAT files define the frozen Animal2Vec 1.0 control baseline. New A2V2
 experiments should not overwrite them or reuse their filenames for changed
 methods.
+
+The other corpus directories retain archived Fairseq-compatible recipes;
+their compatibility fields are not examples of the compact native format.
+
+## Annotated examples and tuning
+
+Start with [annotated pretraining](examples/annotated_pretrain.yaml) and
+[annotated fine-tuning](examples/annotated_finetune.yaml) for parameter comments.
+The [experiment configuration guide](../docs/configuration-guide.md) explains
+Sinc filterbank tuples, audio-seconds per optimizer update, GPU budget tuning,
+and deriving `max_update` from a desired epoch count. These are tutorials,
+not replacement paper controls.
 
 ## What belongs in a native recipe
 
@@ -46,9 +59,7 @@ fields that the new runtime does not consume:
 - criterion log-key, report, and segmentation switches;
 - Canny-only event parameters, because the native baseline supports the
   paper's average and maximum pooling methods;
-- inactive model flags that never reach the rewritten forward pass; and
-- `keep_last_epochs`, because the native trainer never performs destructive
-  checkpoint retention.
+- inactive model flags that never reach the rewritten forward pass.
 
 The pretraining recipes also express Adam and cosine scheduling directly.
 Their former `optimizer: composite` wrapper represented one Fairseq parameter

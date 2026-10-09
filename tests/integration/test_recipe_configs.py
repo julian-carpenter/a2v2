@@ -13,7 +13,7 @@ from a2v2.config import load_config
 ROOT = Path(__file__).parents[2]
 
 
-@pytest.mark.parametrize("path", sorted((ROOT / "configs/MeerKAT").glob("*.yaml")) + sorted((ROOT / "configs/hyenas").glob("*.yaml")))
+@pytest.mark.parametrize("path", sorted((ROOT / "configs/MeerKAT").glob("*.yaml")) + sorted((ROOT / "configs/HyenaSet").glob("*.yaml")))
 def test_every_published_recipe_loads(path: Path) -> None:
     """Check every published recipe loads."""
     config = load_config(path)
@@ -39,7 +39,7 @@ def test_cpu_smoke_profiles_load_with_tiny_architecture() -> None:
     assert finetune.model.average_top_k_layers == 2
 
 
-def test_hyena_pretraining_recipe_retains_unlabeled_manifest_rows(
+def test_meerkat_pretraining_recipe_retains_unlabeled_manifest_rows(
     tmp_path: Path,
 ) -> None:
     """Do not apply the supervised label-file-size filter to pretraining."""
@@ -49,12 +49,12 @@ def test_hyena_pretraining_recipe_retains_unlabeled_manifest_rows(
     (audio_root / "recording.wav").touch()
     manifest = tmp_path / "pretrain.tsv"
     manifest.write_text(
-        f"{audio_root}\nrecording.wav\t24000\n",
+        f"{audio_root}\nrecording.wav\t240000\n",
         encoding="utf-8",
     )
     config = load_config(
         ROOT
-        / "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml"
+        / "configs/MeerKAT/a2v_large_pretrain_best.yaml"
     )
 
     dataset = AudioDataset(

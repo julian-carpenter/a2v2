@@ -1,0 +1,153 @@
+# Researcher tutorial: a MeerKAT-shaped pretraining example, NOT a paper recipe.
+# Read docs/configuration-guide.md before tuning. Labels marked TUNE are the
+# first choices for a new corpus; KEEP fields define checkpoint architecture.
+# This example budgets 1000 audio-seconds/update on FOUR GPUs. It illustrates
+# configuration, not a promise that this batch fits your accelerator.
+
+common:
+  seed: 1  # TUNE for repeated trials; archive it with the dataset/split.
+  fp16: true  # CUDA AMP; use false on CPU. Do not change a paper control.
+  fp16_init_scale: 1  # Initial gradient scale; AMP adjusts it on overflow.
+  min_loss_scale: 1e-6  # Fail if repeated overflow drives scaling below this.
+  log_interval: 100  # Successful optimizer updates between training summaries.
+  tensorboard_logdir: tb  # Relative to checkpoint.save_dir; archive these logs.
+  torch_compile: false  # Optional speed optimization; benchmark warm-up/resume.
+  torch_compile_backend: inductor  # Compiler backend when torch_compile=true.
+  torch_compile_mode: default  # Start here; other modes can use more memory.
+  torch_compile_fullgraph: false  # true diagnoses graph breaks, not a speed guarantee.
+  torch_compile_dynamic: true  # Allow varying retained-token shapes when compiling.
+
+checkpoint:
+  save_dir: checkpoints/tutorial_pretrain  # TUNE: unique directory per experiment.
+  save_interval: 1  # Save at completed epoch boundaries.
+  save_interval_updates: 500  # Also save periodically for interruption recovery.
+  keep_last_epochs: 1  # Retention of epoch checkpoints; periodic files are separate.
+  best_checkpoint_metric: loss  # No validation below; not used to select a model.
+  resume_policy: strict  # Require dataset/sampler provenance for exact resume.
+
+task:
+  data: /path/to/manifests  # TUNE: directory containing pretrain.tsv and audio paths.
+  sample_rate: 8000  # TUNE per corpus, then KEEP across pretraining/fine-tuning.
+  normalize: true  # Zero-mean/unit-variance waveform normalization.
+  with_labels: false  # Pretraining uses unlabeled audio, not event annotations.
+  unique_labels: []  # A pretraining encoder does not have a class vocabulary.
+  # KEEP: each tuple is (output channels, kernel samples, stride samples).
+  # With sinc_input=true the FIRST tuple (127,63,1) defines the Sinc filterbank:
+  # 127 learned bandpass filters, each 63 samples wide, evaluated every sample.
+  # Sinc requires an odd kernel. 63/8000 = 7.875 ms; this is NOT the entire
+  # frontend receptive field. Subsequent tuples are ordinary convolutions.
+  # Stride product=40, giving a 5-ms output hop at 8000 Hz (200 frames/s).
+  conv_feature_layers: '[(127, 63, 1)] + [(512, 10, 5)] + [(512, 3, 2)] * 3 + [(512, 3, 1)] + [(512, 2, 1)] * 2'
+  min_sample_size: 1  # TUNE: discard shorter recordings, in resampled audio samples.
+  max_sample_size: 80000  # TUNE: crop training windows to 10 seconds at 8000 Hz.
+  min_label_size: 0  # KEEP 0 for unlabeled rows; >0 requires a label file even here.
+  enable_padding: false  # Crop each microbatch to its shortest item; true pads.
+
+dataset:
+  num_workers: 8  # TUNE per rank. Total loader workers = ranks * this value.
+  crop_strategy: stateless  # Checkpointed occurrence seeds make resume deterministic.
+  train_subset: pretrain  # Basename of the training manifest (without .tsv).
+  valid_subset: valid_0  # Unused here because pretraining validation is disabled.
+  max_tokens: 400000  # TUNE: raw-audio sample budget per GPU per microbatch.
+  required_batch_size_multiple: 1  # Avoid rounding recording count to a larger multiple.
+  disable_validation: true  # Teacher/student regression uses training summaries.
+  validate_interval: 1  # Epoch validation cadence, inactive with disable_validation.
+  validate_interval_updates: 0  # 0 disables successful-update-based validation.
+  validate_after_updates: 0  # Optional first-validation update, inactive here.
+
+distributed_training:
+  distributed_world_size: 4  # TUNE: TOTAL processes across all nodes, not nodes.
+  # The trainer selects NCCL for CUDA and Gloo for CPU execution.
+
+optimization:
+  update_freq: [5]  # TUNE: five microbatches/rank per optimizer update.
+  # Nominal seconds/update = 400000/8000 * 4 * 5 = 1000.
+  # TUNE max_update from actual sampler length and desired epochs. 100000 is
+  # illustrative: 100 epochs of 1,000,000 retained seconds at 1000 s/update.
+  max_update: 100000
+  lr: [0.0001]  # TUNE: peak LR; compare validation after fine-tuning, not loss alone.
+  clip_norm: 1.0  # Maximum global gradient L2 norm; protects against spikes.
+  gradient_clip_method: global  # global baseline; none/adagc are separate experiments.
+  adagc_beta: 0.99  # Inactive here: EMA decay of parameter-wise norm history.
+  adagc_relative_clip: 1.04  # Inactive: allowed norm/history ratio after AdaGC warm-up.
+  adagc_warmup_updates: 100  # Inactive: successful updates of global clipping first.
+
+optimizer:
+  _name: adam  # Fairseq-compatible Adam; adamw/8-bit variants change the experiment.
+  adam_betas: [0.9, 0.98]  # Momentum/second-moment decay, each strictly below 1.
+  adam_eps: 1e-6  # Denominator stabilization, important with small gradients.
+  weight_decay: 0.01  # TUNE: regularization; evaluate generalization, not training loss.
+  weight_decay_schedule: constant  # cosine is an optional annealing experiment.
+  weight_decay_end: null  # Inactive for constant; cosine null means an endpoint of 0.
+  min_8bit_size: 4096  # Inactive: 8-bit optimizers keep smaller state tensors in FP32.
+
+lr_scheduler:
+  warmup_updates: 10000  # TUNE jointly with max_update; start below the total budget.
+  warmup_init_lr: 0.0  # LR at update zero; warm-up increases it to optimization.lr.
+  min_lr: 0.0  # Cosine-decay endpoint at max_update.
+
+model:
+  depth: 16  # KEEP: number of shared Transformer blocks; more depth costs compute.
+  embed_dim: 1024  # KEEP: representation width; must be divisible by num_heads.
+  num_heads: 16  # KEEP: 64 channels/head here; RoPE needs an even head width.
+  mlp_ratio: 4.0  # KEEP: FFN hidden width relative to embed_dim.
+  clone_batch: 12  # TUNE: masked student views/audio item. Multiplies student work,
+                   # not the unique-audio seconds in the batch-size formula.
+  average_top_k_layers: 16  # TUNE: average the last K layers for targets/features.
+  ema_decay: 0.9997  # Teacher starts as this EMA of successful student updates.
+  ema_end_decay: 1.0  # Teacher EMA endpoint; larger means slower teacher changes.
+  ema_anneal_end_step: 100000  # TUNE to successful-update budget for this experiment.
+  instance_norm_target_layer: true  # Normalize each teacher layer over time.
+  layer_norm_target_layer: false  # Optional per-layer channel normalization.
+  layer_norm_targets: false  # Optional channel normalization after layer averaging.
+  layerdrop: 0.0  # Randomly skip shared blocks during training; 0 uses all blocks.
+  norm_eps: 1e-5  # Numerical epsilon for normalization layers.
+  norm_affine: true  # KEEP: learn normalization scale and bias.
+  layer_norm_first: false  # KEEP: changes shared Transformer normalization order.
+  end_of_block_targets: false  # Choose archived FFN targets instead of block outputs.
+  encoder_dropout: 0.1  # Shared attention/residual dropout in pretraining.
+  post_mlp_drop: 0.1  # Dropout after the shared FFN projection.
+  start_drop_path_rate: 0.0  # Shared residual stochastic-depth rate in first block.
+  end_drop_path_rate: 0.0  # Shared residual stochastic-depth rate in last block.
+  source_mixup: 0.5  # TUNE: mix ratio sampled from [0.5,1], not the mix probability.
+  mixup_prob: 1.0  # Fraction of eligible training batches that receive source mixup.
+  same_mixup: true  # Share one mixing ratio across items in a microbatch.
+  mixing_window_length: 0.05  # Seconds per gain-estimation window (50 ms).
+  gain_mode: A_weighting  # Perceived-loudness gains; alternatives are naive_rms/none.
+  target_mixup: false  # Pretraining does not mix supervised labels.
+  loss_beta: 0.0  # 0 selects squared regression; >0 uses smooth-L1 beta.
+  loss_scale: null  # null uses the archived representation-dimension scaling.
+  checkpoint_activations: false  # TUNE if memory-bound; trades memory for recomputation.
+  position_encoding: legacy  # KEEP: respects audio.use_alibi_encoder below.
+  attention_backend: legacy  # KEEP: manual ALiBi; rope/none can use sdpa or flash.
+  rope_theta: 10000.0  # Inactive here: frequency base for an optional RoPE encoder.
+  use_cls_token: false  # KEEP: optional CLS adds parameters and a regression target.
+  cls_loss_weight: 1.0  # Inactive: weight of the optional pretraining CLS regression.
+  classification_head: frame  # Fine-tuning frame localization; cls is sequence-level.
+  ffn_type: mlp  # KEEP: geglu changes parameter shapes and checkpoint compatibility.
+  initialization: legacy  # KEEP: deepscale_lm also changes residual equations.
+  modalities:
+    audio:
+      sinc_input: true  # KEEP: first convolution tuple defines Sinc bandpass filters.
+      apply_window_to_root: false  # Sinc tapering option; retain for matched comparisons.
+      use_pswish: true  # KEEP: use learnable PSwish frontend activations.
+      sinc_norm: layer_norm  # KEEP: normalization after the first filterbank.
+      conv_pos_depth: 5  # KEEP: convolutional positional-network depth.
+      conv_pos_width: 95  # KEEP: positional convolution kernel in feature frames.
+      conv_pos_groups: 16  # KEEP: grouped positional convolutions, dividing embed_dim.
+      prenet_depth: 8  # KEEP: Transformer blocks before the shared stack.
+      prenet_dropout: 0.1  # Prenet dropout during training, disabled in inference.
+      prenet_layerdrop: 0.0  # Fraction of prenet blocks randomly skipped in training.
+      mask_prob: 1.5  # TUNE: archived span-count parameter; NOT a probability capped at 1.
+      mask_length: 2  # TUNE: span length in feature frames; inspect realized masking.
+      mask_noise_std: 0.01  # Gaussian noise at masked feature locations.
+      mask_dropout: 0.0  # Optional extra masked positions beyond span generation.
+      use_alibi_encoder: true  # KEEP for legacy position mode; disable with RoPE.
+      learned_alibi_scale: true  # KEEP: train ALiBi bias scales.
+      learned_alibi_scale_per_head: true  # KEEP: one learned scale per attention head.
+      decoder:
+        input_dropout: 0.1  # Reconstruction decoder input regularization.
+        decoder_dim: 768  # KEEP during pretraining/resume: decoder channel width.
+        decoder_groups: 16  # Grouped decoder convolutions; must divide decoder_dim.
+        decoder_kernel: 7  # Temporal kernel width in feature frames.
+        decoder_layers: 4  # Number of reconstruction decoder layers.

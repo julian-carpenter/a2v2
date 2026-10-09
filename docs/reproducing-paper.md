@@ -322,8 +322,8 @@ The repository includes four primary recipes:
 | --- | --- | --- |
 | Pretraining | MeerKAT, 8 kHz | `configs/MeerKAT/a2v_large_pretrain_best.yaml` |
 | Fine-tuning | MeerKAT, 8 kHz | `configs/MeerKAT/finetune_mixup_100.yaml` |
-| Pretraining | Spotted hyena, 24 kHz | `configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml` |
-| Fine-tuning | Spotted hyena, 24 kHz | `configs/hyenas/finetune_mixup_100.yaml` |
+| Pretraining | Spotted hyena, 24 kHz | `configs/HyenaSet/a2v_large_pretrain_best.yaml` |
+| Fine-tuning | Spotted hyena, 24 kHz | `configs/HyenaSet/finetune_mixup_100.yaml` |
 
 The 25% and 1% MeerKAT labeled-data recipes are
 `configs/MeerKAT/finetune_mixup_025.yaml` and

@@ -115,7 +115,7 @@ def test_selecting_alibi_before_scaling_preserves_forward_and_scale_gradient() -
 def test_published_frontends_have_the_official_frame_counts() -> None:
     """Check published frontends have the official frame counts."""
     meerkat = load_config(ROOT / "configs/MeerKAT/a2v_large_pretrain_best.yaml")
-    hyena = load_config(ROOT / "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml")
+    hyena = load_config(ROOT / "configs/HyenaSet/a2v_large_pretrain_best.yaml")
     assert conv_output_length(8000, meerkat.task.conv_feature_layers) == 200
     assert conv_output_length(24000, hyena.task.conv_feature_layers) == 201
 
@@ -123,6 +123,6 @@ def test_published_frontends_have_the_official_frame_counts() -> None:
 def test_published_profiles_can_be_counted_without_allocating_models() -> None:
     """Check published profiles can be counted without allocating models."""
     meerkat = load_config(ROOT / "configs/MeerKAT/a2v_large_pretrain_best.yaml")
-    hyena = load_config(ROOT / "configs/hyenas/animal2vec_base_pretrain_10s-2-1_5_sinc_38ms_mixup_pswish.yaml")
+    hyena = load_config(ROOT / "configs/HyenaSet/a2v_large_pretrain_best.yaml")
     assert AudioEncoder.estimated_parameter_count(meerkat) > 300_000_000
     assert AudioEncoder.estimated_parameter_count(hyena) > 80_000_000
