@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -485,7 +486,18 @@ def fuse_probabilities(
     window_frames: int,
     recording_duration: float,
 ) -> tuple[EventInterval, ...]:
-    """Threshold smoothed probabilities and join adjacent active frames."""
+    """Threshold smoothed frame probabilities and join adjacent active frames.
+
+    ``probabilities`` is a CPU sigmoid tensor [frames, classes], not logits.
+    ``timestamps`` holds matching absolute frame-center times in seconds.
+    ``window_frames`` is the temporal pooling width: round the desired
+    smoothing seconds times sample_rate / product(frontend strides).
+    ``method`` selects avg/max pooling before the inclusive threshold.
+    ``recording_duration`` is original audio samples / original sample rate,
+    excluding padding; it caps event ends and supplies the single-frame hop.
+    Trim padded frames and merge overlapping views before calling this helper.
+    See docs/inference-guide.md for executable examples and argument sources.
+    """
 
     if probabilities.shape[0] != timestamps.numel():
         raise ValueError("one timestamp is required per probability frame")
@@ -900,6 +912,46 @@ def _trim_frames_to_duration(
     return probabilities[keep] if probabilities is not None else None, embeddings[keep], timestamps[keep]
 
 
+def _merge_overlapping_frames(
+    probability_parts: Sequence[Tensor],
+    embedding_parts: Sequence[Tensor],
+    timestamp_parts: Sequence[Tensor],
+    frame_index_parts: Sequence[Tensor],
+    *,
+    method: str,
+) -> tuple[Tensor | None, Tensor, Tensor]:
+    """Merge window outputs on integer recording-frame indices.
+
+    Average embeddings across contextual views. Merge class probabilities by
+    mean or max before class reduction, temporal smoothing, and thresholding.
+    Integer indices avoid joining nearby but distinct frames by float rounding.
+    """
+
+    indices = torch.cat(frame_index_parts)
+    unique, inverse = indices.unique(sorted=True, return_inverse=True)
+    counts = torch.bincount(inverse, minlength=unique.numel())[:, None]
+    values = torch.cat(embedding_parts)
+    embeddings = values.new_zeros(unique.numel(), values.shape[1])
+    embeddings.index_add_(0, inverse, values)
+    embeddings /= counts
+    times = torch.cat(timestamp_parts)
+    timestamps = times.new_empty(unique.numel())
+    timestamps.scatter_reduce_(0, inverse, times, reduce="amin", include_self=False)
+    probabilities = None
+    if probability_parts:
+        values = torch.cat(probability_parts)
+        probabilities = values.new_zeros(unique.numel(), values.shape[1])
+        if method == "mean":
+            probabilities.index_add_(0, inverse, values)
+            probabilities /= counts
+        else:
+            probabilities.scatter_reduce_(
+                0, inverse[:, None].expand_as(values), values,
+                reduce="amax", include_self=False,
+            )
+    return probabilities, embeddings, timestamps
+
+
 class InferenceRunner:
     """Load a native checkpoint and process long recordings.
 
@@ -977,11 +1029,27 @@ class InferenceRunner:
         *,
         channel: int | None = None,
         segment_seconds: float = 10.0,
+        overlap_seconds: float = 0.0,
+        overlap_method: Literal["mean", "max"] = "mean",
         threshold: float | None = None,
         event_method: str | None = None,
         fusion_window_seconds: float | None = None,
     ) -> InferenceResult:
-        """Run inference on mono or channel-first audio in memory."""
+        """Run inference on mono or channel-first audio in memory.
+
+        ``overlap_seconds`` defaults to zero, retaining original segmentation.
+        With overlap, snap the window hop down to the frontend stride so each
+        window shares a recording-frame grid. Merge probabilities before event
+        fusion; average overlapping frame embeddings. Keep CLS outputs per
+        window, since a CLS vector describes its entire contextual view.
+        """
+
+        if not math.isfinite(segment_seconds) or segment_seconds <= 0:
+            raise ValueError("segment_seconds must be finite and positive")
+        if not math.isfinite(overlap_seconds) or not 0 <= overlap_seconds < segment_seconds:
+            raise ValueError("overlap_seconds must be finite and satisfy 0 <= overlap < segment_seconds")
+        if overlap_method not in ("mean", "max"):
+            raise ValueError("overlap_method must be mean or max")
 
         if waveform.ndim == 2:
             if channel is None:
@@ -1005,15 +1073,22 @@ class InferenceRunner:
         segment_samples = round(segment_seconds * target_rate)
         if segment_samples <= 0:
             raise ValueError("segment_seconds must produce at least one sample")
+        stride = math.prod(layer[2] for layer in self.config.task.conv_feature_layers)
+        step_samples = segment_samples
+        if overlap_seconds > 0:
+            step_samples = (segment_samples - round(overlap_seconds * target_rate)) // stride * stride
+            if step_samples <= 0:
+                raise ValueError("overlap_seconds leaves less than one frontend stride for the hop")
 
         probability_parts: list[Tensor] = []
         embedding_parts: list[Tensor] = []
         timestamp_parts: list[Tensor] = []
+        frame_index_parts: list[Tensor] = []
         cls_embedding_parts: list[Tensor] = []
         cls_prediction_parts: list[Tensor] = []
         encoder = self.model if self.is_pretrain else self.model.encoder
         collect_cls = self.return_cls and encoder.use_cls_token
-        for start in range(0, waveform.shape[-1], segment_samples):
+        for start in range(0, waveform.shape[-1], step_samples):
             segment = normalize_waveform(waveform[start: start + segment_samples]).unsqueeze(0).to(self.device)
             # Fine-tuning inherits attention architecture from pretraining.
             with _evaluation_autocast(self.pretrained_config, self.device):
@@ -1024,7 +1099,9 @@ class InferenceRunner:
             # from the same forward pass and frame grid.
             probabilities = None
             if self.has_frame_predictions:
-                probabilities = self._event_probabilities(torch.sigmoid(output.logits[0].float()).cpu())
+                probabilities = torch.sigmoid(output.logits[0].float()).cpu()
+                if overlap_seconds == 0:
+                    probabilities = self._event_probabilities(probabilities)
             elif self.has_cls_predictions:
                 cls_prediction_parts.append(self._event_probabilities(torch.sigmoid(output.logits.float()).cpu()))
             layer_count = min(self.config.model.average_top_k_layers, len(output.layer_outputs))
@@ -1056,10 +1133,20 @@ class InferenceRunner:
                 probability_parts.append(probabilities)
             embedding_parts.append(embeddings)
             timestamp_parts.append(timestamps)
+            if overlap_seconds > 0:
+                frame_index_parts.append(torch.arange(timestamps.numel()) + start // stride)
+                if start + segment_samples >= waveform.shape[-1]:
+                    break
 
         dimension = self.pretrained_config.model.embed_dim
         embeddings = torch.cat(embedding_parts) if embedding_parts else torch.empty(0, dimension)
         timestamps = torch.cat(timestamp_parts) if timestamp_parts else torch.empty(0)
+        merged_probabilities = None
+        if overlap_seconds > 0 and embedding_parts:
+            merged_probabilities, embeddings, timestamps = _merge_overlapping_frames(
+                probability_parts, embedding_parts, timestamp_parts, frame_index_parts,
+                method=overlap_method,
+            )
         cls_embeddings = (
             torch.cat(cls_embedding_parts) if cls_embedding_parts else torch.empty(0, dimension)
         ) if collect_cls else None
@@ -1070,13 +1157,13 @@ class InferenceRunner:
             return InferenceResult(None, embeddings, timestamps, None, cls_embeddings, cls_predictions)
         if not probability_parts:
             return InferenceResult(torch.empty(0, len(self.labels)), embeddings, timestamps, (), cls_embeddings, cls_predictions)
-        probabilities = torch.cat(probability_parts)
+        probabilities = (
+            self._event_probabilities(merged_probabilities)
+            if merged_probabilities is not None else torch.cat(probability_parts)
+        )
         threshold = self.config.criterion.metric_threshold if threshold is None else threshold
         event_method = self.config.criterion.event_method if event_method is None else event_method
         window_seconds = self.config.criterion.sigma_s if fusion_window_seconds is None else fusion_window_seconds
-        stride = 1
-        for _, _, layer_stride in self.config.task.conv_feature_layers:
-            stride *= layer_stride
         # Mathematics: total convolution stride q=Π_l s_l gives nominal frame
         # rate f_frame=f_target/q and smoothing width round(τ_window f_frame).
         # Interpretation: a fusion window specified in seconds retains the same
@@ -3689,6 +3776,10 @@ def build_inference_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", type=Path)
     parser.add_argument("--channel", type=int)
     parser.add_argument("--segment-seconds", type=float, default=10.0)
+    parser.add_argument("--overlap-seconds", type=float, default=0.0,
+                        help="overlap between inference windows in seconds; default keeps disjoint windows")
+    parser.add_argument("--overlap-method", choices=("mean", "max"), default="mean",
+                        help="merge window probabilities on the shared frame grid before event fusion")
     parser.add_argument("--threshold", type=float)
     parser.add_argument("--method", choices=("avg", "max"))
     parser.add_argument("--fusion-window-seconds", type=float)
@@ -3715,6 +3806,8 @@ def infer_main(argv: Sequence[str] | None = None) -> int:
         sample_rate,
         channel=arguments.channel,
         segment_seconds=arguments.segment_seconds,
+        overlap_seconds=arguments.overlap_seconds,
+        overlap_method=arguments.overlap_method,
         threshold=arguments.threshold,
         event_method=arguments.method,
         fusion_window_seconds=arguments.fusion_window_seconds,

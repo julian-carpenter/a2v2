@@ -394,3 +394,136 @@ def test_infer_main_writes_audition_csv(tmp_path: Path) -> None:
     )
     assert "\tdecimal\tCue\t" in text
     assert "call\t" in text
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("mean", [[0.1, 0.2], [0.5, 0.5], [0.4, 0.6], [0.9, 0.8]]),
+    ("max", [[0.1, 0.2], [0.8, 0.7], [0.6, 0.9], [0.9, 0.8]]),
+])
+def test_overlap_merge_combines_matching_frames_before_threshold(method, expected) -> None:
+    """Merge conflicting window predictions without duplicate frames or logit voting."""
+    from a2v2.workflows import _merge_overlapping_frames
+
+    probabilities, embeddings, timestamps = _merge_overlapping_frames(
+        [torch.tensor([[0.1, 0.2], [0.2, 0.7], [0.6, 0.3]]),
+         torch.tensor([[0.8, 0.3], [0.2, 0.9], [0.9, 0.8]])],
+        [torch.tensor([[1.], [2.], [3.]]), torch.tensor([[4.], [5.], [6.]])],
+        [torch.tensor([0., 0.1, 0.2]), torch.tensor([0.1, 0.2, 0.3])],
+        [torch.tensor([0, 1, 2]), torch.tensor([1, 2, 3])],
+        method=method,
+    )
+    torch.testing.assert_close(probabilities, torch.tensor(expected))
+    torch.testing.assert_close(embeddings, torch.tensor([[1.], [3.], [4.], [6.]]))
+    torch.testing.assert_close(timestamps, torch.tensor([0., 0.1, 0.2, 0.3]))
+
+
+def test_zero_overlap_preserves_existing_inference_exactly(tmp_path: Path) -> None:
+    """The new option must leave the paper inference path unchanged by default."""
+    runner = InferenceRunner(_checkpoint(tmp_path), device=torch.device("cpu"))
+    waveform = torch.randn(160)
+    original = runner.run_tensor(waveform, 8000, segment_seconds=0.008)
+    explicit = runner.run_tensor(waveform, 8000, segment_seconds=0.008, overlap_seconds=0)
+    for field in ("probabilities", "embeddings", "timestamps"):
+        assert torch.equal(getattr(original, field), getattr(explicit, field))
+    assert original.events == explicit.events
+
+
+@pytest.mark.parametrize("head", ["frame", "cls"])
+def test_overlap_inference_keeps_absolute_grid_and_window_cls(tmp_path: Path, head: str) -> None:
+    """Align frame outputs globally while retaining one CLS result per window."""
+    runner = InferenceRunner(_cls_checkpoint(tmp_path, head), device=torch.device("cpu"), return_cls=True)
+    waveform = torch.randn(161)  # Partial final window and a non-frame-aligned end.
+    result = runner.run_tensor(waveform, 8000, segment_seconds=0.008, overlap_seconds=0.004)
+    assert result.cls_embeddings.shape[0] == 5
+    assert result.embeddings.shape[0] == result.timestamps.numel()
+    assert torch.all(result.timestamps[1:] > result.timestamps[:-1])
+    assert result.timestamps[-1] < 161 / 8000
+    hop = 1
+    for _, _, stride in runner.config.task.conv_feature_layers:
+        hop *= stride
+    torch.testing.assert_close(result.timestamps[1:] - result.timestamps[:-1],
+                               torch.full_like(result.timestamps[1:], hop / 8000))
+    if head == "frame":
+        assert result.probabilities.shape[0] == len(result.timestamps)
+        assert all(event.end_seconds <= 161 / 8000 for event in result.events)
+    else:
+        assert result.cls_predictions.shape == (5, 2)
+        assert result.probabilities is None and result.events is None
+
+
+def test_overlap_averages_real_contextual_outputs_before_class_vote(tmp_path: Path) -> None:
+    """Check the complete runner, not only its merge helper, against model views."""
+    runner = InferenceRunner(_cls_checkpoint(tmp_path, "frame"), device=torch.device("cpu"),
+                             event_detection=True, return_cls=True)
+    waveform = torch.randn(160)
+    result = runner.run_tensor(waveform, 8000, segment_seconds=0.008,
+                               overlap_seconds=0.004, overlap_method="mean")
+    stride = 1
+    for _, _, step in runner.config.task.conv_feature_layers:
+        stride *= step
+    views = {}
+    with torch.inference_mode():
+        for start in [0, 32, 64, 96]:
+            output = runner.model(normalize_waveform(waveform[start:start + 64])[None], update=runner.update)
+            embedding = torch.stack(output.layer_outputs[-2:]).mean(0)[0, 1:]
+            probabilities = output.logits[0].sigmoid()
+            times = feature_timestamps(len(embedding), 8000, runner.config.task.conv_feature_layers)
+            for index in range(len(embedding)):
+                if times[index] < 64 / 8000:
+                    views.setdefault(start // stride + index, []).append((embedding[index], probabilities[index]))
+    expected_embeddings = torch.stack([torch.stack([v[0] for v in views[i]]).mean(0) for i in sorted(views)])
+    expected_probabilities = torch.stack([torch.stack([v[1] for v in views[i]]).mean(0).max() for i in sorted(views)])[:, None]
+    torch.testing.assert_close(result.embeddings, expected_embeddings)
+    torch.testing.assert_close(result.probabilities, expected_probabilities)
+    assert result.cls_embeddings.shape[0] == 4  # No redundant trailing window.
+
+
+def test_overlap_supports_pretraining_embeddings_and_empty_audio(tmp_path: Path) -> None:
+    """Keep the embedding-only contract for overlapping pretraining inference."""
+    config = load_config(ROOT / "tests/fixtures/tiny_pretrain.yaml", overrides=("model.use_cls_token=true",))
+    model = Animal2VecPretrainingModel.from_config(config)
+    path = tmp_path / "pretrain-overlap.pt"
+    save_checkpoint(path, {
+        "format_version": 1, "stage": "pretrain", "config": {"active": config_to_dict(config)},
+        "model": model.state_dict(), "teacher": None, "optimizer": None,
+        "scheduler": None, "scaler": None, "update": 2, "epoch": 1,
+        "batch_in_epoch": 0, "rng_state": capture_rng_state(), "sampler_state": None, "best_metric": None,
+    })
+    runner = InferenceRunner(path, device=torch.device("cpu"), return_cls=True)
+    result = runner.run_tensor(torch.randn(320), 16000, segment_seconds=0.008, overlap_seconds=0.004)
+    assert result.probabilities is None and result.events is None and result.cls_predictions is None
+    assert result.cls_embeddings.shape == (4, 16)
+    assert len(result.embeddings) == len(result.timestamps)
+    assert (result.timestamps[1:] > result.timestamps[:-1]).all()
+    empty = runner.run_tensor(torch.empty(0), 8000, overlap_seconds=1.0)
+    assert empty.embeddings.shape == (0, 16) and empty.timestamps.numel() == 0
+    assert empty.probabilities is None and empty.events is None
+
+
+@pytest.mark.parametrize("overlap", [-0.1, 0.008, float("nan"), float("inf")])
+def test_overlap_rejects_invalid_window_hop(tmp_path: Path, overlap: float) -> None:
+    """Reject impossible or non-finite overlap before model execution."""
+    runner = InferenceRunner(_checkpoint(tmp_path), device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="overlap_seconds"):
+        runner.run_tensor(torch.randn(160), 8000, segment_seconds=0.008, overlap_seconds=overlap)
+
+
+def test_overlap_rejects_unknown_merge_and_substride_hop(tmp_path: Path) -> None:
+    """Catch invalid policies and a hop too small to keep distinct window starts."""
+    runner = InferenceRunner(_checkpoint(tmp_path), device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="overlap_method"):
+        runner.run_tensor(torch.randn(160), 8000, overlap_method="median")
+    with pytest.raises(ValueError, match="frontend stride"):
+        runner.run_tensor(torch.randn(160), 8000, segment_seconds=0.008, overlap_seconds=0.00799)
+
+
+def test_inference_cli_supports_overlap(tmp_path: Path) -> None:
+    """Route both overlap arguments through real checkpoint-backed inference."""
+    checkpoint = _checkpoint(tmp_path)
+    audio = tmp_path / "recording.wav"
+    output = tmp_path / "overlap.tsv"
+    soundfile.write(audio, torch.zeros(160).numpy(), 8000)
+    assert infer_main([str(checkpoint), str(audio), str(output), "--device", "cpu",
+                       "--segment-seconds", "0.008", "--overlap-seconds", "0.004",
+                       "--overlap-method", "max"]) == 0
+    assert output.read_text().startswith("label\tstart_seconds")
