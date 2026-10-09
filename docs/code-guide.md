@@ -622,6 +622,12 @@ classwise AP, macro and micro AP, fixed-threshold confusion metrics, and focal
 threshold search. It retains all fixed-size output rows because an all-zero
 target row can contain a false-positive segment score. Removing target-free
 rows inflates AP.
+The focal F1 threshold search sorts scores once and uses cumulative positive
+counts at equal-score group boundaries, avoiding a quadratic full-array scan
+for every candidate. It preserves the archived inclusive `score >= threshold`
+rule, Python floating-point metric arithmetic, and highest-threshold tie-break.
+This keeps validation practical when many segment scores are distinct, without
+changing reported metrics or the paper reproduction protocol.
 
 `TensorBoardLogger` owns experiment event files. Rank zero records globally
 reduced training scalars at `common.log_interval`. `_validate` supplies
